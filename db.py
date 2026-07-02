@@ -185,21 +185,6 @@ def init():
             )
             """
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS broadcast_logs(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                content_type TEXT NOT NULL,
-                preview TEXT,
-                total INTEGER DEFAULT 0,
-                success INTEGER DEFAULT 0,
-                failed INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-            """
-        )
 
         _add_column_if_missing("subs", "price_paid", "INTEGER")
         _add_column_if_missing("subs", "account_name", "TEXT")
@@ -337,57 +322,6 @@ def list_users(offset=0, limit=10):
     cur.execute(
         "SELECT * FROM users ORDER BY joined_at DESC LIMIT ? OFFSET ?",
         (limit, offset),
-    )
-    return cur.fetchall()
-
-# پیام همگانی
-
-def _broadcast_where(scope):
-    """Return safe WHERE clause for broadcast target scopes."""
-    if scope == "all":
-        return "banned=0"
-    if scope == "buyers":
-        return "banned=0 AND purchased > 0"
-    if scope == "no_buy":
-        return "banned=0 AND purchased = 0"
-    if scope == "active7":
-        return "banned=0 AND last_active >= datetime('now', '-7 days')"
-    raise ValueError(f"unknown broadcast scope: {scope}")
-
-
-def count_broadcast_targets(scope):
-    where = _broadcast_where(scope)
-    cur.execute(f"SELECT COUNT(*) AS c FROM users WHERE {where}")
-    return cur.fetchone()["c"]
-
-
-def list_broadcast_targets(scope, limit=None):
-    where = _broadcast_where(scope)
-    sql = f"SELECT id, username, purchased, last_active FROM users WHERE {where} ORDER BY joined_at DESC"
-    params = []
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(int(limit))
-    cur.execute(sql, params)
-    return cur.fetchall()
-
-
-def log_broadcast(admin_id, scope, content_type, preview, total, success, failed):
-    cur.execute(
-        """
-        INSERT INTO broadcast_logs(admin_id, scope, content_type, preview, total, success, failed)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (str(admin_id), scope, content_type, preview, int(total), int(success), int(failed)),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def list_broadcast_logs(limit=10):
-    cur.execute(
-        "SELECT * FROM broadcast_logs ORDER BY id DESC LIMIT ?",
-        (int(limit),),
     )
     return cur.fetchall()
 

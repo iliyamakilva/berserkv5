@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 import sys
@@ -31,8 +30,6 @@ class AdminStates(StatesGroup):
     waiting_setting_value = State()
     waiting_message_edit = State()
     waiting_restore_file = State()
-    waiting_broadcast_content = State()
-    waiting_broadcast_confirm = State()
 
 
 def cancel_kb():
@@ -57,7 +54,6 @@ def admin_menu_kb():
         InlineKeyboardButton("📊 آمار و درآمد", callback_data="adm_stats"),
         InlineKeyboardButton("⚙️ تنظیمات", callback_data="adm_settings"),
         InlineKeyboardButton("📝 ویرایش پیام‌ها", callback_data="adm_messages"),
-        InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast"),
         InlineKeyboardButton("💾 دریافت بک‌آپ", callback_data="adm_backup"),
         InlineKeyboardButton("♻️ بارگذاری بک‌آپ", callback_data="adm_restore"),
     )
@@ -446,208 +442,6 @@ async def process_message_edit(m: types.Message, state: FSMContext):
     await m.answer("لطفا فقط متن یا عکس بفرستید.", reply_markup=cancel_kb())
 
 
-BROADCAST_SCOPES = {
-    "all": "همه کاربران فعال نشده‌بن",
-    "buyers": "فقط خریداران",
-    "no_buy": "کاربران بدون خرید",
-    "active7": "کاربران فعال ۷ روز اخیر",
-}
-
-
-def broadcast_scope_menu_kb():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("👥 همه کاربران", callback_data="broadcast_scope_all"))
-    kb.add(InlineKeyboardButton("✅ فقط خریداران", callback_data="broadcast_scope_buyers"))
-    kb.add(InlineKeyboardButton("🕊 کاربران بدون خرید", callback_data="broadcast_scope_no_buy"))
-    kb.add(InlineKeyboardButton("🔥 فعال‌های ۷ روز اخیر", callback_data="broadcast_scope_active7"))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
-    return kb
-
-
-def broadcast_confirm_kb():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("🚀 تایید و ارسال", callback_data="broadcast_confirm"))
-    kb.add(InlineKeyboardButton("❌ لغو ارسال", callback_data="broadcast_cancel"))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
-    return kb
-
-
-def _broadcast_preview_text(data):
-    content_type = data.get("content_type")
-    if content_type == "text":
-        text = data.get("text") or ""
-    else:
-        text = data.get("caption") or "(عکس بدون کپشن)"
-    text = text.replace("\n", " ").strip()
-    return text[:120]
-
-
-async def cb_broadcast_menu(c: types.CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer()
-    await c.answer()
-
-    recent = db.list_broadcast_logs(limit=3)
-    text = "📢 پیام همگانی\n\nجامعه هدف پیام رو انتخاب کنید.\n"
-    if recent:
-        text += "\nآخرین ارسال‌ها:\n"
-        for r in recent:
-            scope_label = BROADCAST_SCOPES.get(r["scope"], r["scope"])
-            text += f"• #{r['id']} | {scope_label} | موفق {r['success']}/{r['total']} | {r['created_at']}\n"
-
-    await c.message.answer(text, reply_markup=broadcast_scope_menu_kb())
-
-
-async def cb_broadcast_scope(c: types.CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer()
-    await c.answer()
-
-    scope = c.data.split("broadcast_scope_", 1)[1]
-    if scope not in BROADCAST_SCOPES:
-        return await c.message.answer("جامعه هدف معتبر نیست.", reply_markup=admin_back_kb())
-
-    total = db.count_broadcast_targets(scope)
-    await state.update_data(scope=scope)
-    await c.message.answer(
-        f"📢 جامعه هدف: {BROADCAST_SCOPES[scope]}\n"
-        f"تعداد مخاطب: {total}\n\n"
-        "حالا متن پیام یا عکس همراه با کپشن رو بفرستید.\n"
-        "قبل از ارسال، پیش‌نمایش و تایید نهایی گرفته می‌شود.",
-        reply_markup=cancel_kb(),
-    )
-    await AdminStates.waiting_broadcast_content.set()
-
-
-async def process_broadcast_content(m: types.Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        return
-
-    data = await state.get_data()
-    scope = data.get("scope")
-    if scope not in BROADCAST_SCOPES:
-        await state.finish()
-        return await m.answer("جامعه هدف پیدا نشد. دوباره از پنل مدیریت شروع کنید.", reply_markup=admin_back_kb())
-
-    if m.content_type == "text":
-        payload = {
-            "scope": scope,
-            "content_type": "text",
-            "text": m.text,
-            "photo_file_id": "",
-            "caption": "",
-        }
-    elif m.content_type == "photo":
-        payload = {
-            "scope": scope,
-            "content_type": "photo",
-            "text": "",
-            "photo_file_id": m.photo[-1].file_id,
-            "caption": m.caption or "",
-        }
-    else:
-        return await m.answer("فعلا برای پیام همگانی فقط متن یا عکس پشتیبانی می‌شود.", reply_markup=cancel_kb())
-
-    await state.set_data(payload)
-    total = db.count_broadcast_targets(scope)
-
-    await m.answer(
-        f"🔎 پیش‌نمایش پیام همگانی\n\n"
-        f"جامعه هدف: {BROADCAST_SCOPES[scope]}\n"
-        f"تعداد مخاطب: {total}\n"
-        f"نوع پیام: {'متن' if payload['content_type'] == 'text' else 'عکس'}"
-    )
-
-    if payload["content_type"] == "text":
-        await m.answer(payload["text"])
-    else:
-        await m.answer_photo(payload["photo_file_id"], caption=payload["caption"] or None)
-
-    await m.answer(
-        "ارسال نهایی انجام بشه؟\n"
-        "بعد از تایید، پیام به‌صورت تدریجی ارسال می‌شود تا ریسک محدودیت تلگرام کمتر شود.",
-        reply_markup=broadcast_confirm_kb(),
-    )
-    await AdminStates.waiting_broadcast_confirm.set()
-
-
-async def cb_broadcast_cancel(c: types.CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer()
-    await c.answer("لغو شد")
-    await state.finish()
-    await c.message.answer("❌ ارسال پیام همگانی لغو شد.", reply_markup=admin_back_kb())
-
-
-async def cb_broadcast_confirm(c: types.CallbackQuery, state: FSMContext):
-    bot = Bot.get_current()
-    if not is_admin(c.from_user.id):
-        return await c.answer()
-    await c.answer()
-
-    data = await state.get_data()
-    scope = data.get("scope")
-    content_type = data.get("content_type")
-
-    if scope not in BROADCAST_SCOPES or content_type not in {"text", "photo"}:
-        await state.finish()
-        return await c.message.answer("اطلاعات ارسال کامل نیست. دوباره شروع کنید.", reply_markup=admin_back_kb())
-
-    targets = db.list_broadcast_targets(scope)
-    total = len(targets)
-
-    if total == 0:
-        await state.finish()
-        return await c.message.answer("هیچ مخاطبی برای این جامعه هدف وجود ندارد.", reply_markup=admin_back_kb())
-
-    progress = await c.message.answer(f"🚀 ارسال پیام همگانی شروع شد...\nمخاطب‌ها: {total}")
-    success = 0
-    failed = 0
-
-    for index, user in enumerate(targets, start=1):
-        uid = user["id"]
-        try:
-            if content_type == "text":
-                await bot.send_message(int(uid), data["text"], reply_markup=menus.main_reply_kb(uid))
-            else:
-                await bot.send_photo(
-                    int(uid),
-                    data["photo_file_id"],
-                    caption=data.get("caption") or None,
-                    reply_markup=menus.main_reply_kb(uid),
-                )
-            success += 1
-        except Exception:
-            failed += 1
-
-        if index % 25 == 0 or index == total:
-            try:
-                await progress.edit_text(
-                    f"📢 در حال ارسال...\n"
-                    f"پیشرفت: {index}/{total}\n"
-                    f"موفق: {success}\n"
-                    f"ناموفق: {failed}"
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(0.05)
-
-    preview = _broadcast_preview_text(data)
-    log_id = db.log_broadcast(c.from_user.id, scope, content_type, preview, total, success, failed)
-    await state.finish()
-
-    await c.message.answer(
-        f"✅ پیام همگانی ارسال شد.\n\n"
-        f"Log ID: #{log_id}\n"
-        f"جامعه هدف: {BROADCAST_SCOPES[scope]}\n"
-        f"کل مخاطب: {total}\n"
-        f"موفق: {success}\n"
-        f"ناموفق: {failed}",
-        reply_markup=admin_back_kb(),
-    )
-
-
 async def cb_backup(c: types.CallbackQuery):
     bot = Bot.get_current()
     if not is_admin(c.from_user.id):
@@ -709,11 +503,6 @@ def register(dp):
     dp.register_callback_query_handler(cb_messages, lambda c: c.data == "adm_messages")
     dp.register_callback_query_handler(cb_msgkey, lambda c: c.data.startswith("msgkey_"))
     dp.register_message_handler(process_message_edit, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_message_edit)
-    dp.register_callback_query_handler(cb_broadcast_menu, lambda c: c.data == "adm_broadcast")
-    dp.register_callback_query_handler(cb_broadcast_scope, lambda c: c.data.startswith("broadcast_scope_"))
-    dp.register_message_handler(process_broadcast_content, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_broadcast_content)
-    dp.register_callback_query_handler(cb_broadcast_confirm, lambda c: c.data == "broadcast_confirm", state=AdminStates.waiting_broadcast_confirm)
-    dp.register_callback_query_handler(cb_broadcast_cancel, lambda c: c.data == "broadcast_cancel", state=AdminStates.waiting_broadcast_confirm)
     dp.register_callback_query_handler(cb_backup, lambda c: c.data == "adm_backup")
     dp.register_callback_query_handler(cb_restore_start, lambda c: c.data == "adm_restore")
     dp.register_message_handler(process_restore_file, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_restore_file)
