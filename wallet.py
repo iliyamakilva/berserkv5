@@ -1,9 +1,9 @@
 """
 جریان شارژ کیف پول.
 
-Hotfix:
-در aiogram 2 هندلرها نباید پارامتر اجباری bot بگیرند.
-برای گرفتن نمونه Bot از Bot.get_current() استفاده می‌کنیم.
+v5.1 UX hotfix:
+- منوی ثابت پایین بعد از ارسال رسید حفظ می‌شود.
+- هندلرها با aiogram v2 سازگارند و bot را با Bot.get_current() می‌گیرند.
 """
 
 from aiogram import Bot, types
@@ -11,6 +11,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 
 import db
+import menus
 import settings
 from config import ADMIN_IDS
 
@@ -29,6 +30,7 @@ def cancel_kb():
 def topup_button_kb():
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("💳 شارژ کیف پول", callback_data="topup_start"))
+    kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
 
 
@@ -44,17 +46,12 @@ async def cb_topup_start(c: types.CallbackQuery):
 
 async def process_amount(m: types.Message, state: FSMContext):
     if m.content_type != "text":
-        return await m.answer(
-            "لطفا فقط عدد بفرستید (مثال: 100000).",
-            reply_markup=cancel_kb(),
-        )
+        return await m.answer("لطفا فقط عدد بفرستید (مثال: 100000).", reply_markup=cancel_kb())
 
     text = m.text.strip().replace(",", "")
+
     if not text.isdigit():
-        return await m.answer(
-            "لطفا فقط عدد بفرستید. مثال: 100000",
-            reply_markup=cancel_kb(),
-        )
+        return await m.answer("لطفا فقط عدد بفرستید. مثال: 100000", reply_markup=cancel_kb())
 
     amount = int(text)
     min_amount = settings.min_topup()
@@ -83,10 +80,7 @@ async def process_receipt(m: types.Message, state: FSMContext):
     bot = Bot.get_current()
 
     if m.content_type not in ("photo", "text"):
-        return await m.answer(
-            "لطفا عکس رسید پرداخت رو بفرستید (نه فایل یا نوع دیگه).",
-            reply_markup=cancel_kb(),
-        )
+        return await m.answer("لطفا عکس رسید پرداخت رو بفرستید.", reply_markup=cancel_kb())
 
     data = await state.get_data()
     topup_id = data.get("topup_id")
@@ -99,20 +93,21 @@ async def process_receipt(m: types.Message, state: FSMContext):
         await state.finish()
         return await m.answer(
             "درخواست شارژ فعالی برای شما پیدا نشد.\n"
-            "لطفا اول روی «شارژ کیف پول» بزنید."
+            "لطفا اول از منوی پایین وارد کیف پول شوید.",
+            reply_markup=menus.main_reply_kb(m.from_user.id),
         )
 
     topup = db.get_topup(topup_id)
 
     if not topup or topup["status"] != "awaiting_receipt":
         await state.finish()
-        return await m.answer("این درخواست قبلا بررسی شده یا معتبر نیست.")
+        return await m.answer(
+            "این درخواست قبلا بررسی شده یا معتبر نیست.",
+            reply_markup=menus.main_reply_kb(m.from_user.id),
+        )
 
     if not m.photo:
-        return await m.answer(
-            "لطفا عکس رسید پرداخت رو بفرستید (نه فقط متن).",
-            reply_markup=cancel_kb(),
-        )
+        return await m.answer("لطفا عکس رسید پرداخت رو بفرستید.", reply_markup=cancel_kb())
 
     photo = m.photo[-1]
 
@@ -148,8 +143,10 @@ async def process_receipt(m: types.Message, state: FSMContext):
             pass
 
     await m.answer(
-        "رسید شما برای بررسی ارسال شد.\n"
-        "بعد از تایید، کیف پولتون شارژ میشه."
+        "✅ رسید شما برای بررسی ارسال شد.\n"
+        "بعد از تایید، کیف پولتون شارژ میشه.\n\n"
+        "منوی پایین همچنان فعاله و می‌تونید ادامه بدید.",
+        reply_markup=menus.main_reply_kb(m.from_user.id),
     )
 
 
@@ -178,6 +175,7 @@ async def cb_confirm(c: types.CallbackQuery):
             int(topup["user_id"]),
             f"✅ کیف پول شما به مبلغ {topup['amount']:,} تومان شارژ شد.\n"
             f"💰 موجودی فعلی: {user['balance']:,} تومان",
+            reply_markup=menus.main_reply_kb(topup["user_id"]),
         )
     except Exception:
         pass
@@ -208,6 +206,7 @@ async def cb_reject(c: types.CallbackQuery):
             int(topup["user_id"]),
             f"❌ درخواست شارژ #{topup_id} رد شد.\n"
             "در صورت سوال با پشتیبانی تماس بگیرید.",
+            reply_markup=menus.main_reply_kb(topup["user_id"]),
         )
     except Exception:
         pass

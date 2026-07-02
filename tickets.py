@@ -1,9 +1,8 @@
 """
 سیستم تیکت پشتیبانی.
 
-Hotfix:
-در aiogram 2 هندلرها نباید پارامتر اجباری bot بگیرند.
-برای گرفتن نمونه Bot از Bot.get_current() استفاده می‌کنیم.
+v5.1 UX hotfix:
+بعد از ارسال تیکت، منوی ثابت پایین برای کاربر باقی می‌ماند.
 """
 
 from aiogram import Bot, types
@@ -11,6 +10,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 
 import db
+import menus
 from config import ADMIN_IDS
 
 
@@ -54,12 +54,7 @@ async def process_ticket_message(m: types.Message, state: FSMContext):
                 sent = await bot.send_message(admin_id, header + "\n" + m.text)
             else:
                 caption = header + ("\n" + m.caption if m.caption else "")
-                sent = await bot.copy_message(
-                    admin_id,
-                    m.chat.id,
-                    m.message_id,
-                    caption=caption,
-                )
+                sent = await bot.copy_message(admin_id, m.chat.id, m.message_id, caption=caption)
 
             db.record_ticket_message(admin_id, sent.message_id, ticket_id, m.from_user.id)
         except Exception:
@@ -67,7 +62,8 @@ async def process_ticket_message(m: types.Message, state: FSMContext):
 
     await m.answer(
         f"✅ پیام شما ثبت شد (تیکت #{ticket_id}).\n"
-        "به‌زودی پاسخ داده میشه."
+        "به‌زودی پاسخ داده میشه.",
+        reply_markup=menus.main_reply_kb(m.from_user.id),
     )
 
 
@@ -94,10 +90,11 @@ async def handle_ticket_reply(m: types.Message):
 
     try:
         if m.content_type == "text":
-            await bot.send_message(int(customer_id), header + "\n" + m.text)
+            await bot.send_message(int(customer_id), header + "\n" + m.text, reply_markup=menus.main_reply_kb(customer_id))
         else:
             caption = header + ("\n" + m.caption if m.caption else "")
             await bot.copy_message(int(customer_id), m.chat.id, m.message_id, caption=caption)
+            await bot.send_message(int(customer_id), "از منوی پایین می‌تونید ادامه بدید.", reply_markup=menus.main_reply_kb(customer_id))
 
         await m.reply("✅ پاسخ برای مشتری ارسال شد.")
     except Exception:
@@ -112,7 +109,7 @@ async def cb_open_tickets(c: types.CallbackQuery):
     rows = db.list_open_tickets()
 
     if not rows:
-        return await c.message.answer("تیکت باز وجود نداره.")
+        return await c.message.answer("تیکت باز وجود نداره.", reply_markup=menus.admin_back_inline())
 
     for r in rows:
         user = db.get_user(r["user_id"])
@@ -124,9 +121,9 @@ async def cb_open_tickets(c: types.CallbackQuery):
             f"{r['created_at']}"
         )
 
-        kb = types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("✅ بستن تیکت", callback_data=f"ticket_close_{r['id']}")
-        )
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(types.InlineKeyboardButton("✅ بستن تیکت", callback_data=f"ticket_close_{r['id']}"))
+        kb.add(types.InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
 
         await c.message.answer(text, reply_markup=kb)
 
@@ -142,7 +139,7 @@ async def cb_close_ticket(c: types.CallbackQuery):
     try:
         await c.message.edit_text(c.message.text + "\n\n✅ بسته شد.")
     except Exception:
-        await c.message.answer(f"تیکت #{ticket_id} بسته شد.")
+        await c.message.answer(f"تیکت #{ticket_id} بسته شد.", reply_markup=menus.admin_back_inline())
 
 
 def register(dp):
