@@ -1,50 +1,62 @@
-"""
-مدیریت استخر ساب‌لینک‌ها: افزودن، تخصیص، و موجودی.
-هر لینک فقط یکبار تخصیص داده میشه (used=1, owner=user_id) و دیگه
-هیچ‌وقت به کسی دیگه داده نمیشه. assigned_at هم تاریخچه مالکیت رو نگه می‌داره.
-
-هر لینک، همون لحظه‌ای که اضافه میشه، یه اسم اکانت رندوم و یکتا به فرمت
-Berserk-XXXXX می‌گیره؛ این اسم برای مدیریت راحت‌تر حساب‌ها (مثلا سمت
-تامین‌کننده) استفاده میشه و بعد از خرید هم به مشتری نشون داده میشه.
-"""
-
-import random
-
-from db import bump_daily, conn, cur
 import db
+from db import conn, cur
 
 
 def _generate_account_name():
-    """یه اسم Berserk-XXXXX یکتا می‌سازه (تلاش مجدد در صورت برخورد نادر)."""
-    for _ in range(20):
-        candidate = f"Berserk-{random.randint(10000, 99999)}"
-        cur.execute("SELECT 1 FROM subs WHERE account_name=?", (candidate,))
-        if cur.fetchone() is None:
-            return candidate
-    # اگه بعد از ۲۰ تلاش هم برخورد داشتیم (خیلی بعیده)، یه رنج بزرگتر امتحان کن
-    return f"Berserk-{random.randint(100000, 999999)}"
+    return db.generate_service_code()
 
 
 def get_sub():
-    """قدیمی‌ترین لینک استفاده‌نشده رو برمی‌گردونه (بدون رزرو کردنش)."""
-    cur.execute("SELECT id, link, account_name FROM subs WHERE used=0 ORDER BY id LIMIT 1")
+    cur.execute(
+        "SELECT id, link, account_name FROM subs WHERE used=0 ORDER BY id LIMIT 1"
+    )
+    return cur.fetchone()
+
+
+def get_sub_by_id(sub_id):
+    cur.execute(
+        """
+        SELECT id, link, used, owner, added_at, assigned_at, price_paid,
+               account_name, status, purchase_id
+        FROM subs WHERE id=?
+        """,
+        (int(sub_id),),
+    )
     return cur.fetchone()
 
 
 def assign_sub(sub_id, user_id, price_paid=None):
+    cur.execute("SELECT account_name FROM subs WHERE id=?", (sub_id,))
+    row = cur.fetchone()
+    account_name = row["account_name"] if row and row["account_name"] else _generate_account_name()
     cur.execute(
-        "UPDATE subs SET used=1, owner=?, assigned_at=datetime('now'), price_paid=? WHERE id=?",
-        (str(user_id), price_paid, sub_id),
+        """
+        UPDATE subs
+        SET used=1,
+            owner=?,
+            assigned_at=datetime('now'),
+            price_paid=?,
+            account_name=?,
+            status='delivered'
+        WHERE id=? AND used=0
+        """,
+        (str(user_id), price_paid, account_name, sub_id),
     )
     conn.commit()
-    bump_daily("sales")
+    db.bump_daily("sales")
 
 
 def add_sub(link):
     link = link.strip()
-    account_name = _generate_account_name()
+    if not link:
+        return None
+    cur.execute("SELECT id FROM subs WHERE link=?", (link,))
+    existing = cur.fetchone()
+    if existing:
+        return existing["id"]
     cur.execute(
-        "INSERT INTO subs(link, account_name) VALUES (?, ?)", (link, account_name)
+        "INSERT INTO subs(link, account_name, status) VALUES (?, ?, 'available')",
+        (link, _generate_account_name()),
     )
     conn.commit()
     db.set_low_stock_alerted(False)
@@ -52,16 +64,23 @@ def add_sub(link):
 
 
 def add_subs_bulk(links):
-    clean = [l.strip() for l in links if l.strip()]
-    for link in clean:
-        account_name = _generate_account_name()
+    count = 0
+    for link in links:
+        link = link.strip()
+        if not link:
+            continue
+        cur.execute("SELECT 1 FROM subs WHERE link=?", (link,))
+        if cur.fetchone():
+            continue
         cur.execute(
-            "INSERT INTO subs(link, account_name) VALUES (?, ?)", (link, account_name)
+            "INSERT INTO subs(link, account_name, status) VALUES (?, ?, 'available')",
+            (link, _generate_account_name()),
         )
+        count += 1
     conn.commit()
-    if clean:
+    if count:
         db.set_low_stock_alerted(False)
-    return len(clean)
+    return count
 
 
 def stock_count():
@@ -74,11 +93,21 @@ def sold_count():
     return cur.fetchone()["c"]
 
 
-def user_subs(user_id):
-    """تاریخچه ساب‌لینک‌هایی که این کاربر مالکشونه (برای دکمه «اشتراک‌های من»)."""
+def user_subs(user_id, limit=50):
     cur.execute(
-        "SELECT id, link, account_name, assigned_at FROM subs WHERE owner=? "
-        "ORDER BY assigned_at DESC",
-        (str(user_id),),
+        """
+        SELECT id, link, account_name, assigned_at, price_paid, status, purchase_id
+        FROM subs
+        WHERE owner=?
+        ORDER BY assigned_at DESC, id DESC
+        LIMIT ?
+        """,
+        (str(user_id), limit),
     )
     return cur.fetchall()
+
+
+def short_link(link: str, limit=48):
+    if not link:
+        return "-"
+    return link if len(link) <= limit else link[:limit] + "..."

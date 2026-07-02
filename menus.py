@@ -18,10 +18,6 @@ def is_admin_user(user_id) -> bool:
 
 
 def main_reply_kb(user_id=None):
-    """
-    منوی ثابت پایین تلگرام.
-    این منو همیشه در دسترس کاربر می‌ماند و مشکل نیاز به /start بعد از رسید/تیکت را حل می‌کند.
-    """
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=False)
     kb.row(BTN_BUY, BTN_MY_SUBS)
     kb.row(BTN_WALLET, BTN_REFERRAL)

@@ -1,25 +1,11 @@
-"""
-Storage پایدار برای FSM (حالت مکالمه هر کاربر) روی SQLite.
-
-مشکلی که این فایل حل می‌کنه: MemoryStorage پیش‌فرض aiogram همه‌چیز رو
-توی RAM نگه می‌داره. با هر ری‌استارت Railway (دیپلوی جدید، کرش، خواب رفتن)
-تمام state های کاربرا (مثلاً کسی که وسط وارد کردن مبلغ شارژه) پاک میشه و
-پیام بعدیش نادیده گرفته میشه. این storage همون رفتار MemoryStorage رو
-پیاده می‌کنه ولی هر تغییر رو فوری روی دیسک (توی همون berserk.db) ذخیره
-می‌کنه، پس با ری‌استارت چیزی از دست نمی‌ره.
-
-پیاده‌سازی دقیقاً امضای BaseStorage در aiogram 2.x رو دنبال می‌کنه.
-"""
-
 import json
-
 from aiogram.dispatcher.storage import BaseStorage
-
 import db
 
 
 def _ensure_table():
-    db.cur.execute("""
+    db.cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS fsm_state(
             chat_id TEXT,
             user_id TEXT,
@@ -28,7 +14,8 @@ def _ensure_table():
             bucket TEXT DEFAULT '{}',
             PRIMARY KEY (chat_id, user_id)
         )
-    """)
+        """
+    )
     db.conn.commit()
 
 
@@ -53,8 +40,10 @@ class SQLiteStorage(BaseStorage):
         row = self._row(chat_id, user_id)
         if row is None:
             db.cur.execute(
-                "INSERT INTO fsm_state(chat_id, user_id, state, data, bucket) "
-                "VALUES (?, ?, ?, ?, ?)",
+                """
+                INSERT INTO fsm_state(chat_id, user_id, state, data, bucket)
+                VALUES (?, ?, ?, ?, ?)
+                """,
                 (
                     chat_id,
                     user_id,
@@ -81,7 +70,8 @@ class SQLiteStorage(BaseStorage):
         row = self._row(chat_id, user_id)
         if row and not row["state"] and row["data"] == "{}" and row["bucket"] == "{}":
             db.cur.execute(
-                "DELETE FROM fsm_state WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+                "DELETE FROM fsm_state WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
             )
             db.conn.commit()
 

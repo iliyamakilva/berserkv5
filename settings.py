@@ -1,13 +1,7 @@
-"""
-تنظیمات قابل ویرایش از پنل ادمین، بدون نیاز به کدنویسی یا ری‌دیپلوی.
-مقادیر در جدول `settings` دیتابیس ذخیره میشن؛ DEFAULTS فقط برای اولین
-اجرا (وقتی هنوز چیزی در دیتابیس ثبت نشده) استفاده میشه.
-"""
-
 from db import get_setting, get_setting_int, set_setting
 
 DEFAULTS = {
-    "plan_title": "یک ماهه",
+    "plan_title": "یک ماهه | ۱۰۰ گیگ | ۳ کاربره",
     "plan_duration_label": "۳۰ روز",
     "plan_price": "100000",
     "ref_reward": "30000",
@@ -19,8 +13,6 @@ DEFAULTS = {
 
 
 def ensure_defaults():
-    """موقع استارت ربات صدا زده میشه تا مقدار پیش‌فرض هر تنظیم، اگه قبلا
-    در دیتابیس ست نشده، ذخیره بشه."""
     for key, value in DEFAULTS.items():
         if get_setting(key) is None:
             set_setting(key, value)

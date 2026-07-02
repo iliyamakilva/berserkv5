@@ -20,19 +20,13 @@ from config import ADMIN_COMMAND, ADMIN_IDS, BOT_TOKEN, validate
 from fsm_storage import SQLiteStorage
 from utils import cleanup_qr, make_qr
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 validate()
 
 if ADMIN_COMMAND == "panel_secret":
-    logger.warning(
-        "ADMIN_COMMAND هنوز مقدار پیش‌فرضه! حتما توی Railway یه اسم اختصاصی "
-        "براش ست کنید (مثلا panel_x7k9) تا امنیت پنل ادمین حفظ بشه."
-    )
+    logger.warning("ADMIN_COMMAND هنوز مقدار پیش‌فرضه؛ بهتره در Railway مقدار اختصاصی ست شود.")
 
 bot = Bot(token=BOT_TOKEN)
 
@@ -51,11 +45,9 @@ def wallet_menu_kb():
 
 def buy_quantity_kb(max_qty: int):
     kb = types.InlineKeyboardMarkup(row_width=2)
-
     for qty in range(1, 5):
         if qty <= max_qty:
             kb.insert(types.InlineKeyboardButton(f"{qty} عدد", callback_data=f"buy_qty_{qty}"))
-
     kb.add(types.InlineKeyboardButton("📦 خرید عمده", callback_data="buy_bulk"))
     kb.add(types.InlineKeyboardButton("💳 شارژ کیف پول", callback_data="topup_start"))
     kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
@@ -64,25 +56,26 @@ def buy_quantity_kb(max_qty: int):
 
 async def send_main_menu(target, user_id: int):
     await target.answer(
-        "⚡ Berserk VPN Ready\n\n"
-        "از منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
+        "⚡ Berserk VPN Ready\n\nاز منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
         reply_markup=menus.main_reply_kb(user_id),
     )
 
 
-async def render_buy(target, user_id: int, username: str = ""):
-    user_id_str = str(user_id)
-    user = db.get_user(user_id_str)
+def ensure_user(user_id, username="", ref=None):
+    row, _ = db.get_or_create_user(str(user_id), username or "", ref)
+    db.touch_active(str(user_id), username or "")
+    return db.get_user(str(user_id)) or row
 
+
+async def render_buy(target, user_id: int, username: str = ""):
+    user = ensure_user(user_id, username)
     if user and user["banned"]:
         return await target.answer("⛔ حساب شما مسدود است.")
-
-    db.touch_active(user_id_str, username)
 
     price = settings.plan_price()
     title = settings.plan_title()
     duration = settings.plan_duration_label()
-    balance = user["balance"] if user else 0
+    balance = int(user["balance"] if user else 0)
     stock = subs.stock_count()
 
     affordable_qty = balance // price if price > 0 else 0
@@ -99,44 +92,29 @@ async def render_buy(target, user_id: int, username: str = ""):
 
     if stock <= 0:
         text += "❌ در حال حاضر موجودی نداریم."
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
-        return await messages.send(target, "menu_buy", text, reply_markup=kb)
+        return await messages.send(target, "menu_buy", text, reply_markup=menus.back_main_inline())
 
     if balance < price:
         need = price - balance
         text += f"⚠️ موجودی کافی نیست. {need:,} تومان دیگر شارژ کنید."
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(types.InlineKeyboardButton("💳 شارژ کیف پول", callback_data="topup_start"))
-        kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
-        return await messages.send(target, "menu_buy", text, reply_markup=kb)
+        return await messages.send(target, "menu_buy", text, reply_markup=wallet_menu_kb())
 
-    text += (
-        "تعداد مورد نظر را انتخاب کنید:\n"
-        "برای خرید عمده، درخواست مستقیم برای ادمین ارسال می‌شود."
-    )
+    text += "تعداد مورد نظر را انتخاب کنید. برای خرید عمده، درخواست مستقیم برای ادمین ارسال می‌شود."
     await messages.send(target, "menu_buy", text, reply_markup=buy_quantity_kb(max_qty))
 
 
 async def check_low_stock_alert():
-    """
-    بعد از هر فروش صدا زده میشه.
-    اگر موجودی به آستانه رسید، فقط یکبار تا شارژ مجدد به ادمین هشدار می‌دهد.
-    """
     threshold = settings.low_stock_threshold()
     current_stock = subs.stock_count()
-
     if current_stock <= threshold and not db.is_low_stock_alerted():
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(
                     admin_id,
-                    f"⚠️ موجودی سرویس کم شد! فقط {current_stock} لینک باقی مونده "
-                    f"(آستانه: {threshold}).\nلطفا لینک جدید اضافه کنید.",
+                    f"⚠️ موجودی سرویس کم شد! فقط {current_stock} لینک باقی مونده (آستانه: {threshold}).",
                 )
             except Exception:
                 pass
-
         db.set_low_stock_alerted(True)
 
 
@@ -144,17 +122,12 @@ async def check_low_stock_alert():
 async def start(m: types.Message):
     user_id = str(m.from_user.id)
     ref = None
-
     args = m.get_args()
     if args and args.isdigit() and args != user_id:
         ref = args
-
-    row, created = db.get_or_create_user(user_id, m.from_user.username, ref)
-    db.touch_active(user_id, m.from_user.username)
-
+    row = ensure_user(user_id, m.from_user.username, ref)
     if row["banned"]:
-        return await m.answer("⛔ حساب شما مسدود شده.\nبرای پیگیری با پشتیبانی تماس بگیرید.")
-
+        return await m.answer("⛔ حساب شما مسدود شده. برای پیگیری با پشتیبانی تماس بگیرید.")
     await messages.send(
         m,
         "welcome",
@@ -205,7 +178,6 @@ async def cmd_cancel(m: types.Message, state: FSMContext):
     current = await state.get_state()
     if current is None:
         return await m.answer("چیزی برای لغو کردن نیست.", reply_markup=menus.main_reply_kb(m.from_user.id))
-
     await state.finish()
     await m.answer("❌ لغو شد.", reply_markup=menus.main_reply_kb(m.from_user.id))
 
@@ -214,10 +186,8 @@ async def cmd_cancel(m: types.Message, state: FSMContext):
 async def cb_cancel_fsm(c: types.CallbackQuery, state: FSMContext):
     await c.answer()
     current = await state.get_state()
-
     if current is not None:
         await state.finish()
-
     await c.message.answer("❌ لغو شد.", reply_markup=menus.main_reply_kb(c.from_user.id))
 
 
@@ -236,11 +206,7 @@ async def buy(c: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("buy_qty_"))
 async def buy_qty(c: types.CallbackQuery):
     user_id = str(c.from_user.id)
-    user = db.get_user(user_id)
-
-    if user and user["banned"]:
-        return await c.answer("⛔ حساب شما مسدود است.", show_alert=True)
-
+    user = ensure_user(user_id, c.from_user.username or "")
     await c.answer()
 
     try:
@@ -248,65 +214,23 @@ async def buy_qty(c: types.CallbackQuery):
     except ValueError:
         return await c.message.answer("درخواست خرید نامعتبر است.", reply_markup=menus.main_reply_kb(c.from_user.id))
 
-    if qty < 1 or qty > 4:
-        return await c.message.answer("تعداد انتخاب‌شده معتبر نیست.", reply_markup=menus.main_reply_kb(c.from_user.id))
-
-    price = settings.plan_price()
-    total_price = price * qty
-    balance = user["balance"] if user else 0
-    stock = subs.stock_count()
-
-    if stock < qty:
-        return await c.message.answer(
-            f"❌ موجودی کافی نیست. موجودی فعلی: {stock}",
-            reply_markup=menus.main_reply_kb(c.from_user.id),
-        )
-
-    if balance < total_price:
-        return await c.message.answer(
-            f"⚠️ موجودی کافی نیست.\n"
-            f"مبلغ مورد نیاز: {total_price:,} تومان\n"
-            f"موجودی شما: {balance:,} تومان",
-            reply_markup=wallet_menu_kb(),
-        )
-
     was_first_purchase = int(user["purchased"] or 0) == 0
-    purchased_items = []
+    price = settings.plan_price()
 
-    db.add_balance(user_id, -total_price)
-
-    for _ in range(qty):
-        sub = subs.get_sub()
-        if not sub:
-            break
-
-        sub_id, link = sub["id"], sub["link"]
-        account_name = sub["account_name"] or "-"
-        subs.assign_sub(sub_id, user_id, price_paid=price)
-        db.increment_purchased(user_id)
-        purchased_items.append((sub_id, link, account_name))
-
-    if not purchased_items:
-        db.add_balance(user_id, total_price)
-        return await c.message.answer("❌ خرید انجام نشد؛ موجودی لینک تمام شد.", reply_markup=menus.main_reply_kb(c.from_user.id))
-
-    if len(purchased_items) != qty:
-        # در حالت نادر، اگر وسط کار موجودی تمام شد، مبلغ لینک‌های تحویل‌نشده را برمی‌گردانیم.
-        refund = (qty - len(purchased_items)) * price
-        db.add_balance(user_id, refund)
+    try:
+        result = db.complete_purchase(user_id, qty, price, note="telegram_multi_buy")
+    except db.PurchaseError as exc:
+        if exc.code == "insufficient_balance":
+            return await c.message.answer(exc.message, reply_markup=wallet_menu_kb())
+        return await c.message.answer(f"❌ {exc.message}", reply_markup=menus.main_reply_kb(c.from_user.id))
 
     if was_first_purchase:
         status, detail = reward_ref(user_id)
-
         if status == "rewarded":
             try:
-                await bot.send_message(
-                    int(detail),
-                    "💰 یکی از زیرمجموعه‌های شما خرید کرد! پاداش رفرال به کیف پولتون اضافه شد.",
-                )
+                await bot.send_message(int(detail), "💰 یکی از زیرمجموعه‌های شما خرید کرد! پاداش رفرال به کیف پولتون اضافه شد.")
             except Exception:
                 logger.warning("could not notify referrer %s", detail)
-
         elif status == "blocked":
             for admin_id in ADMIN_IDS:
                 try:
@@ -318,22 +242,24 @@ async def buy_qty(c: types.CallbackQuery):
 
     await c.message.answer(
         f"✅ خرید موفق!\n"
-        f"تعداد تحویل‌شده: {len(purchased_items)} عدد\n"
-        f"مبلغ کسرشده: {len(purchased_items) * price:,} تومان",
+        f"شماره خرید: #{result['purchase_id']}\n"
+        f"تعداد: {result['quantity']} عدد\n"
+        f"مبلغ کسرشده: {result['amount']:,} تومان\n"
+        f"موجودی جدید: {result['balance_after']:,} تومان",
         reply_markup=menus.main_reply_kb(c.from_user.id),
     )
 
-    for index, (sub_id, link, account_name) in enumerate(purchased_items, start=1):
-        qr_path = make_qr(link, user_id)
-
+    for index, item in enumerate(result["items"], start=1):
+        qr_path = make_qr(item["link"], user_id)
         try:
             with open(qr_path, "rb") as f:
                 await c.message.answer_photo(
                     f,
                     caption=(
                         f"✅ سرویس #{index}\n"
-                        f"اکانت: {account_name}\n\n"
-                        f"لینک سرویس:\n{link}"
+                        f"شناسه: {item['account_name']}\n"
+                        f"وضعیت: تحویل‌شده\n\n"
+                        f"لینک سرویس:\n{item['link']}"
                     ),
                 )
         finally:
@@ -343,11 +269,12 @@ async def buy_qty(c: types.CallbackQuery):
         try:
             await bot.send_message(
                 admin_id,
-                f"🛒 خرید جدید\n"
+                f"🛒 خرید جدید #{result['purchase_id']}\n"
                 f"کاربر: {c.from_user.full_name} (@{c.from_user.username or '-'})\n"
                 f"ID: {user_id}\n"
-                f"تعداد: {len(purchased_items)}\n"
-                f"مبلغ: {len(purchased_items) * price:,} تومان",
+                f"تعداد: {result['quantity']}\n"
+                f"مبلغ: {result['amount']:,} تومان\n"
+                f"اکانت‌ها: {', '.join([x['account_name'] for x in result['items']])}",
             )
         except Exception:
             pass
@@ -355,12 +282,7 @@ async def buy_qty(c: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "confirm_buy")
 async def confirm_buy(c: types.CallbackQuery):
-    """
-    سازگاری با نسخه قبل:
-    اگر دکمه قدیمی confirm_buy جایی باقی مانده باشد، آن را به خرید یک‌عددی وصل می‌کنیم.
-    """
-    # در نسخه جدید، خرید تک‌عددی همان مسیر buy_qty_1 است.
-    class _Shim:
+    class Shim:
         data = "buy_qty_1"
         from_user = c.from_user
         message = c.message
@@ -368,17 +290,15 @@ async def confirm_buy(c: types.CallbackQuery):
         async def answer(self, *args, **kwargs):
             return await c.answer(*args, **kwargs)
 
-    await buy_qty(_Shim())
+    await buy_qty(Shim())
 
 
 @dp.callback_query_handler(lambda c: c.data == "buy_bulk")
 async def buy_bulk(c: types.CallbackQuery):
     await c.answer()
     user_id = str(c.from_user.id)
-    db.touch_active(user_id, c.from_user.username)
-
+    ensure_user(user_id, c.from_user.username or "")
     ticket_id = db.create_ticket(user_id)
-
     text = (
         f"📦 درخواست خرید عمده #{ticket_id}\n\n"
         f"کاربر: {c.from_user.full_name}\n"
@@ -386,40 +306,39 @@ async def buy_bulk(c: types.CallbackQuery):
         f"User ID: {user_id}\n\n"
         "لطفاً با کاربر صحبت کنید و تعداد/شرایط خرید عمده را دستی هماهنگ کنید."
     )
-
     for admin_id in ADMIN_IDS:
         try:
             sent = await bot.send_message(admin_id, text)
             db.record_ticket_message(admin_id, sent.message_id, ticket_id, user_id)
         except Exception:
             pass
-
     await c.message.answer(
-        "✅ درخواست خرید عمده برای مدیریت ارسال شد.\n"
-        "به‌زودی برای هماهنگی با شما تماس گرفته می‌شود.",
+        "✅ درخواست خرید عمده برای مدیریت ارسال شد. به‌زودی برای هماهنگی با شما تماس گرفته می‌شود.",
         reply_markup=menus.main_reply_kb(c.from_user.id),
     )
 
 
 async def show_my_subs(target, user_id: int, username: str = ""):
-    user_id_str = str(user_id)
-    db.touch_active(user_id_str, username)
-
-    rows = subs.user_subs(user_id_str)
-
+    ensure_user(user_id, username)
+    rows = subs.user_subs(str(user_id), limit=10)
     if not rows:
         return await target.answer("هنوز هیچ اشتراکی خریداری نکردید.", reply_markup=menus.main_reply_kb(user_id))
 
     lines = ["📦 اشتراک‌های شما:\n"]
-
-    for r in rows:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for idx, r in enumerate(rows, start=1):
         lines.append(
-            f"اکانت: {r['account_name'] or '-'}\n"
-            f"لینک: {r['link']}\n"
-            f"تاریخ خرید: {r['assigned_at']}\n"
+            f"{idx}) {r['account_name'] or '-'}\n"
+            f"تاریخ خرید: {r['assigned_at'] or '-'}\n"
+            f"مبلغ: {(r['price_paid'] or 0):,} تومان\n"
+            f"وضعیت: {r['status'] or 'delivered'}\n"
         )
-
-    await target.answer("\n".join(lines), reply_markup=menus.main_reply_kb(user_id))
+        kb.add(
+            types.InlineKeyboardButton(f"🔗 لینک {idx}", callback_data=f"sub_link_{r['id']}"),
+            types.InlineKeyboardButton(f"📷 QR {idx}", callback_data=f"sub_qr_{r['id']}"),
+        )
+    kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
+    await target.answer("\n".join(lines), reply_markup=kb)
 
 
 @dp.callback_query_handler(lambda c: c.data == "my_subs")
@@ -428,18 +347,44 @@ async def my_subs(c: types.CallbackQuery):
     await show_my_subs(c.message, c.from_user.id, c.from_user.username or "")
 
 
+@dp.callback_query_handler(lambda c: c.data.startswith("sub_link_"))
+async def show_sub_link(c: types.CallbackQuery):
+    await c.answer()
+    sub_id = int(c.data.split("_")[-1])
+    row = subs.get_sub_by_id(sub_id)
+    if not row or str(row["owner"]) != str(c.from_user.id):
+        return await c.message.answer("این سرویس برای شما نیست یا پیدا نشد.")
+    await c.message.answer(
+        f"🔗 لینک سرویس\nشناسه: {row['account_name']}\n\n{row['link']}",
+        reply_markup=menus.main_reply_kb(c.from_user.id),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("sub_qr_"))
+async def show_sub_qr(c: types.CallbackQuery):
+    await c.answer()
+    sub_id = int(c.data.split("_")[-1])
+    row = subs.get_sub_by_id(sub_id)
+    if not row or str(row["owner"]) != str(c.from_user.id):
+        return await c.message.answer("این سرویس برای شما نیست یا پیدا نشد.")
+    qr_path = make_qr(row["link"], c.from_user.id)
+    try:
+        with open(qr_path, "rb") as f:
+            await c.message.answer_photo(
+                f,
+                caption=f"📷 QR سرویس\nشناسه: {row['account_name']}",
+                reply_markup=menus.main_reply_kb(c.from_user.id),
+            )
+    finally:
+        cleanup_qr(qr_path)
+
+
 async def show_wallet(target, user_id: int, username: str = ""):
-    user_id_str = str(user_id)
-    db.touch_active(user_id_str, username)
-
-    user = db.get_user(user_id_str)
-    bal = user["balance"] if user else 0
-    purchased = user["purchased"] if user else 0
-
+    user = ensure_user(user_id, username)
     await messages.send(
         target,
         "menu_wallet",
-        f"💳 موجودی: {bal:,} تومان\n📦 تعداد خرید: {purchased}",
+        f"💳 موجودی: {int(user['balance']):,} تومان\n📦 تعداد سرویس خریداری‌شده: {int(user['purchased']):,}",
         reply_markup=wallet_menu_kb(),
     )
 
@@ -451,12 +396,11 @@ async def wallet_menu(c: types.CallbackQuery):
 
 
 async def show_referral(target, user_id: int, username: str = ""):
-    user_id_str = str(user_id)
+    ensure_user(user_id, username)
     bot_user = (await bot.get_me()).username
-    link = f"https://t.me/{bot_user}?start={user_id_str}"
-    count = db.referral_count(user_id_str)
+    link = f"https://t.me/{bot_user}?start={user_id}"
+    count = db.referral_count(str(user_id))
     reward = settings.ref_reward()
-
     await messages.send(
         target,
         "menu_referral",
@@ -482,7 +426,6 @@ admin.register(dp)
 @dp.errors_handler()
 async def global_error_handler(update: types.Update, exception: Exception):
     logger.exception("خطای پیش‌بینی‌نشده: %s", exception)
-
     try:
         if update.message:
             await update.message.answer(
@@ -496,15 +439,12 @@ async def global_error_handler(update: types.Update, exception: Exception):
             )
     except Exception:
         pass
-
     tb = traceback.format_exc()[-1500:]
-
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, f"🚨 خطای پیش‌بینی‌نشده:\n{tb}")
         except Exception:
             pass
-
     return True
 
 

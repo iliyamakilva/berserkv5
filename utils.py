@@ -1,8 +1,5 @@
-"""تولید QR کد برای لینک ساب، با پاکسازی فایل موقت بعد از ارسال."""
-
 import os
 import tempfile
-
 import qrcode
 
 
