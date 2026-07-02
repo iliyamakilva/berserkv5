@@ -11,6 +11,7 @@ import os
 import sys
 
 from aiogram import types
+from aiogram import Bot
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -132,6 +133,11 @@ async def process_search(m: types.Message, state: FSMContext):
             f"زیرمجموعه: {refs} نفر\n"
             f"عضویت: {r['joined_at']}"
         )
+        owned = subs.user_subs(r["id"])
+        if owned:
+            text += "\n\n📦 اکانت‌های این کاربر:\n" + "\n".join(
+                f"  {s['account_name'] or '-'} ({s['assigned_at']})" for s in owned
+            )
         await m.answer(text, parse_mode="Markdown")
 
 
@@ -489,7 +495,8 @@ async def process_message_edit(m: types.Message, state: FSMContext):
 # بک‌آپ دستی و بازگردانی
 # ---------------------------------------------------------------------------
 
-async def cb_backup(c: types.CallbackQuery, bot):
+async def cb_backup(c: types.CallbackQuery):
+    bot = Bot.get_current()
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer("در حال آماده‌سازی بک‌آپ...")
@@ -510,7 +517,7 @@ async def cb_restore_start(c: types.CallbackQuery):
     await AdminStates.waiting_restore_file.set()
 
 
-async def process_restore_file(m: types.Message, state: FSMContext, bot):
+async def process_restore_file(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return
     if m.content_type != "document":
