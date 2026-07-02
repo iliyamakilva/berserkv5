@@ -1,2 +1,3 @@
 aiogram==2.25.1
-qrcode
+aiohttp==3.8.6
+qrcode[pil]==7.4.2
