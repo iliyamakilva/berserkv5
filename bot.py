@@ -47,6 +47,7 @@ dp = Dispatcher(bot, storage=SQLiteStorage())
 def main_menu_kb(user_id=None):
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("💰 خرید سرویس", callback_data="buy"))
+    kb.add(types.InlineKeyboardButton("📦 اشتراک‌های من", callback_data="my_subs"))
     kb.add(types.InlineKeyboardButton("💳 کیف پول", callback_data="wallet"))
     kb.add(types.InlineKeyboardButton("👥 دعوت دوستان", callback_data="referral"))
     kb.add(types.InlineKeyboardButton("🎫 پشتیبانی", callback_data="ticket_start"))
@@ -184,6 +185,7 @@ async def confirm_buy(c: types.CallbackQuery):
         return await c.message.answer("❌ در حال حاضر موجودی سرویس نداریم. لطفا بعدا تلاش کنید.")
 
     sub_id, link = sub["id"], sub["link"]
+    account_name = sub["account_name"] or "-"
 
     db.add_balance(user_id, -price)
     subs.assign_sub(sub_id, user_id, price_paid=price)
@@ -212,11 +214,31 @@ async def confirm_buy(c: types.CallbackQuery):
         with open(qr_path, "rb") as f:
             await c.message.answer_photo(
                 f,
-                caption=f"✅ خرید موفق!\n🔗 لینک سرویس:\n`{link}`",
+                caption=f"✅ خرید موفق!\n👤 اکانت: {account_name}\n🔗 لینک سرویس:\n`{link}`",
                 parse_mode="Markdown",
             )
     finally:
         cleanup_qr(qr_path)
+
+
+@dp.callback_query_handler(lambda c: c.data == "my_subs")
+async def my_subs(c: types.CallbackQuery):
+    await c.answer()
+    user_id = str(c.from_user.id)
+    db.touch_active(user_id, c.from_user.username)
+
+    rows = subs.user_subs(user_id)
+    if not rows:
+        return await c.message.answer("هنوز هیچ اشتراکی خریداری نکردید.")
+
+    lines = ["📦 اشتراک‌های شما:\n"]
+    for r in rows:
+        lines.append(
+            f"👤 {r['account_name'] or '-'}\n"
+            f"🔗 `{r['link']}`\n"
+            f"🕒 {r['assigned_at']}\n"
+        )
+    await c.message.answer("\n".join(lines), parse_mode="Markdown")
 
 
 @dp.callback_query_handler(lambda c: c.data == "wallet")
