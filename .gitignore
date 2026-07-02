@@ -1,0 +1,4 @@
+berserk.db
+berserk_pre_restore_*.db
+__pycache__/
+*.pyc
