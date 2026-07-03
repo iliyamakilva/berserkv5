@@ -29,6 +29,8 @@ class AdminStates(StatesGroup):
     waiting_ban_id = State()
     waiting_unban_id = State()
     waiting_add_sub = State()
+    waiting_link_search = State()
+    waiting_link_delete_id = State()
     waiting_setting_value = State()
     waiting_message_edit = State()
     waiting_restore_file = State()
@@ -52,7 +54,7 @@ def admin_menu_kb():
         InlineKeyboardButton("➕ موجودی دستی", callback_data="adm_addbal"),
         InlineKeyboardButton("⛔ بن", callback_data="adm_ban"),
         InlineKeyboardButton("✅ آنبن", callback_data="adm_unban"),
-        InlineKeyboardButton("➕ افزودن لینک", callback_data="adm_addsub"),
+        InlineKeyboardButton("🔗 لینک‌ها", callback_data="adm_links"),
         InlineKeyboardButton("💳 شارژهای در انتظار", callback_data="adm_topups"),
         InlineKeyboardButton("🎫 تیکت‌های باز", callback_data="adm_tickets"),
         InlineKeyboardButton("📊 آمار و درآمد", callback_data="adm_stats"),
@@ -465,6 +467,317 @@ async def process_unban(m: types.Message, state: FSMContext):
     await m.answer(f"✅ کاربر {target} آنبن شد.", reply_markup=admin_back_kb())
 
 
+
+def link_manager_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ افزودن لینک", callback_data="adm_link_add"),
+        InlineKeyboardButton("📦 لینک‌های آزاد", callback_data="adm_links_available"),
+        InlineKeyboardButton("✅ لینک‌های تحویل‌شده", callback_data="adm_links_delivered"),
+        InlineKeyboardButton("🔎 جستجوی لینک", callback_data="adm_link_search"),
+        InlineKeyboardButton("🗑 حذف لینک آزاد", callback_data="adm_link_delete_manual"),
+    )
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+    return kb
+
+
+def link_back_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🔗 بازگشت به مدیریت لینک‌ها", callback_data="adm_links"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+    return kb
+
+
+def _link_status_label(row):
+    if not row:
+        return "-"
+
+    if int(row["used"] or 0) == 1:
+        return "✅ تحویل‌شده"
+
+    if (row["status"] or "") == "disabled":
+        return "🚫 غیرفعال"
+
+    return "📦 آزاد"
+
+
+def _fmt_link_row(row):
+    owner = row["owner"] or "-"
+    owner_text = owner
+
+    if owner != "-":
+        user = db.get_user(owner)
+        if user and user["username"]:
+            owner_text = f"{owner} (@{user['username']})"
+
+    return (
+        f"🔗 Link #{row['id']}\n"
+        f"شناسه سرویس: {row['account_name'] or '-'}\n"
+        f"وضعیت: {_link_status_label(row)}\n"
+        f"مالک: {owner_text}\n"
+        f"قیمت فروش: {_fmt_money(row['price_paid'])}\n"
+        f"خرید/تحویل: {row['assigned_at'] or '-'}\n"
+        f"Purchase ID: {row['purchase_id'] or '-'}\n"
+        f"افزوده‌شده: {row['added_at'] or '-'}\n"
+        f"لینک کوتاه: {_short(row['link'], 80)}"
+    )
+
+
+def _links_list_text(title, rows):
+    if not rows:
+        return f"{title}\n\nموردی پیدا نشد."
+
+    text = f"{title}\n\n"
+
+    for row in rows:
+        text += (
+            f"• #{row['id']} | {row['account_name'] or '-'} | {_link_status_label(row)}\n"
+            f"  مالک: {row['owner'] or '-'} | قیمت: {_fmt_money(row['price_paid'])}\n"
+            f"  لینک: {_short(row['link'], 65)}\n\n"
+        )
+
+    return text.strip()
+
+
+def _links_list_kb(rows, back_callback="adm_links"):
+    kb = InlineKeyboardMarkup(row_width=2)
+
+    for row in rows[:12]:
+        kb.insert(InlineKeyboardButton(f"جزئیات #{row['id']}", callback_data=f"adm_link_detail_{row['id']}"))
+
+        if int(row["used"] or 0) == 0:
+            kb.insert(InlineKeyboardButton(f"حذف #{row['id']}", callback_data=f"adm_link_delete_ask_{row['id']}"))
+
+    kb.add(InlineKeyboardButton("🔗 بازگشت به مدیریت لینک‌ها", callback_data=back_callback))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+    return kb
+
+
+async def cb_links(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    counts = subs.link_counts()
+
+    text = (
+        "🔗 مدیریت لینک‌ها\n\n"
+        "از این بخش می‌تونی لینک‌های ساب رو مدیریت کنی؛ جزئیات ببینی، لینک جدید اضافه کنی یا لینک آزاد رو حذف کنی.\n\n"
+        f"📊 آمار لینک‌ها:\n"
+        f"کل لینک‌ها: {counts['total']}\n"
+        f"آزاد/قابل فروش: {counts['available']}\n"
+        f"تحویل‌شده/فروخته‌شده: {counts['delivered']}\n\n"
+        "⚠️ نکته: لینک تحویل‌شده حذف نمی‌شود چون سابقه خرید و جزئیات کاربر خراب می‌شود. فقط لینک‌های آزاد قابل حذف هستند."
+    )
+
+    await _replace_callback_message(c, text, reply_markup=link_manager_kb())
+
+
+async def cb_links_available(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    rows = subs.list_links("available", limit=15)
+    await _replace_callback_message(
+        c,
+        _links_list_text("📦 آخرین لینک‌های آزاد", rows),
+        reply_markup=_links_list_kb(rows),
+    )
+
+
+async def cb_links_delivered(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    rows = subs.list_links("delivered", limit=15)
+    await _replace_callback_message(
+        c,
+        _links_list_text("✅ آخرین لینک‌های تحویل‌شده", rows),
+        reply_markup=_links_list_kb(rows),
+    )
+
+
+async def cb_link_detail(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    link_id = c.data.split("adm_link_detail_", 1)[1]
+    row = subs.get_link_detail(link_id)
+
+    if not row:
+        return await _replace_callback_message(c, "این لینک پیدا نشد.", reply_markup=link_back_kb())
+
+    text = _fmt_link_row(row) + f"\n\nلینک کامل:\n{row['link']}"
+
+    kb = InlineKeyboardMarkup(row_width=1)
+
+    if int(row["used"] or 0) == 0:
+        kb.add(InlineKeyboardButton("🗑 حذف این لینک آزاد", callback_data=f"adm_link_delete_ask_{row['id']}"))
+    elif row["owner"]:
+        kb.add(InlineKeyboardButton("👤 جزئیات مالک", callback_data=f"adm_user_{row['owner']}"))
+
+    kb.add(InlineKeyboardButton("🔗 بازگشت به مدیریت لینک‌ها", callback_data="adm_links"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+
+    await _replace_callback_message(c, text, reply_markup=kb)
+
+
+async def cb_link_delete_ask(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    link_id = c.data.split("adm_link_delete_ask_", 1)[1]
+    row = subs.get_link_detail(link_id)
+
+    if not row:
+        return await _replace_callback_message(c, "این لینک پیدا نشد.", reply_markup=link_back_kb())
+
+    if int(row["used"] or 0) == 1:
+        return await _replace_callback_message(
+            c,
+            "❌ این لینک قبلاً تحویل شده و حذف نمی‌شود.\n"
+            "حذف لینک تحویل‌شده باعث خراب شدن سابقه خرید و جزئیات کاربر می‌شود.",
+            reply_markup=link_back_kb(),
+        )
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"adm_link_delete_confirm_{row['id']}"),
+        InlineKeyboardButton("❌ منصرف شدم", callback_data="adm_links"),
+    )
+
+    await _replace_callback_message(
+        c,
+        f"⚠️ حذف لینک آزاد\n\n"
+        f"Link ID: #{row['id']}\n"
+        f"شناسه سرویس: {row['account_name'] or '-'}\n"
+        f"لینک: {_short(row['link'], 100)}\n\n"
+        "آیا مطمئنی؟",
+        reply_markup=kb,
+    )
+
+
+async def cb_link_delete_confirm(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    link_id = c.data.split("adm_link_delete_confirm_", 1)[1]
+    ok, reason = subs.delete_available_link(link_id)
+
+    if ok:
+        counts = subs.link_counts()
+        return await _replace_callback_message(
+            c,
+            f"✅ لینک #{link_id} حذف شد.\n\nموجودی آزاد فعلی: {counts['available']}",
+            reply_markup=link_manager_kb(),
+        )
+
+    if reason == "already_delivered":
+        msg = "❌ این لینک قبلاً تحویل شده و قابل حذف نیست."
+    elif reason == "not_found":
+        msg = "❌ این لینک پیدا نشد."
+    else:
+        msg = "❌ حذف لینک انجام نشد."
+
+    await _replace_callback_message(c, msg, reply_markup=link_back_kb())
+
+
+async def cb_link_add(c: types.CallbackQuery):
+    await cb_addsub(c)
+
+
+async def cb_link_search(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    await _replace_callback_message(
+        c,
+        "🔎 جستجوی لینک\n\n"
+        "یکی از این موارد رو بفرست:\n"
+        "• Link ID\n"
+        "• شناسه Berserk\n"
+        "• بخشی از لینک\n"
+        "• User ID مالک",
+        reply_markup=cancel_kb(),
+    )
+    await AdminStates.waiting_link_search.set()
+
+
+async def process_link_search(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+
+    if m.content_type != "text":
+        return await m.answer("لطفاً عبارت جستجو را به صورت متن بفرستید.", reply_markup=cancel_kb())
+
+    rows = subs.search_links(m.text, limit=15)
+    await state.finish()
+
+    await m.answer(
+        _links_list_text("🔎 نتیجه جستجوی لینک", rows),
+        reply_markup=_links_list_kb(rows),
+    )
+
+
+async def cb_link_delete_manual(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    await _replace_callback_message(
+        c,
+        "🗑 حذف لینک آزاد\n\n"
+        "Link ID لینکی که می‌خوای حذف بشه رو بفرست.\n"
+        "فقط لینک‌هایی که هنوز به کاربر تحویل نشده‌اند قابل حذف هستند.",
+        reply_markup=cancel_kb(),
+    )
+    await AdminStates.waiting_link_delete_id.set()
+
+
+async def process_link_delete_id(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+
+    if m.content_type != "text" or not m.text.strip().isdigit():
+        return await m.answer("لطفاً فقط Link ID عددی را بفرستید.", reply_markup=cancel_kb())
+
+    link_id = int(m.text.strip())
+    row = subs.get_link_detail(link_id)
+
+    if not row:
+        await state.finish()
+        return await m.answer("این لینک پیدا نشد.", reply_markup=link_back_kb())
+
+    await state.finish()
+
+    if int(row["used"] or 0) == 1:
+        return await m.answer(
+            "❌ این لینک قبلاً تحویل شده و قابل حذف نیست.\n"
+            "حذف لینک تحویل‌شده سابقه خرید کاربر را خراب می‌کند.",
+            reply_markup=link_back_kb(),
+        )
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ بله، حذف کن", callback_data=f"adm_link_delete_confirm_{row['id']}"),
+        InlineKeyboardButton("❌ منصرف شدم", callback_data="adm_links"),
+    )
+    await m.answer(
+        f"⚠️ حذف لینک آزاد\n\n"
+        f"Link ID: #{row['id']}\n"
+        f"شناسه سرویس: {row['account_name'] or '-'}\n"
+        f"لینک: {_short(row['link'], 100)}\n\n"
+        "آیا مطمئنی؟",
+        reply_markup=kb,
+    )
+
+
 async def cb_addsub(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
@@ -485,7 +798,7 @@ async def process_addsub(m: types.Message, state: FSMContext):
         return await m.answer("لطفا لینک(ها) رو به‌صورت متن بفرستید.", reply_markup=cancel_kb())
     count = subs.add_subs_bulk(m.text.splitlines())
     await state.finish()
-    await m.answer(f"✅ {count} لینک اضافه شد.\nموجودی فعلی: {subs.stock_count()}", reply_markup=admin_back_kb())
+    await m.answer(f"✅ {count} لینک اضافه شد.\nموجودی فعلی: {subs.stock_count()}", reply_markup=link_manager_kb())
 
 
 async def cb_topups(c: types.CallbackQuery):
@@ -637,36 +950,68 @@ async def cb_messages(c: types.CallbackQuery):
 async def cb_msgkey(c: types.CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
     key = c.data.split("msgkey_", 1)[1]
     label = dict(messages.MESSAGE_KEYS).get(key, key)
     current_text, current_photo = messages.get(key)
+
     await state.update_data(message_key=key)
-    info = f"وضعیت فعلی «{label}»:\nمتن بنر: {current_text or '(چیزی تنظیم نشده)'}\nعکس: {'دارد' if current_photo else '(چیزی تنظیم نشده)'}"
-    await c.message.answer(info + "\n\nمتن یا عکس جدید را بفرستید. برای پاک کردن /clear بفرستید.", reply_markup=cancel_kb())
+
+    info = (
+        f"📝 ویرایش «{label}»\n\n"
+        f"متن فعلی: {current_text or '(تنظیم نشده؛ متن پیش‌فرض استفاده می‌شود)'}\n"
+        f"عکس فعلی: {'دارد' if current_photo else '(تنظیم نشده)'}\n\n"
+        "متن جدیدی که می‌فرستید، جایگزین کامل متن پیش‌فرض می‌شود؛ "
+        "دیگر متن پیش‌فرض زیر آن اضافه نمی‌شود.\n\n"
+        "برای پاک کردن متن/عکس سفارشی و برگشت به حالت پیش‌فرض، /clear را بفرستید.\n"
+        "برای تنظیم عکس، عکس را همراه کپشن اختیاری بفرستید."
+    )
+
+    await _replace_callback_message(c, info, reply_markup=cancel_kb())
     await AdminStates.waiting_message_edit.set()
 
 
 async def process_message_edit(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return
+
     data = await state.get_data()
     key = data["message_key"]
+    label = dict(messages.MESSAGE_KEYS).get(key, key)
+
     if m.content_type == "text":
         if m.text.strip() == "/clear":
             messages.clear(key)
             await state.finish()
-            return await m.answer("✅ بنر پاک شد.", reply_markup=messages_menu_kb())
+            return await m.answer(
+                f"✅ پیام سفارشی «{label}» پاک شد.\n"
+                "از این به بعد متن پیش‌فرض خود ربات نمایش داده می‌شود.",
+                reply_markup=messages_menu_kb(),
+            )
+
         messages.set_text(key, m.text)
         await state.finish()
-        return await m.answer("✅ متن بنر به‌روزرسانی شد.", reply_markup=messages_menu_kb())
+        return await m.answer(
+            f"✅ متن «{label}» به‌روزرسانی شد.\n"
+            "این متن از حالا جایگزین کامل متن پیش‌فرض می‌شود.",
+            reply_markup=messages_menu_kb(),
+        )
+
     if m.content_type == "photo":
         messages.set_photo(key, m.photo[-1].file_id)
+
         if m.caption:
             messages.set_text(key, m.caption)
+
         await state.finish()
-        return await m.answer("✅ عکس/متن به‌روزرسانی شد.", reply_markup=messages_menu_kb())
-    await m.answer("لطفا فقط متن یا عکس بفرستید.", reply_markup=cancel_kb())
+        return await m.answer(
+            f"✅ عکس/متن «{label}» به‌روزرسانی شد.\n"
+            "اگر کپشن داده باشید، همان کپشن جایگزین کامل متن پیش‌فرض می‌شود.",
+            reply_markup=messages_menu_kb(),
+        )
+
+    await m.answer("لطفاً فقط متن یا عکس بفرستید.", reply_markup=cancel_kb())
 
 
 BROADCAST_SCOPES = {
@@ -924,6 +1269,18 @@ def register(dp):
 
     dp.register_callback_query_handler(cb_unban, lambda c: c.data == "adm_unban")
     dp.register_message_handler(process_unban, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_unban_id)
+
+    dp.register_callback_query_handler(cb_links, lambda c: c.data == "adm_links")
+    dp.register_callback_query_handler(cb_links_available, lambda c: c.data == "adm_links_available")
+    dp.register_callback_query_handler(cb_links_delivered, lambda c: c.data == "adm_links_delivered")
+    dp.register_callback_query_handler(cb_link_detail, lambda c: c.data.startswith("adm_link_detail_"))
+    dp.register_callback_query_handler(cb_link_delete_ask, lambda c: c.data.startswith("adm_link_delete_ask_"))
+    dp.register_callback_query_handler(cb_link_delete_confirm, lambda c: c.data.startswith("adm_link_delete_confirm_"))
+    dp.register_callback_query_handler(cb_link_add, lambda c: c.data == "adm_link_add")
+    dp.register_callback_query_handler(cb_link_search, lambda c: c.data == "adm_link_search")
+    dp.register_message_handler(process_link_search, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_link_search)
+    dp.register_callback_query_handler(cb_link_delete_manual, lambda c: c.data == "adm_link_delete_manual")
+    dp.register_message_handler(process_link_delete_id, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_link_delete_id)
 
     dp.register_callback_query_handler(cb_addsub, lambda c: c.data == "adm_addsub")
     dp.register_message_handler(process_addsub, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_add_sub)

@@ -124,3 +124,121 @@ def short_link(link, size=34):
     if len(link) <= size:
         return link
     return link[:size] + "..."
+
+
+# مدیریت کامل لینک‌ها برای پنل ادمین
+
+def link_counts():
+    cur.execute("SELECT COUNT(*) AS c FROM subs")
+    total = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0")
+    available = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1")
+    delivered = cur.fetchone()["c"]
+
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE status='disabled'")
+    disabled = cur.fetchone()["c"]
+
+    return {
+        "total": total,
+        "available": available,
+        "delivered": delivered,
+        "disabled": disabled,
+    }
+
+
+def list_links(kind="all", limit=15, offset=0):
+    where = ""
+    params = []
+
+    if kind == "available":
+        where = "WHERE used=0"
+    elif kind == "delivered":
+        where = "WHERE used=1"
+    elif kind == "disabled":
+        where = "WHERE status='disabled'"
+
+    sql = f"""
+        SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+        FROM subs
+        {where}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+    """
+
+    params.extend([int(limit), int(offset)])
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def search_links(query, limit=15):
+    q = (query or "").strip()
+
+    if not q:
+        return []
+
+    like = f"%{q}%"
+
+    if q.isdigit():
+        cur.execute(
+            """
+            SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+            FROM subs
+            WHERE id=? OR owner=? OR link LIKE ? OR account_name LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(q), q, like, like, int(limit)),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+            FROM subs
+            WHERE link LIKE ? OR account_name LIKE ? OR owner LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (like, like, like, int(limit)),
+        )
+
+    return cur.fetchall()
+
+
+def delete_available_link(link_id):
+    """
+    فقط لینک آزاد حذف می‌شود.
+    لینک تحویل‌شده حذف نمی‌شود چون سابقه خرید و دیتیل کاربر خراب می‌شود.
+    """
+    link_id = int(link_id)
+
+    cur.execute("SELECT id, used FROM subs WHERE id=?", (link_id,))
+    row = cur.fetchone()
+
+    if not row:
+        return False, "not_found"
+
+    if int(row["used"] or 0) == 1:
+        return False, "already_delivered"
+
+    cur.execute("DELETE FROM subs WHERE id=? AND used=0", (link_id,))
+    conn.commit()
+
+    if cur.rowcount == 1:
+        return True, "deleted"
+
+    return False, "not_deleted"
+
+
+def get_link_detail(link_id):
+    cur.execute(
+        """
+        SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+        FROM subs
+        WHERE id=?
+        """,
+        (int(link_id),),
+    )
+    return cur.fetchone()
