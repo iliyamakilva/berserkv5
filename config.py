@@ -52,3 +52,7 @@ def validate():
         raise SystemExit(
             "متغیر(های) محیطی الزامی تنظیم نشده: " + ", ".join(missing)
         )
+
+
+# فاصله کوتاه بین ارسال پیام‌های همگانی برای کاهش ریسک محدودیت تلگرام
+BROADCAST_DELAY = float(os.getenv("BROADCAST_DELAY", "0.08"))

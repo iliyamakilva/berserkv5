@@ -1,88 +1,94 @@
 """
 مدیریت استخر ساب‌لینک‌ها.
 
-Patch mode:
-- فرمت فایل درست شد.
-- اختصاص لینک همچنان یک‌بار مصرف است.
-- duplicate link هنگام افزودن باعث crash نمی‌شود.
+قانون اصلی:
+- هر لینک فقط یک بار به یک کاربر اختصاص داده می‌شود.
+- شناسه سرویس Berserk برای هر لینک نگهداری می‌شود.
 """
 
-import random
-
 import db
-from db import bump_daily, conn, cur
+from db import conn, cur
 
 
 def _generate_account_name():
-    """
-    یک اسم Berserk-XXXXX یکتا می‌سازد.
-    """
-    for _ in range(20):
-        candidate = f"Berserk-{random.randint(10000, 99999)}"
-        cur.execute("SELECT 1 FROM subs WHERE account_name=?", (candidate,))
-        if cur.fetchone() is None:
-            return candidate
-
-    return f"Berserk-{random.randint(100000, 999999)}"
+    return db.generate_service_code()
 
 
 def get_sub():
-    """
-    قدیمی‌ترین لینک استفاده‌نشده را برمی‌گرداند.
-    """
-    cur.execute("SELECT id, link, account_name FROM subs WHERE used=0 ORDER BY id LIMIT 1")
+    cur.execute(
+        """
+        SELECT id, link, account_name, status, price_paid, assigned_at, owner, purchase_id
+        FROM subs
+        WHERE used=0
+        ORDER BY id
+        LIMIT 1
+        """
+    )
+    return cur.fetchone()
+
+
+def get_sub_detail(sub_id):
+    cur.execute(
+        """
+        SELECT id, link, account_name, status, price_paid, assigned_at, owner, purchase_id, used
+        FROM subs
+        WHERE id=?
+        """,
+        (int(sub_id),),
+    )
     return cur.fetchone()
 
 
 def assign_sub(sub_id, user_id, price_paid=None):
-    """
-    یک ساب را به مالک مشخص اختصاص می‌دهد.
-    """
+    account_name = _generate_account_name()
     cur.execute(
-        "UPDATE subs SET used=1, owner=?, assigned_at=datetime('now'), price_paid=? "
-        "WHERE id=? AND used=0",
-        (str(user_id), price_paid, sub_id),
+        """
+        UPDATE subs
+        SET used=1,
+            owner=?,
+            assigned_at=datetime('now'),
+            price_paid=?,
+            account_name=COALESCE(NULLIF(account_name, ''), ?),
+            status='delivered'
+        WHERE id=? AND used=0
+        """,
+        (str(user_id), price_paid, account_name, int(sub_id)),
     )
     conn.commit()
 
     if cur.rowcount:
-        bump_daily("sales")
+        db.bump_daily("sales")
         return True
-
     return False
 
 
 def add_sub(link):
     link = (link or "").strip()
-
     if not link:
         return None
 
     cur.execute("SELECT id FROM subs WHERE link=?", (link,))
-    existing = cur.fetchone()
-
-    if existing:
+    if cur.fetchone():
         return None
 
     account_name = _generate_account_name()
-
     cur.execute(
-        "INSERT INTO subs(link, account_name) VALUES (?, ?)",
+        """
+        INSERT INTO subs(link, account_name, status)
+        VALUES (?, ?, 'available')
+        """,
         (link, account_name),
     )
     conn.commit()
     db.set_low_stock_alerted(False)
-
     return cur.lastrowid
 
 
 def add_subs_bulk(links):
     added = 0
-
     for raw_link in links:
         if add_sub(raw_link):
             added += 1
-
     return added
 
 
@@ -96,10 +102,25 @@ def sold_count():
     return cur.fetchone()["c"]
 
 
-def user_subs(user_id):
-    cur.execute(
-        "SELECT id, link, account_name, assigned_at, price_paid FROM subs WHERE owner=? "
-        "ORDER BY assigned_at DESC",
-        (str(user_id),),
-    )
+def user_subs(user_id, limit=None):
+    sql = """
+        SELECT id, link, account_name, assigned_at, price_paid, status, purchase_id, used
+        FROM subs
+        WHERE owner=?
+        ORDER BY assigned_at DESC, id DESC
+    """
+    params = [str(user_id)]
+
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+
+    cur.execute(sql, params)
     return cur.fetchall()
+
+
+def short_link(link, size=34):
+    link = link or ""
+    if len(link) <= size:
+        return link
+    return link[:size] + "..."
