@@ -18,17 +18,23 @@ def is_admin_user(user_id) -> bool:
 
 
 def main_reply_kb(user_id=None):
+    """
+    منوی ثابت پایین تلگرام.
+    این منو بعد از ارسال رسید/تیکت/خرید دوباره به کاربر برمی‌گردد.
+    """
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=False)
     kb.row(BTN_BUY, BTN_MY_SUBS)
     kb.row(BTN_WALLET, BTN_REFERRAL)
     kb.row(BTN_TICKET)
+
     if user_id is not None and is_admin_user(user_id):
         kb.row(BTN_ADMIN)
+
     return kb
 
 
 def back_main_inline():
-    kb = types.InlineKeyboardMarkup()
+    kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
 

@@ -1,86 +1,89 @@
+"""
+مدیریت استخر ساب‌لینک‌ها.
+
+Patch mode:
+- فرمت فایل درست شد.
+- اختصاص لینک همچنان یک‌بار مصرف است.
+- duplicate link هنگام افزودن باعث crash نمی‌شود.
+"""
+
+import random
+
 import db
-from db import conn, cur
+from db import bump_daily, conn, cur
 
 
 def _generate_account_name():
-    return db.generate_service_code()
+    """
+    یک اسم Berserk-XXXXX یکتا می‌سازد.
+    """
+    for _ in range(20):
+        candidate = f"Berserk-{random.randint(10000, 99999)}"
+        cur.execute("SELECT 1 FROM subs WHERE account_name=?", (candidate,))
+        if cur.fetchone() is None:
+            return candidate
+
+    return f"Berserk-{random.randint(100000, 999999)}"
 
 
 def get_sub():
-    cur.execute(
-        "SELECT id, link, account_name FROM subs WHERE used=0 ORDER BY id LIMIT 1"
-    )
-    return cur.fetchone()
-
-
-def get_sub_by_id(sub_id):
-    cur.execute(
-        """
-        SELECT id, link, used, owner, added_at, assigned_at, price_paid,
-               account_name, status, purchase_id
-        FROM subs WHERE id=?
-        """,
-        (int(sub_id),),
-    )
+    """
+    قدیمی‌ترین لینک استفاده‌نشده را برمی‌گرداند.
+    """
+    cur.execute("SELECT id, link, account_name FROM subs WHERE used=0 ORDER BY id LIMIT 1")
     return cur.fetchone()
 
 
 def assign_sub(sub_id, user_id, price_paid=None):
-    cur.execute("SELECT account_name FROM subs WHERE id=?", (sub_id,))
-    row = cur.fetchone()
-    account_name = row["account_name"] if row and row["account_name"] else _generate_account_name()
+    """
+    یک ساب را به مالک مشخص اختصاص می‌دهد.
+    """
     cur.execute(
-        """
-        UPDATE subs
-        SET used=1,
-            owner=?,
-            assigned_at=datetime('now'),
-            price_paid=?,
-            account_name=?,
-            status='delivered'
-        WHERE id=? AND used=0
-        """,
-        (str(user_id), price_paid, account_name, sub_id),
+        "UPDATE subs SET used=1, owner=?, assigned_at=datetime('now'), price_paid=? "
+        "WHERE id=? AND used=0",
+        (str(user_id), price_paid, sub_id),
     )
     conn.commit()
-    db.bump_daily("sales")
+
+    if cur.rowcount:
+        bump_daily("sales")
+        return True
+
+    return False
 
 
 def add_sub(link):
-    link = link.strip()
+    link = (link or "").strip()
+
     if not link:
         return None
+
     cur.execute("SELECT id FROM subs WHERE link=?", (link,))
     existing = cur.fetchone()
+
     if existing:
-        return existing["id"]
+        return None
+
+    account_name = _generate_account_name()
+
     cur.execute(
-        "INSERT INTO subs(link, account_name, status) VALUES (?, ?, 'available')",
-        (link, _generate_account_name()),
+        "INSERT INTO subs(link, account_name) VALUES (?, ?)",
+        (link, account_name),
     )
     conn.commit()
     db.set_low_stock_alerted(False)
+
     return cur.lastrowid
 
 
 def add_subs_bulk(links):
-    count = 0
-    for link in links:
-        link = link.strip()
-        if not link:
-            continue
-        cur.execute("SELECT 1 FROM subs WHERE link=?", (link,))
-        if cur.fetchone():
-            continue
-        cur.execute(
-            "INSERT INTO subs(link, account_name, status) VALUES (?, ?, 'available')",
-            (link, _generate_account_name()),
-        )
-        count += 1
-    conn.commit()
-    if count:
-        db.set_low_stock_alerted(False)
-    return count
+    added = 0
+
+    for raw_link in links:
+        if add_sub(raw_link):
+            added += 1
+
+    return added
 
 
 def stock_count():
@@ -93,21 +96,10 @@ def sold_count():
     return cur.fetchone()["c"]
 
 
-def user_subs(user_id, limit=50):
+def user_subs(user_id):
     cur.execute(
-        """
-        SELECT id, link, account_name, assigned_at, price_paid, status, purchase_id
-        FROM subs
-        WHERE owner=?
-        ORDER BY assigned_at DESC, id DESC
-        LIMIT ?
-        """,
-        (str(user_id), limit),
+        "SELECT id, link, account_name, assigned_at, price_paid FROM subs WHERE owner=? "
+        "ORDER BY assigned_at DESC",
+        (str(user_id),),
     )
     return cur.fetchall()
-
-
-def short_link(link: str, limit=48):
-    if not link:
-        return "-"
-    return link if len(link) <= limit else link[:limit] + "..."
