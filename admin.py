@@ -90,6 +90,42 @@ async def _send_long(message, text, reply_markup=None):
     for index, chunk in enumerate(chunks):
         await message.answer(chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None)
 
+async def _safe_remove_inline_keyboard(message):
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def _safe_delete_message(message):
+    try:
+        await message.delete()
+        return True
+    except Exception:
+        return False
+
+
+async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_markup=None, parse_mode=None):
+    """
+    برای جلوگیری از شلوغ شدن پنل:
+    - اگر پیام قابل ویرایش باشد، همان پیام edit می‌شود.
+    - اگر قابل edit نباشد، پیام قبلی حذف و پیام جدید ارسال می‌شود.
+    """
+    try:
+        if getattr(c.message, "content_type", None) == types.ContentType.TEXT:
+            await c.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return
+    except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+
+    deleted = await _safe_delete_message(c.message)
+
+    if not deleted:
+        await _safe_remove_inline_keyboard(c.message)
+
+    await c.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
 
 def user_detail_kb(user_id):
     kb = InlineKeyboardMarkup(row_width=1)
@@ -224,27 +260,32 @@ async def cmd_admin(m: types.Message):
 async def cb_open_panel(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("⚙️ پنل مدیریت Berserk VPN", reply_markup=admin_menu_kb())
+    await _replace_callback_message(c, "⚙️ پنل مدیریت Berserk VPN", reply_markup=admin_menu_kb())
 
 
 async def cb_back(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("⚙️ پنل مدیریت Berserk VPN", reply_markup=admin_menu_kb())
+    await _replace_callback_message(c, "⚙️ پنل مدیریت Berserk VPN", reply_markup=admin_menu_kb())
 
 
 async def cb_users(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
     rows = db.list_users(limit=15)
+
     if not rows:
-        return await c.message.answer("هیچ کاربری ثبت نشده.", reply_markup=admin_back_kb())
+        return await _replace_callback_message(c, "هیچ کاربری ثبت نشده.", reply_markup=admin_back_kb())
 
     lines = ["👥 آخرین ۱۵ کاربر:\n"]
     kb = InlineKeyboardMarkup(row_width=1)
+
     for r in rows:
         flag = "⛔" if r["banned"] else "✅"
         username = f"@{r['username']}" if r["username"] else "بدون یوزرنیم"
@@ -253,8 +294,9 @@ async def cb_users(c: types.CallbackQuery):
             f"{flag} {r['id']} | {username} | خرید: {r['purchased']} | سرویس: {delivered} | موجودی: {_fmt_money(r['balance'])}"
         )
         kb.add(InlineKeyboardButton(f"👤 جزئیات {username} | {r['id']}", callback_data=f"adm_user_{r['id']}"))
+
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
-    await c.message.answer("\n".join(lines), reply_markup=kb)
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=kb)
 
 
 async def cb_user_detail(c: types.CallbackQuery):
@@ -325,8 +367,9 @@ async def cb_resend_qr(c: types.CallbackQuery):
 async def cb_search(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("آیدی عددی یا یوزرنیم کاربر رو بفرستید:", reply_markup=cancel_kb())
+    await _replace_callback_message(c, "آیدی عددی یا یوزرنیم کاربر رو بفرستید:", reply_markup=cancel_kb())
     await AdminStates.waiting_search.set()
 
 
@@ -348,8 +391,9 @@ async def process_search(m: types.Message, state: FSMContext):
 async def cb_addbal(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("آیدی کاربر رو بفرستید:", reply_markup=cancel_kb())
+    await _replace_callback_message(c, "آیدی کاربر رو بفرستید:", reply_markup=cancel_kb())
     await AdminStates.waiting_balance_id.set()
 
 
@@ -384,8 +428,9 @@ async def process_balance_amount(m: types.Message, state: FSMContext):
 async def cb_ban(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("آیدی کاربری که باید بن بشه رو بفرستید:", reply_markup=cancel_kb())
+    await _replace_callback_message(c, "آیدی کاربری که باید بن بشه رو بفرستید:", reply_markup=cancel_kb())
     await AdminStates.waiting_ban_id.set()
 
 
@@ -403,8 +448,9 @@ async def process_ban(m: types.Message, state: FSMContext):
 async def cb_unban(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("آیدی کاربری که باید آنبن بشه رو بفرستید:", reply_markup=cancel_kb())
+    await _replace_callback_message(c, "آیدی کاربری که باید آنبن بشه رو بفرستید:", reply_markup=cancel_kb())
     await AdminStates.waiting_unban_id.set()
 
 
@@ -422,8 +468,10 @@ async def process_unban(m: types.Message, state: FSMContext):
 async def cb_addsub(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer(
+    await _replace_callback_message(
+        c,
         "لینک(های) ساب رو بفرستید. برای افزودن چند لینک هم‌زمان، هرکدوم رو در یک خط جدا بنویسید.",
         reply_markup=cancel_kb(),
     )
@@ -497,7 +545,7 @@ async def cb_stats(c: types.CallbackQuery):
     ]
     for row in db.recent_daily_stats(7):
         lines.append(f"{row['day']}: کاربر جدید {row['new_users']} | فروش {row['sales']} | رفرال {row['referral_rewards']:,}")
-    await c.message.answer("\n".join(lines), reply_markup=admin_back_kb())
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=admin_back_kb())
 
 
 SETTING_FIELDS = [
@@ -526,8 +574,13 @@ def settings_menu_kb():
 async def cb_settings(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("⚙️ تنظیمات — روی هر مورد بزنید تا مقدارش رو تغییر بدید:", reply_markup=settings_menu_kb())
+    await _replace_callback_message(
+        c,
+        "⚙️ تنظیمات — روی هر مورد بزنید تا مقدارش رو تغییر بدید:",
+        reply_markup=settings_menu_kb(),
+    )
 
 
 async def cb_setkey(c: types.CallbackQuery, state: FSMContext):
@@ -572,8 +625,13 @@ def messages_menu_kb():
 async def cb_messages(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("📝 کدوم پیام رو می‌خواید ویرایش کنید؟", reply_markup=messages_menu_kb())
+    await _replace_callback_message(
+        c,
+        "📝 کدوم پیام رو می‌خواید ویرایش کنید؟",
+        reply_markup=messages_menu_kb(),
+    )
 
 
 async def cb_msgkey(c: types.CallbackQuery, state: FSMContext):
@@ -675,19 +733,23 @@ async def cb_broadcast_menu(c: types.CallbackQuery):
                 f"• #{log['id']} | {BROADCAST_SCOPES.get(log['scope'], log['scope'])} | "
                 f"{log['content_type']} | موفق {log['success']}/{log['total']} | {log['created_at']}\n"
             )
-    await c.message.answer(text, reply_markup=broadcast_scope_menu_kb())
+    await _replace_callback_message(c, text, reply_markup=broadcast_scope_menu_kb())
 
 
 async def cb_broadcast_scope(c: types.CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
     scope = c.data.split("broadcast_scope_", 1)[1]
+
     if scope not in BROADCAST_SCOPES:
-        return await c.message.answer("جامعه هدف نامعتبر است.", reply_markup=admin_back_kb())
+        return await _replace_callback_message(c, "جامعه هدف نامعتبر است.", reply_markup=admin_back_kb())
+
     total = db.count_broadcast_targets(scope)
     await state.update_data(scope=scope)
-    await c.message.answer(
+    await _replace_callback_message(
+        c,
         f"جامعه هدف: {BROADCAST_SCOPES[scope]}\n"
         f"تعداد مخاطب: {total}\n\n"
         "حالا یکی از این‌ها را بفرستید:\n"
@@ -815,8 +877,9 @@ async def cb_backup(c: types.CallbackQuery):
 async def cb_restore_start(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
+
     await c.answer()
-    await c.message.answer("⚠️ فایل دیتابیس (.db) رو بفرستید.", reply_markup=cancel_kb())
+    await _replace_callback_message(c, "⚠️ فایل دیتابیس (.db) رو بفرستید.", reply_markup=cancel_kb())
     await AdminStates.waiting_restore_file.set()
 
 

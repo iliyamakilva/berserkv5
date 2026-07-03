@@ -71,6 +71,17 @@ async def send_main_menu(target, user_id: int):
         reply_markup=menus.main_reply_kb(user_id),
     )
 
+async def _safe_delete_callback_message(c: types.CallbackQuery):
+    try:
+        await c.message.delete()
+        return True
+    except Exception:
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return False
+
 
 async def render_buy(target, user_id: int, username: str = ""):
     user_id_str = str(user_id)
@@ -216,15 +227,32 @@ async def cmd_cancel(m: types.Message, state: FSMContext):
 async def cb_cancel_fsm(c: types.CallbackQuery, state: FSMContext):
     await c.answer()
     current = await state.get_state()
+
     if current is not None:
         await state.finish()
-    await c.message.answer("❌ لغو شد.", reply_markup=menus.main_reply_kb(c.from_user.id))
+
+    # پیام inline قبلی حذف می‌شود تا دکمه‌های قدیمی قابل اسپم نباشند.
+    await _safe_delete_callback_message(c)
+
+    await bot.send_message(
+        c.message.chat.id,
+        "❌ لغو شد.",
+        reply_markup=menus.main_reply_kb(c.from_user.id),
+    )
 
 
 @dp.callback_query_handler(lambda c: c.data == "back_main")
 async def back_main(c: types.CallbackQuery):
     await c.answer()
-    await send_main_menu(c.message, c.from_user.id)
+
+    # پیام inline قبلی حذف می‌شود تا دکمه‌های قدیمی قابل اسپم نباشند.
+    await _safe_delete_callback_message(c)
+
+    await bot.send_message(
+        c.message.chat.id,
+        "⚡ Berserk VPN Ready\n\nاز منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
+        reply_markup=menus.main_reply_kb(c.from_user.id),
+    )
 
 
 @dp.callback_query_handler(lambda c: c.data == "buy")
