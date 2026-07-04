@@ -576,7 +576,7 @@ async def cb_links(c: types.CallbackQuery):
         f"کل لینک‌ها: {counts['total']}\n"
         f"آزاد/قابل فروش: {counts['available']}\n"
         f"تحویل‌شده/فروخته‌شده: {counts['delivered']}\n\n"
-        "⚠️ نکته: لینک تحویل‌شده حذف نمی‌شود چون سابقه خرید و جزئیات کاربر خراب می‌شود. فقط لینک‌های آزاد قابل حذف هستند."
+        "⚠️ نکته: لینک تحویل‌شده حذف مستقیم نمی‌شود. اگر تحویل اشتباه یا تست بود، از جزئیات لینک گزینه «بازگردانی به استخر» را بزنید."
     )
 
     await _replace_callback_message(c, text, reply_markup=link_manager_kb())
@@ -627,6 +627,7 @@ async def cb_link_detail(c: types.CallbackQuery):
         kb.add(InlineKeyboardButton("🗑 حذف این لینک آزاد", callback_data=f"adm_link_delete_ask_{row['id']}"))
     elif row["owner"]:
         kb.add(InlineKeyboardButton("👤 جزئیات مالک", callback_data=f"adm_user_{row['owner']}"))
+        kb.add(InlineKeyboardButton("↩️ بازگردانی به استخر", callback_data=f"adm_link_repool_ask_{row['id']}"))
 
     kb.add(InlineKeyboardButton("🔗 بازگشت به مدیریت لینک‌ها", callback_data="adm_links"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
@@ -692,6 +693,74 @@ async def cb_link_delete_confirm(c: types.CallbackQuery):
         msg = "❌ این لینک پیدا نشد."
     else:
         msg = "❌ حذف لینک انجام نشد."
+
+    await _replace_callback_message(c, msg, reply_markup=link_back_kb())
+
+
+
+async def cb_link_repool_ask(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    link_id = c.data.split("adm_link_repool_ask_", 1)[1]
+    row = subs.get_link_detail(link_id)
+
+    if not row:
+        return await _replace_callback_message(c, "این لینک پیدا نشد.", reply_markup=link_back_kb())
+
+    if int(row["used"] or 0) != 1:
+        return await _replace_callback_message(c, "این لینک تحویل‌شده نیست و نیازی به بازگردانی ندارد.", reply_markup=link_back_kb())
+
+    owner = row["owner"] or "-"
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ بله، به استخر برگردان", callback_data=f"adm_link_repool_confirm_{row['id']}"),
+        InlineKeyboardButton("❌ لغو", callback_data=f"adm_link_detail_{row['id']}"),
+    )
+
+    await _replace_callback_message(
+        c,
+        "⚠️ بازگردانی لینک تحویل‌شده به استخر\n\n"
+        f"Link ID: #{row['id']}\n"
+        f"شناسه سرویس: {row['account_name'] or '-'}\n"
+        f"مالک فعلی: {owner}\n"
+        f"Purchase ID: {row['purchase_id'] or '-'}\n"
+        f"لینک: {_short(row['link'], 100)}\n\n"
+        "این عملیات لینک را از بخش «سرویس‌های من» کاربر حذف می‌کند و همان لینک را دوباره قابل فروش می‌کند.\n"
+        "هیچ رکورد تکراری ساخته نمی‌شود. اگر کاربر قبلاً لینک را کپی کرده باشد، ممکن است همچنان لینک را داشته باشد؛ پس این گزینه را فقط برای تست، تحویل اشتباه یا اصلاح دستی استفاده کنید.",
+        reply_markup=kb,
+    )
+
+
+async def cb_link_repool_confirm(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    link_id = c.data.split("adm_link_repool_confirm_", 1)[1]
+    ok, reason, old_row = subs.return_delivered_link_to_pool(
+        link_id,
+        admin_id=c.from_user.id,
+        reason="admin_manual_return_to_pool",
+    )
+
+    if ok:
+        counts = subs.link_counts()
+        owner = old_row["owner"] if old_row else "-"
+        return await _replace_callback_message(
+            c,
+            f"✅ لینک #{link_id} از حساب {owner or '-'} حذف شد و به استخر برگشت.\n\n"
+            f"موجودی آزاد فعلی: {counts['available']}",
+            reply_markup=link_manager_kb(),
+        )
+
+    if reason == "not_delivered":
+        msg = "❌ این لینک تحویل‌شده نیست و قابل بازگردانی نیست."
+    elif reason == "not_found":
+        msg = "❌ این لینک پیدا نشد."
+    else:
+        msg = "❌ بازگردانی لینک انجام نشد."
 
     await _replace_callback_message(c, msg, reply_markup=link_back_kb())
 
@@ -942,9 +1011,9 @@ async def process_setting_value(m: types.Message, state: FSMContext):
 DEFAULT_MESSAGE_TEXTS = {
     "welcome": "⚡ Berserk VPN Ready\n\nمنوی اصلی پایین صفحه همیشه در دسترس شماست.",
     "main_menu": "⚡ Berserk VPN Ready\n\nاز منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
-    "menu_buy": "🛒 خرید سرویس",
-    "menu_wallet": "💳 کیف پول",
-    "menu_referral": "👥 لینک دعوت اختصاصی شما",
+    "menu_buy": "{body}",
+    "menu_wallet": "{body}",
+    "menu_referral": "{body}",
     "my_services_empty": "هنوز هیچ سرویسی خریداری نکردید.",
     "guide_home": "📚 آموزش اتصال\n\nدستگاه خود را انتخاب کنید:",
     "guide_android": "📱 آموزش اندروید\n\n۱. یک برنامه سازگار با ساب‌لینک نصب کنید.\n۲. لینک سرویس را کپی کنید.\n۳. داخل برنامه، گزینه Import/Subscription را بزنید.\n۴. لینک را وارد و بروزرسانی کنید.",
@@ -957,6 +1026,41 @@ DEFAULT_MESSAGE_TEXTS = {
     "rules": "📜 قوانین و شرایط خرید\n\nبعد از خرید، لینک آماده تحویل داده می‌شود. در صورت خرابی واقعی سرویس، از پشتیبانی پیگیری کنید.",
 }
 
+MESSAGE_SAMPLE_BODIES = {
+    "menu_buy": (
+        "🛒 خرید سرویس\n\n"
+        "پلن: نمونه پلن\n"
+        "⏳ مدت: ۳۰ روز\n"
+        "قیمت هر عدد: 100,000 تومان\n"
+        "موجودی کیف پول شما: 40,000 تومان\n"
+        "موجودی سرویس: 25\n\n"
+        "⚠️ موجودی کافی نیست. 60,000 تومان دیگر شارژ کنید.\n"
+        "برای هماهنگی دستی یا تعداد بالا می‌توانید خرید عمده بزنید."
+    ),
+    "menu_wallet": "💳 موجودی: 40,000 تومان\n📦 تعداد خرید: 1",
+    "menu_referral": (
+        "👥 لینک دعوت اختصاصی شما:\nhttps://t.me/YourBot?start=123456\n\n"
+        "تعداد زیرمجموعه: 2 نفر\n"
+        "پاداش هر اولین خرید واقعی زیرمجموعه: 10,000 تومان\n\n"
+        "پاداش فقط بعد از اولین خرید واقعی زیرمجموعه پرداخت می‌شود."
+    ),
+}
+
+
+def _message_default_template(key):
+    return DEFAULT_MESSAGE_TEXTS.get(key, "")
+
+
+def _message_preview_body(key):
+    return MESSAGE_SAMPLE_BODIES.get(key, _message_default_template(key))
+
+
+def _short_block(text, limit=900):
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n..."
+
 
 def messages_menu_kb():
     kb = InlineKeyboardMarkup(row_width=1)
@@ -968,6 +1072,8 @@ def messages_menu_kb():
 
 def message_action_kb(key):
     kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("👁 مشاهده متن پیش‌فرض", callback_data=f"msg_default_{key}"))
+    kb.add(InlineKeyboardButton("📋 کپی پیش‌فرض به Draft", callback_data=f"msg_copy_default_{key}"))
     kb.add(InlineKeyboardButton("✏️ ویرایش آزمایشی", callback_data=f"msg_edit_{key}"))
     kb.add(InlineKeyboardButton("🧪 پیش‌نمایش Draft", callback_data=f"msg_preview_{key}"))
     kb.add(InlineKeyboardButton("✅ ثبت نهایی / انتشار", callback_data=f"msg_publish_{key}"))
@@ -984,7 +1090,10 @@ async def cb_messages(c: types.CallbackQuery):
     await c.answer()
     await _replace_callback_message(
         c,
-        "📝 مدیریت متن‌ها\n\nمتن‌ها ابتدا به‌صورت Draft ذخیره می‌شوند. بعد از پیش‌نمایش، با «ثبت نهایی» برای کاربران منتشر می‌شوند.",
+        "📝 مدیریت متن‌ها\n\n"
+        "متن‌ها ابتدا به‌صورت Draft ذخیره می‌شوند. بعد از پیش‌نمایش، با «ثبت نهایی» برای کاربران منتشر می‌شوند.\n\n"
+        "برای پیام‌های سیستمی مثل خرید سرویس، کد {body} نماینده بخش خودکار ربات است؛ مثل قیمت، موجودی، کسری موجودی و لینک دعوت.\n"
+        "اگر در این پیام‌ها {body} را حذف کنید، ربات برای امنیت بخش سیستمی را خودکار پایین متن شما اضافه می‌کند.",
         reply_markup=messages_menu_kb(),
     )
 
@@ -998,17 +1107,64 @@ async def cb_msgkey(c: types.CallbackQuery, state: FSMContext):
     label = dict(messages.MESSAGE_KEYS).get(key, key)
     current_text, current_photo = messages.get(key)
     draft_text, draft_photo = messages.get_draft(key)
+    default_template = _message_default_template(key)
 
     info = (
         f"📝 مدیریت متن «{label}»\n\n"
-        f"متن منتشرشده: {current_text or '(تنظیم نشده؛ متن پیش‌فرض استفاده می‌شود)'}\n"
-        f"Draft: {draft_text or '(ندارد)'}\n"
+        f"نوع متن: {'سیستمی/داینامیک' if messages.is_dynamic_key(key) else 'معمولی'}\n"
+        f"متن پیش‌فرض: {_short_block(default_template, 250) or '(ندارد)'}\n\n"
+        f"متن منتشرشده: {_short_block(current_text, 350) or '(تنظیم نشده؛ متن پیش‌فرض استفاده می‌شود)'}\n\n"
+        f"Draft: {_short_block(draft_text, 350) or '(ندارد)'}\n"
         f"عکس منتشرشده: {'دارد' if current_photo else '(ندارد)'}\n"
         f"عکس Draft: {'دارد' if draft_photo else '(ندارد)'}\n\n"
         "تغییرات Draft تا وقتی ثبت نهایی نشوند، برای کاربر نمایش داده نمی‌شوند."
     )
 
     await _replace_callback_message(c, info, reply_markup=message_action_kb(key))
+
+
+async def cb_msg_default(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("msg_default_", 1)[1]
+    if not messages.is_valid_key(key):
+        return await c.message.answer("این متن پیدا نشد.", reply_markup=messages_menu_kb())
+    label = dict(messages.MESSAGE_KEYS).get(key, key)
+    default_template = _message_default_template(key)
+    sample_body = _message_preview_body(key)
+    sample_rendered = messages.render_template(key, default_template, sample_body)
+
+    help_text = (
+        f"👁 متن پیش‌فرض «{label}»\n\n"
+        f"قالب قابل کپی:\n{default_template or '(متن پیش‌فرض خالی است)'}\n\n"
+    )
+
+    if messages.is_dynamic_key(key):
+        help_text += (
+            "ℹ️ این پیام بخش سیستمی دارد. کد {body} یعنی همان متن خودکار ربات؛ مثل قیمت، موجودی، کسری موجودی یا لینک دعوت.\n"
+            "می‌توانید متن خودتان را قبل یا بعد از {body} اضافه کنید، ولی بهتر است خود {body} را نگه دارید.\n\n"
+            f"نمونه نمایش با اطلاعات فرضی:\n{sample_rendered}"
+        )
+
+    await c.message.answer(_short_block(help_text, 3800), reply_markup=message_action_kb(key))
+
+
+async def cb_msg_copy_default(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("msg_copy_default_", 1)[1]
+    if not messages.is_valid_key(key):
+        return await c.message.answer("این متن پیدا نشد.", reply_markup=messages_menu_kb())
+    default_template = _message_default_template(key)
+    messages.set_draft_text(key, default_template)
+    await _replace_callback_message(
+        c,
+        "✅ متن پیش‌فرض به Draft کپی شد.\n"
+        "حالا می‌توانید Draft را ویرایش کنید، پیش‌نمایش بگیرید و بعد ثبت نهایی کنید.",
+        reply_markup=message_action_kb(key),
+    )
 
 
 async def cb_msg_edit_start(c: types.CallbackQuery, state: FSMContext):
@@ -1020,12 +1176,24 @@ async def cb_msg_edit_start(c: types.CallbackQuery, state: FSMContext):
         return await c.message.answer("این متن پیدا نشد.", reply_markup=messages_menu_kb())
     label = dict(messages.MESSAGE_KEYS).get(key, key)
     await state.update_data(message_key=key)
+
+    hint = ""
+    if messages.is_dynamic_key(key):
+        hint = (
+            "\n\nکد سیستمی مهم: {body}\n"
+            "{body} جای قیمت، موجودی، کسری موجودی، لینک دعوت و متن خودکار ربات قرار می‌گیرد.\n"
+            "مثال:\n"
+            "توضیح دلخواه شما\n\n{body}\n\nپیام پایانی دلخواه شما"
+        )
+
     await _replace_callback_message(
         c,
         f"✏️ ویرایش آزمایشی «{label}»\n\n"
         "متن جدید را بفرستید تا به‌عنوان Draft ذخیره شود.\n"
+        "برای شروع راحت‌تر می‌توانید اول «کپی پیش‌فرض به Draft» را بزنید.\n"
         "برای تنظیم عکس Draft، عکس را همراه کپشن اختیاری بفرستید.\n"
-        "برای لغو /cancel را بزنید.",
+        "برای لغو /cancel را بزنید."
+        f"{hint}",
         reply_markup=cancel_kb(),
     )
     await AdminStates.waiting_message_edit.set()
@@ -1039,7 +1207,7 @@ async def cb_msg_preview(c: types.CallbackQuery):
     if not messages.is_valid_key(key):
         return await c.message.answer("این متن پیدا نشد.", reply_markup=messages_menu_kb())
     label = dict(messages.MESSAGE_KEYS).get(key, key)
-    text, photo = messages.compose_preview(key, DEFAULT_MESSAGE_TEXTS.get(key, ""))
+    text, photo = messages.compose_preview(key, _message_preview_body(key))
     await c.message.answer(f"🧪 پیش‌نمایش «{label}»:")
     if photo:
         await c.message.answer_photo(photo, caption=text or None)
@@ -1840,10 +2008,14 @@ async def cb_restore_confirm(c: types.CallbackQuery, state: FSMContext):
         return await c.message.answer("فایل موقت ری‌استور پیدا نشد. دوباره تلاش کنید.", reply_markup=backup_menu_kb())
 
     await c.message.answer("⏳ در حال ری‌استور... ابتدا بک‌آپ اضطراری از دیتابیس فعلی گرفته می‌شود.")
+
+    # perform_restore دیتابیس فعلی را می‌بندد و فایل DB را جایگزین می‌کند.
+    # پس پاک‌کردن state باید قبل از بسته‌شدن connection انجام شود.
+    await state.finish()
+
     try:
         safety_path = backup.perform_restore(tmp_path, admin_id=c.from_user.id)
     except Exception as exc:
-        await state.finish()
         try:
             os.remove(tmp_path)
         except OSError:
@@ -1855,7 +2027,6 @@ async def cb_restore_confirm(c: types.CallbackQuery, state: FSMContext):
     except OSError:
         pass
 
-    await state.finish()
     await c.message.answer(f"✅ بازگردانی انجام شد.\nنسخه امن قبلی:\n{safety_path}\n\nربات الان ری‌استارت میشه...")
     logging.getLogger(__name__).warning("Database restored by admin %s, restarting process.", c.from_user.id)
     sys.exit(1)
@@ -1889,6 +2060,8 @@ def register(dp):
     dp.register_callback_query_handler(cb_link_detail, lambda c: c.data.startswith("adm_link_detail_"))
     dp.register_callback_query_handler(cb_link_delete_ask, lambda c: c.data.startswith("adm_link_delete_ask_"))
     dp.register_callback_query_handler(cb_link_delete_confirm, lambda c: c.data.startswith("adm_link_delete_confirm_"))
+    dp.register_callback_query_handler(cb_link_repool_ask, lambda c: c.data.startswith("adm_link_repool_ask_"))
+    dp.register_callback_query_handler(cb_link_repool_confirm, lambda c: c.data.startswith("adm_link_repool_confirm_"))
     dp.register_callback_query_handler(cb_link_add, lambda c: c.data == "adm_link_add")
     dp.register_callback_query_handler(cb_link_search, lambda c: c.data == "adm_link_search")
     dp.register_message_handler(process_link_search, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_link_search)
@@ -1907,6 +2080,8 @@ def register(dp):
 
     dp.register_callback_query_handler(cb_messages, lambda c: c.data == "adm_messages")
     dp.register_callback_query_handler(cb_msgkey, lambda c: c.data.startswith("msgkey_"))
+    dp.register_callback_query_handler(cb_msg_default, lambda c: c.data.startswith("msg_default_"))
+    dp.register_callback_query_handler(cb_msg_copy_default, lambda c: c.data.startswith("msg_copy_default_"))
     dp.register_callback_query_handler(cb_msg_edit_start, lambda c: c.data.startswith("msg_edit_"))
     dp.register_callback_query_handler(cb_msg_preview, lambda c: c.data.startswith("msg_preview_"))
     dp.register_callback_query_handler(cb_msg_publish, lambda c: c.data.startswith("msg_publish_"))

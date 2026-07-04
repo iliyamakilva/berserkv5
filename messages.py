@@ -20,9 +20,46 @@ MESSAGE_KEYS = [
 
 _VALID_KEYS = {k for k, _ in MESSAGE_KEYS}
 
+# این پیام‌ها در زمان اجرا مقدارهای سیستمی دارند؛ مثل قیمت، موجودی، لینک دعوت و...
+# برای همین متن سفارشی آن‌ها با {body} رندر می‌شود تا بخش سیستمی حذف نشود.
+DYNAMIC_MESSAGE_KEYS = {"menu_buy", "menu_wallet", "menu_referral"}
+PLACEHOLDERS = ("{body}", "{{body}}", "{default}", "{{default}}")
+
 
 def is_valid_key(key):
     return key in _VALID_KEYS
+
+
+def is_dynamic_key(key):
+    return key in DYNAMIC_MESSAGE_KEYS
+
+
+def has_system_placeholder(text):
+    text = text or ""
+    return any(ph in text for ph in PLACEHOLDERS)
+
+
+def render_template(key, template_text, body_text):
+    """
+    رندر امن متن‌های قابل ویرایش.
+    - برای پیام‌های معمولی، متن سفارشی جایگزین متن پیش‌فرض می‌شود.
+    - برای پیام‌های داینامیک، اگر ادمین {body} نگذارد، برای جلوگیری از حذف قیمت/موجودی/لینک،
+      متن سفارشی بالای متن سیستمی قرار می‌گیرد.
+    """
+    template_text = (template_text or "").strip()
+    body_text = body_text or ""
+
+    if not template_text:
+        return body_text
+
+    rendered = template_text
+    for placeholder in PLACEHOLDERS:
+        rendered = rendered.replace(placeholder, body_text)
+
+    if is_dynamic_key(key) and not has_system_placeholder(template_text) and body_text.strip():
+        rendered = f"{template_text}\n\n{body_text}".strip()
+
+    return rendered.strip()
 
 
 def get(key):
@@ -45,24 +82,26 @@ def get_draft(key):
 
 def compose(key, default_text):
     """
-    متن منتشرشده ادمین جایگزین کامل متن پیش‌فرض می‌شود.
+    متن منتشرشده ادمین با پشتیبانی از قالب امن رندر می‌شود.
+    برای پیام‌های سیستمی/داینامیک، {body} نماینده متن اصلی ربات است.
     Draft فقط برای پیش‌نمایش ادمین است و تا انتشار نهایی برای کاربر نمایش داده نمی‌شود.
     """
     custom_text, photo_file_id = get(key)
 
     if custom_text and custom_text.strip():
-        return custom_text.strip(), photo_file_id
+        return render_template(key, custom_text, default_text), photo_file_id
 
     return default_text, photo_file_id
 
 
 def compose_preview(key, default_text):
     """
-    نسخه پیش‌نمایش: اگر draft وجود داشته باشد همان نمایش داده می‌شود؛ وگرنه متن منتشرشده/پیش‌فرض.
+    نسخه پیش‌نمایش: اگر draft وجود داشته باشد با متن نمونه/پیش‌فرض رندر می‌شود؛
+    وگرنه متن منتشرشده/پیش‌فرض نمایش داده می‌شود.
     """
     draft_text, draft_photo = get_draft(key)
     if draft_text and draft_text.strip():
-        return draft_text.strip(), draft_photo
+        return render_template(key, draft_text, default_text), draft_photo
     final_text, final_photo = compose(key, default_text)
     return final_text, draft_photo or final_photo
 

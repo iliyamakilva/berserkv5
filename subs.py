@@ -232,6 +232,103 @@ def delete_available_link(link_id):
     return False, "not_deleted"
 
 
+def return_delivered_link_to_pool(link_id, admin_id=None, reason=""):
+    """
+    لینک تحویل‌شده را بدون ساخت رکورد تکراری به همان استخر برمی‌گرداند.
+    این عملیات برای تست/تحویل اشتباه است و لینک اصلی در جدول subs حفظ می‌شود.
+    خروجی: (ok, reason, row_snapshot)
+    """
+    link_id = int(link_id)
+    reason = (reason or "manual_admin_return").strip()[:500]
+
+    with db.LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                """
+                SELECT id, link, used, owner, assigned_at, price_paid, account_name, status, purchase_id
+                FROM subs
+                WHERE id=?
+                """,
+                (link_id,),
+            )
+            row = cur.fetchone()
+
+            if not row:
+                conn.rollback()
+                return False, "not_found", None
+
+            if int(row["used"] or 0) != 1:
+                conn.rollback()
+                return False, "not_delivered", row
+
+            old_owner = row["owner"]
+            purchase_id = row["purchase_id"]
+
+            cur.execute(
+                """
+                UPDATE subs
+                SET used=0,
+                    owner=NULL,
+                    assigned_at=NULL,
+                    price_paid=NULL,
+                    status='available',
+                    purchase_id=NULL
+                WHERE id=? AND used=1
+                """,
+                (link_id,),
+            )
+
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "not_updated", row
+
+            if old_owner:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET purchased=CASE WHEN purchased > 0 THEN purchased - 1 ELSE 0 END
+                    WHERE id=?
+                    """,
+                    (str(old_owner),),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note)
+                    VALUES (?, 'admin_return_sub_to_pool', 0, NULL, NULL, ?)
+                    """,
+                    (
+                        str(old_owner),
+                        f"sub_id={link_id}; purchase_id={purchase_id or '-'}; admin_id={admin_id or '-'}; reason={reason}",
+                    ),
+                )
+
+            try:
+                cur.execute(
+                    """
+                    UPDATE purchase_items
+                    SET status='returned_to_pool',
+                        reverted_at=datetime('now'),
+                        reverted_by=?,
+                        revert_reason=?
+                    WHERE sub_id=?
+                      AND (? IS NULL OR purchase_id=?)
+                      AND COALESCE(status, 'active') != 'returned_to_pool'
+                    """,
+                    (str(admin_id) if admin_id is not None else None, reason, link_id, purchase_id, purchase_id),
+                )
+            except Exception:
+                # اگر بک‌آپ/دیتابیس قدیمی ستون‌های جدید نداشت، عملیات اصلی لینک نباید شکست بخورد.
+                pass
+
+            conn.commit()
+            db.set_low_stock_alerted(False)
+            return True, "returned", row
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def get_link_detail(link_id):
     cur.execute(
         """
