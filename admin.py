@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime
 
 from aiogram import Bot, types
 from aiogram.dispatcher import FSMContext
@@ -14,12 +15,16 @@ import menus
 import messages
 import settings
 import subs
-from config import ADMIN_COMMAND, ADMIN_IDS, BROADCAST_DELAY
+from config import ADMIN_COMMAND, ADMIN_IDS, BROADCAST_DELAY, OWNER_IDS
 from utils import cleanup_qr, make_qr
 
 
 def is_admin(user_id) -> bool:
     return int(user_id) in ADMIN_IDS
+
+
+def is_owner(user_id) -> bool:
+    return int(user_id) in OWNER_IDS
 
 
 class AdminStates(StatesGroup):
@@ -34,6 +39,10 @@ class AdminStates(StatesGroup):
     waiting_setting_value = State()
     waiting_message_edit = State()
     waiting_restore_file = State()
+    waiting_restore_confirm = State()
+    waiting_custom_button_form = State()
+    waiting_button_order = State()
+    waiting_button_location = State()
     waiting_broadcast_content = State()
     waiting_broadcast_confirm = State()
 
@@ -60,9 +69,9 @@ def admin_menu_kb():
         InlineKeyboardButton("📊 آمار و درآمد", callback_data="adm_stats"),
         InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast"),
         InlineKeyboardButton("⚙️ تنظیمات", callback_data="adm_settings"),
-        InlineKeyboardButton("📝 ویرایش پیام‌ها", callback_data="adm_messages"),
-        InlineKeyboardButton("💾 دریافت بک‌آپ", callback_data="adm_backup"),
-        InlineKeyboardButton("♻️ بارگذاری بک‌آپ", callback_data="adm_restore"),
+        InlineKeyboardButton("🎛 مدیریت دکمه‌ها", callback_data="adm_buttons"),
+        InlineKeyboardButton("📝 مدیریت متن‌ها", callback_data="adm_messages"),
+        InlineKeyboardButton("💾 بک‌آپ و ری‌استور", callback_data="adm_backup_menu"),
     )
     kb.add(InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
@@ -927,11 +936,44 @@ async def process_setting_value(m: types.Message, state: FSMContext):
     await m.answer("✅ تنظیمات به‌روزرسانی شد.", reply_markup=settings_menu_kb())
 
 
+
+# -------------------- مدیریت متن‌ها با Draft / Preview / Publish --------------------
+
+DEFAULT_MESSAGE_TEXTS = {
+    "welcome": "⚡ Berserk VPN Ready\n\nمنوی اصلی پایین صفحه همیشه در دسترس شماست.",
+    "main_menu": "⚡ Berserk VPN Ready\n\nاز منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
+    "menu_buy": "🛒 خرید سرویس",
+    "menu_wallet": "💳 کیف پول",
+    "menu_referral": "👥 لینک دعوت اختصاصی شما",
+    "my_services_empty": "هنوز هیچ سرویسی خریداری نکردید.",
+    "guide_home": "📚 آموزش اتصال\n\nدستگاه خود را انتخاب کنید:",
+    "guide_android": "📱 آموزش اندروید\n\n۱. یک برنامه سازگار با ساب‌لینک نصب کنید.\n۲. لینک سرویس را کپی کنید.\n۳. داخل برنامه، گزینه Import/Subscription را بزنید.\n۴. لینک را وارد و بروزرسانی کنید.",
+    "guide_ios": "🍎 آموزش آیفون\n\n۱. یک کلاینت سازگار نصب کنید.\n۲. ساب‌لینک را کپی کنید.\n۳. از بخش Subscription یا Import، لینک را اضافه کنید.\n۴. اتصال را تست کنید.",
+    "guide_windows": "💻 آموزش ویندوز\n\n۱. برنامه مناسب ویندوز را نصب کنید.\n۲. لینک سرویس را از بخش سرویس‌های من کپی کنید.\n۳. از بخش Subscription لینک را اضافه کنید.\n۴. Update subscription را بزنید.",
+    "guide_mac": "🖥 آموزش مک\n\n۱. کلاینت سازگار با مک را نصب کنید.\n۲. لینک سرویس را اضافه کنید.\n۳. ساب‌لینک را بروزرسانی و اتصال را فعال کنید.",
+    "guide_troubleshoot": "❓ مشکل اتصال دارم\n\nاول اینترنت اصلی را بررسی کنید، سپس ساب‌لینک را بروزرسانی کنید. اگر مشکل ادامه داشت، از بخش پشتیبانی پیام بدهید.",
+    "guide_update": "🔄 بروزرسانی ساب‌لینک\n\nدر برنامه خود گزینه Update/Refresh Subscription را بزنید تا لیست سرورها تازه شود.",
+    "support_intro": "برای ارسال پیام به پشتیبانی، روی دکمه زیر بزنید:",
+    "rules": "📜 قوانین و شرایط خرید\n\nبعد از خرید، لینک آماده تحویل داده می‌شود. در صورت خرابی واقعی سرویس، از پشتیبانی پیگیری کنید.",
+}
+
+
 def messages_menu_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     for key, label in messages.MESSAGE_KEYS:
         kb.add(InlineKeyboardButton(label, callback_data=f"msgkey_{key}"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_back"))
+    return kb
+
+
+def message_action_kb(key):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("✏️ ویرایش آزمایشی", callback_data=f"msg_edit_{key}"))
+    kb.add(InlineKeyboardButton("🧪 پیش‌نمایش Draft", callback_data=f"msg_preview_{key}"))
+    kb.add(InlineKeyboardButton("✅ ثبت نهایی / انتشار", callback_data=f"msg_publish_{key}"))
+    kb.add(InlineKeyboardButton("🧹 حذف Draft", callback_data=f"msg_clear_draft_{key}"))
+    kb.add(InlineKeyboardButton("♻️ بازگشت به متن پیش‌فرض", callback_data=f"msg_clear_published_{key}"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به مدیریت متن‌ها", callback_data="adm_messages"))
     return kb
 
 
@@ -942,7 +984,7 @@ async def cb_messages(c: types.CallbackQuery):
     await c.answer()
     await _replace_callback_message(
         c,
-        "📝 کدوم پیام رو می‌خواید ویرایش کنید؟",
+        "📝 مدیریت متن‌ها\n\nمتن‌ها ابتدا به‌صورت Draft ذخیره می‌شوند. بعد از پیش‌نمایش، با «ثبت نهایی» برای کاربران منتشر می‌شوند.",
         reply_markup=messages_menu_kb(),
     )
 
@@ -955,21 +997,85 @@ async def cb_msgkey(c: types.CallbackQuery, state: FSMContext):
     key = c.data.split("msgkey_", 1)[1]
     label = dict(messages.MESSAGE_KEYS).get(key, key)
     current_text, current_photo = messages.get(key)
-
-    await state.update_data(message_key=key)
+    draft_text, draft_photo = messages.get_draft(key)
 
     info = (
-        f"📝 ویرایش «{label}»\n\n"
-        f"متن فعلی: {current_text or '(تنظیم نشده؛ متن پیش‌فرض استفاده می‌شود)'}\n"
-        f"عکس فعلی: {'دارد' if current_photo else '(تنظیم نشده)'}\n\n"
-        "متن جدیدی که می‌فرستید، جایگزین کامل متن پیش‌فرض می‌شود؛ "
-        "دیگر متن پیش‌فرض زیر آن اضافه نمی‌شود.\n\n"
-        "برای پاک کردن متن/عکس سفارشی و برگشت به حالت پیش‌فرض، /clear را بفرستید.\n"
-        "برای تنظیم عکس، عکس را همراه کپشن اختیاری بفرستید."
+        f"📝 مدیریت متن «{label}»\n\n"
+        f"متن منتشرشده: {current_text or '(تنظیم نشده؛ متن پیش‌فرض استفاده می‌شود)'}\n"
+        f"Draft: {draft_text or '(ندارد)'}\n"
+        f"عکس منتشرشده: {'دارد' if current_photo else '(ندارد)'}\n"
+        f"عکس Draft: {'دارد' if draft_photo else '(ندارد)'}\n\n"
+        "تغییرات Draft تا وقتی ثبت نهایی نشوند، برای کاربر نمایش داده نمی‌شوند."
     )
 
-    await _replace_callback_message(c, info, reply_markup=cancel_kb())
+    await _replace_callback_message(c, info, reply_markup=message_action_kb(key))
+
+
+async def cb_msg_edit_start(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("msg_edit_", 1)[1]
+    if not messages.is_valid_key(key):
+        return await c.message.answer("این متن پیدا نشد.", reply_markup=messages_menu_kb())
+    label = dict(messages.MESSAGE_KEYS).get(key, key)
+    await state.update_data(message_key=key)
+    await _replace_callback_message(
+        c,
+        f"✏️ ویرایش آزمایشی «{label}»\n\n"
+        "متن جدید را بفرستید تا به‌عنوان Draft ذخیره شود.\n"
+        "برای تنظیم عکس Draft، عکس را همراه کپشن اختیاری بفرستید.\n"
+        "برای لغو /cancel را بزنید.",
+        reply_markup=cancel_kb(),
+    )
     await AdminStates.waiting_message_edit.set()
+
+
+async def cb_msg_preview(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("msg_preview_", 1)[1]
+    if not messages.is_valid_key(key):
+        return await c.message.answer("این متن پیدا نشد.", reply_markup=messages_menu_kb())
+    label = dict(messages.MESSAGE_KEYS).get(key, key)
+    text, photo = messages.compose_preview(key, DEFAULT_MESSAGE_TEXTS.get(key, ""))
+    await c.message.answer(f"🧪 پیش‌نمایش «{label}»:")
+    if photo:
+        await c.message.answer_photo(photo, caption=text or None)
+    else:
+        await c.message.answer(text or "(متن خالی است)")
+    await c.message.answer("بعد از بررسی، می‌توانید ثبت نهایی کنید.", reply_markup=message_action_kb(key))
+
+
+async def cb_msg_publish(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("msg_publish_", 1)[1]
+    ok = messages.publish_draft(key)
+    if ok:
+        await _replace_callback_message(c, "✅ Draft منتشر شد و از این به بعد برای کاربران نمایش داده می‌شود.", reply_markup=message_action_kb(key))
+    else:
+        await _replace_callback_message(c, "Draft فعالی برای انتشار وجود ندارد.", reply_markup=message_action_kb(key))
+
+
+async def cb_msg_clear_draft(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("msg_clear_draft_", 1)[1]
+    messages.clear_draft(key)
+    await _replace_callback_message(c, "✅ Draft حذف شد. متن منتشرشده قبلی دست‌نخورده باقی ماند.", reply_markup=message_action_kb(key))
+
+
+async def cb_msg_clear_published(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("msg_clear_published_", 1)[1]
+    messages.clear(key)
+    await _replace_callback_message(c, "✅ متن سفارشی منتشرشده حذف شد. از این به بعد متن پیش‌فرض ربات استفاده می‌شود.", reply_markup=messages_menu_kb())
 
 
 async def process_message_edit(m: types.Message, state: FSMContext):
@@ -981,38 +1087,467 @@ async def process_message_edit(m: types.Message, state: FSMContext):
     label = dict(messages.MESSAGE_KEYS).get(key, key)
 
     if m.content_type == "text":
-        if m.text.strip() == "/clear":
-            messages.clear(key)
-            await state.finish()
-            return await m.answer(
-                f"✅ پیام سفارشی «{label}» پاک شد.\n"
-                "از این به بعد متن پیش‌فرض خود ربات نمایش داده می‌شود.",
-                reply_markup=messages_menu_kb(),
-            )
-
-        messages.set_text(key, m.text)
+        messages.set_draft_text(key, m.text)
         await state.finish()
         return await m.answer(
-            f"✅ متن «{label}» به‌روزرسانی شد.\n"
-            "این متن از حالا جایگزین کامل متن پیش‌فرض می‌شود.",
-            reply_markup=messages_menu_kb(),
+            f"✅ Draft متن «{label}» ذخیره شد.\n"
+            "برای اعمال روی ربات، از پیش‌نمایش و سپس ثبت نهایی استفاده کنید.",
+            reply_markup=message_action_kb(key),
         )
 
     if m.content_type == "photo":
-        messages.set_photo(key, m.photo[-1].file_id)
+        messages.set_draft_photo(key, m.photo[-1].file_id)
 
         if m.caption:
-            messages.set_text(key, m.caption)
+            messages.set_draft_text(key, m.caption)
 
         await state.finish()
         return await m.answer(
-            f"✅ عکس/متن «{label}» به‌روزرسانی شد.\n"
-            "اگر کپشن داده باشید، همان کپشن جایگزین کامل متن پیش‌فرض می‌شود.",
-            reply_markup=messages_menu_kb(),
+            f"✅ Draft عکس/متن «{label}» ذخیره شد.\n"
+            "برای اعمال روی ربات، از پیش‌نمایش و سپس ثبت نهایی استفاده کنید.",
+            reply_markup=message_action_kb(key),
         )
 
     await m.answer("لطفاً فقط متن یا عکس بفرستید.", reply_markup=cancel_kb())
 
+
+# -------------------- مدیریت دکمه‌های اختصاصی --------------------
+
+BUTTON_TYPE_LABELS = {
+    "text": "متنی",
+    "link": "لینک",
+    "submenu": "زیرمنو",
+    "file": "فایل",
+    "support": "پشتیبانی",
+    "buy_plan": "خرید پلن",
+    "faq": "سوالات متداول",
+    "guide": "آموزش",
+}
+
+BUTTON_LOCATION_LABELS = {
+    "main": "منوی اصلی",
+    "buy": "منوی خرید سرویس",
+    "my_services": "منوی سرویس‌های من",
+    "wallet": "منوی کیف پول",
+    "support": "منوی پشتیبانی",
+    "guide": "منوی آموزش‌ها",
+    "account": "منوی حساب کاربری",
+}
+
+BUTTON_AUDIENCE_LABELS = {
+    "all": "همه کاربران",
+    "buyers": "خریداران",
+    "no_buy": "بدون خرید",
+    "has_service": "دارای سرویس",
+    "no_service": "بدون سرویس",
+    "admins": "فقط ادمین‌ها",
+}
+
+
+def custom_buttons_menu_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("➕ ساخت دکمه جدید", callback_data="btn_create"))
+    kb.add(InlineKeyboardButton("📋 لیست دکمه‌ها", callback_data="btn_list"))
+    kb.add(InlineKeyboardButton("🧪 پیش‌نمایش منوی اصلی", callback_data="btn_preview_main"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_back"))
+    return kb
+
+
+def custom_button_detail_kb(button_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✏️ ویرایش دکمه", callback_data=f"btn_edit_{button_id}"),
+        InlineKeyboardButton("🗑 حذف دکمه", callback_data=f"btn_delete_{button_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("👁 فعال / غیرفعال", callback_data=f"btn_toggle_{button_id}"),
+        InlineKeyboardButton("↕️ تغییر ترتیب", callback_data=f"btn_order_{button_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("📍 تغییر جایگاه", callback_data=f"btn_location_{button_id}"),
+        InlineKeyboardButton("🧪 پیش‌نمایش", callback_data=f"btn_preview_{button_id}"),
+    )
+    kb.add(InlineKeyboardButton("✅ ثبت نهایی / انتشار", callback_data=f"btn_publish_{button_id}"))
+    kb.add(InlineKeyboardButton("⬅️ لیست دکمه‌ها", callback_data="btn_list"))
+    kb.add(InlineKeyboardButton("🏠 پنل مدیریت", callback_data="adm_back"))
+    return kb
+
+
+def _button_form_help(current=None):
+    base = "" if current is None else "\nمقدارهای فعلی/پیشنهادی را تغییر بده و دوباره بفرست:\n"
+    return (
+        "فرمت ساخت/ویرایش دکمه را به همین شکل بفرست:\n\n"
+        "عنوان: 📚 نمونه دکمه\n"
+        "نوع: text\n"
+        "متن یا لینک: متن، لینک، file_id یا توضیح دکمه\n"
+        "جایگاه: main\n"
+        "ترتیب: 100\n"
+        "وضعیت: active\n"
+        "نمایش: all\n"
+        "شروع: \n"
+        "پایان: \n\n"
+        "نوع‌های مجاز: text, link, submenu, file, support, buy_plan, faq, guide\n"
+        "جایگاه‌های مجاز: main, buy, my_services, wallet, support, guide, account\n"
+        "نمایش‌های مجاز: all, buyers, no_buy, has_service, no_service, admins\n"
+        "نکته: تغییر اول Draft می‌شود؛ بعد از پیش‌نمایش باید ثبت نهایی شود."
+        + base
+    )
+
+
+def _parse_button_form(text):
+    aliases = {
+        "عنوان": "title",
+        "title": "title",
+        "نوع": "button_type",
+        "type": "button_type",
+        "متن یا لینک": "payload",
+        "متن": "payload",
+        "لینک": "payload",
+        "payload": "payload",
+        "جایگاه": "location",
+        "location": "location",
+        "ترتیب": "sort_order",
+        "order": "sort_order",
+        "وضعیت": "is_active",
+        "active": "is_active",
+        "نمایش": "audience",
+        "audience": "audience",
+        "شروع": "starts_at",
+        "start": "starts_at",
+        "پایان": "ends_at",
+        "end": "ends_at",
+    }
+    data = {}
+    for raw in (text or "").splitlines():
+        if ":" not in raw:
+            continue
+        k, v = raw.split(":", 1)
+        key = aliases.get(k.strip())
+        if key:
+            data[key] = v.strip()
+    if "is_active" in data:
+        val = data["is_active"].strip().lower()
+        data["is_active"] = 0 if val in {"inactive", "off", "0", "false", "غیرفعال"} else 1
+    return data
+
+
+def _fmt_custom_button(row, prefer_draft=True):
+    data = db.custom_button_effective_data(row, prefer_draft=prefer_draft)
+    draft_mark = "📝 Draft آماده انتشار دارد" if db.custom_button_has_draft(row) else "بدون Draft"
+    status = "منتشرشده" if row["status"] == "published" else "پیش‌نویس"
+    active = "فعال" if int(data.get("is_active") or 0) else "غیرفعال"
+    return (
+        f"🎛 دکمه #{row['id']}\n\n"
+        f"عنوان: {data.get('title') or '-'}\n"
+        f"نوع: {BUTTON_TYPE_LABELS.get(data.get('button_type'), data.get('button_type'))}\n"
+        f"متن یا لینک: {_short(data.get('payload'), 160)}\n"
+        f"جایگاه: {BUTTON_LOCATION_LABELS.get(data.get('location'), data.get('location'))}\n"
+        f"ترتیب: {data.get('sort_order')}\n"
+        f"وضعیت: {active}\n"
+        f"نمایش: {BUTTON_AUDIENCE_LABELS.get(data.get('audience'), data.get('audience'))}\n"
+        f"شروع: {data.get('starts_at') or '-'}\n"
+        f"پایان: {data.get('ends_at') or '-'}\n"
+        f"حالت: {status}\n"
+        f"Draft: {draft_mark}"
+    )
+
+
+async def cb_buttons(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await _replace_callback_message(
+        c,
+        "🎛 مدیریت دکمه‌ها\n\nاز این بخش می‌توانید دکمه اختصاصی بسازید، ویرایش کنید، پیش‌نمایش بگیرید و بعد ثبت نهایی کنید. دکمه‌های سیستمی حذف نمی‌شوند.",
+        reply_markup=custom_buttons_menu_kb(),
+    )
+
+
+async def cb_button_create(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await state.update_data(button_action="create")
+    await _replace_callback_message(c, "➕ ساخت دکمه جدید\n\n" + _button_form_help(), reply_markup=cancel_kb())
+    await AdminStates.waiting_custom_button_form.set()
+
+
+async def cb_button_list(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    rows = db.list_custom_buttons(limit=30)
+    if not rows:
+        return await _replace_callback_message(c, "هنوز دکمه اختصاصی ساخته نشده.", reply_markup=custom_buttons_menu_kb())
+    kb = InlineKeyboardMarkup(row_width=1)
+    lines = ["📋 لیست دکمه‌های اختصاصی:\n"]
+    for row in rows:
+        data = db.custom_button_effective_data(row)
+        active = "✅" if int(data.get("is_active") or 0) else "🚫"
+        draft = " 📝" if db.custom_button_has_draft(row) else ""
+        lines.append(f"#{row['id']} | {active} {data.get('title') or '-'} | {data.get('location')} | order {data.get('sort_order')}{draft}")
+        kb.add(InlineKeyboardButton(f"#{row['id']} {data.get('title') or '-'}{draft}", callback_data=f"btn_detail_{row['id']}"))
+    kb.add(InlineKeyboardButton("➕ ساخت دکمه جدید", callback_data="btn_create"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_buttons"))
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=kb)
+
+
+async def cb_button_detail(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = c.data.split("btn_detail_", 1)[1]
+    row = db.get_custom_button(button_id)
+    if not row:
+        return await _replace_callback_message(c, "این دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+    await _replace_callback_message(c, _fmt_custom_button(row), reply_markup=custom_button_detail_kb(button_id))
+
+
+async def cb_button_edit(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = c.data.split("btn_edit_", 1)[1]
+    row = db.get_custom_button(button_id)
+    if not row:
+        return await c.message.answer("این دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+    data = db.custom_button_effective_data(row)
+    current = (
+        f"عنوان: {data.get('title') or ''}\n"
+        f"نوع: {data.get('button_type') or 'text'}\n"
+        f"متن یا لینک: {data.get('payload') or ''}\n"
+        f"جایگاه: {data.get('location') or 'main'}\n"
+        f"ترتیب: {data.get('sort_order') or 100}\n"
+        f"وضعیت: {'active' if int(data.get('is_active') or 0) else 'inactive'}\n"
+        f"نمایش: {data.get('audience') or 'all'}\n"
+        f"شروع: {data.get('starts_at') or ''}\n"
+        f"پایان: {data.get('ends_at') or ''}"
+    )
+    await state.update_data(button_action="edit", button_id=int(button_id))
+    await _replace_callback_message(c, "✏️ ویرایش آزمایشی دکمه\n\n" + _button_form_help() + "\n\n" + current, reply_markup=cancel_kb())
+    await AdminStates.waiting_custom_button_form.set()
+
+
+async def process_custom_button_form(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.content_type != "text":
+        return await m.answer("لطفاً اطلاعات دکمه را به‌صورت متن بفرستید.", reply_markup=cancel_kb())
+    form = _parse_button_form(m.text)
+    data = await state.get_data()
+    try:
+        if data.get("button_action") == "edit":
+            button_id = int(data["button_id"])
+            ok = db.save_custom_button_draft(button_id, form)
+            if not ok:
+                await state.finish()
+                return await m.answer("این دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+        else:
+            button_id = db.create_custom_button_draft(form)
+    except Exception as exc:
+        return await m.answer(f"❌ اطلاعات دکمه معتبر نیست: {exc}\n\n" + _button_form_help(), reply_markup=cancel_kb())
+
+    await state.finish()
+    row = db.get_custom_button(button_id)
+    await m.answer(
+        "✅ دکمه به‌صورت Draft ذخیره شد.\n"
+        "قبل از نمایش برای کاربران، پیش‌نمایش بگیرید و ثبت نهایی کنید.\n\n"
+        + _fmt_custom_button(row),
+        reply_markup=custom_button_detail_kb(button_id),
+    )
+
+
+async def cb_button_delete(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = c.data.split("btn_delete_", 1)[1]
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ بله حذف شود", callback_data=f"btn_delete_confirm_{button_id}"),
+        InlineKeyboardButton("❌ لغو", callback_data=f"btn_detail_{button_id}"),
+    )
+    await _replace_callback_message(c, f"⚠️ حذف دکمه #{button_id}\n\nآیا مطمئن هستید؟", reply_markup=kb)
+
+
+async def cb_button_delete_confirm(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = c.data.split("btn_delete_confirm_", 1)[1]
+    ok = db.delete_custom_button(button_id)
+    await _replace_callback_message(c, "✅ دکمه حذف شد." if ok else "دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+
+
+async def cb_button_toggle(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = c.data.split("btn_toggle_", 1)[1]
+    ok = db.stage_custom_button_toggle(button_id)
+    row = db.get_custom_button(button_id)
+    if not ok or not row:
+        return await _replace_callback_message(c, "دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+    await _replace_callback_message(c, "👁 تغییر وضعیت به‌صورت Draft ذخیره شد. برای اعمال، ثبت نهایی کنید.\n\n" + _fmt_custom_button(row), reply_markup=custom_button_detail_kb(button_id))
+
+
+async def cb_button_order(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = int(c.data.split("btn_order_", 1)[1])
+    await state.update_data(button_id=button_id)
+    await _replace_callback_message(c, "↕️ عدد ترتیب جدید را بفرستید. عدد کمتر بالاتر نمایش داده می‌شود.", reply_markup=cancel_kb())
+    await AdminStates.waiting_button_order.set()
+
+
+async def process_button_order(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.content_type != "text" or not m.text.strip().lstrip("-").isdigit():
+        return await m.answer("لطفاً فقط عدد بفرستید.", reply_markup=cancel_kb())
+    data = await state.get_data()
+    row = db.get_custom_button(data["button_id"])
+    if not row:
+        await state.finish()
+        return await m.answer("دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+    current = db.custom_button_effective_data(row)
+    current["sort_order"] = int(m.text.strip())
+    db.save_custom_button_draft(row["id"], current)
+    await state.finish()
+    row = db.get_custom_button(row["id"])
+    await m.answer("✅ ترتیب جدید به‌صورت Draft ذخیره شد. برای اعمال، ثبت نهایی کنید.\n\n" + _fmt_custom_button(row), reply_markup=custom_button_detail_kb(row["id"]))
+
+
+async def cb_button_location(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = int(c.data.split("btn_location_", 1)[1])
+    await state.update_data(button_id=button_id)
+    await _replace_callback_message(c, "📍 جایگاه جدید را بفرستید.\nمجاز: main, buy, my_services, wallet, support, guide, account", reply_markup=cancel_kb())
+    await AdminStates.waiting_button_location.set()
+
+
+async def process_button_location(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.content_type != "text":
+        return await m.answer("لطفاً جایگاه را به‌صورت متن بفرستید.", reply_markup=cancel_kb())
+    data = await state.get_data()
+    row = db.get_custom_button(data["button_id"])
+    if not row:
+        await state.finish()
+        return await m.answer("دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+    current = db.custom_button_effective_data(row)
+    current["location"] = m.text.strip().lower()
+    try:
+        db.save_custom_button_draft(row["id"], current)
+    except Exception as exc:
+        return await m.answer(f"❌ جایگاه معتبر نیست: {exc}", reply_markup=cancel_kb())
+    await state.finish()
+    row = db.get_custom_button(row["id"])
+    await m.answer("✅ جایگاه جدید به‌صورت Draft ذخیره شد. برای اعمال، ثبت نهایی کنید.\n\n" + _fmt_custom_button(row), reply_markup=custom_button_detail_kb(row["id"]))
+
+
+async def cb_button_preview(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = c.data.split("btn_preview_", 1)[1]
+    row = db.get_custom_button(button_id)
+    if not row:
+        return await c.message.answer("دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+    data = db.custom_button_effective_data(row, prefer_draft=True)
+    kb = InlineKeyboardMarkup(row_width=1)
+    if data.get("button_type") == "link" and str(data.get("payload") or "").startswith(("http://", "https://", "tg://")):
+        kb.add(InlineKeyboardButton(data.get("title") or "باز کردن لینک", url=data.get("payload")))
+    else:
+        kb.add(InlineKeyboardButton(data.get("title") or "دکمه نمونه", callback_data="btn_preview_noop"))
+    await c.message.answer("🧪 پیش‌نمایش دکمه:\n\n" + _fmt_custom_button(row), reply_markup=kb)
+    await c.message.answer("برای اعمال روی منو، ثبت نهایی را بزنید.", reply_markup=custom_button_detail_kb(button_id))
+
+
+async def cb_button_preview_main(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await c.message.answer("🧪 پیش‌نمایش منوی اصلی با دکمه‌های منتشرشده:", reply_markup=menus.main_reply_kb(c.from_user.id))
+
+
+async def cb_button_publish(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    button_id = c.data.split("btn_publish_", 1)[1]
+    ok = db.publish_custom_button(button_id)
+    row = db.get_custom_button(button_id)
+    if ok and row:
+        await _replace_callback_message(c, "✅ دکمه منتشر شد و طبق جایگاه/وضعیت برای کاربران نمایش داده می‌شود.\n\n" + _fmt_custom_button(row, prefer_draft=False), reply_markup=custom_button_detail_kb(button_id))
+    else:
+        await _replace_callback_message(c, "Draft فعالی برای انتشار وجود ندارد.", reply_markup=custom_button_detail_kb(button_id))
+
+
+# -------------------- بک‌آپ و ری‌استور قوی‌تر --------------------
+
+
+def backup_menu_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("📥 دریافت بک‌آپ کامل", callback_data="adm_backup"))
+    kb.add(InlineKeyboardButton("🧪 تست سلامت دیتابیس فعلی", callback_data="adm_backup_health"))
+    kb.add(InlineKeyboardButton("🗂 لیست بک‌آپ‌های محلی", callback_data="adm_backup_files"))
+    kb.add(InlineKeyboardButton("📜 لاگ بک‌آپ و ری‌استور", callback_data="adm_backup_logs"))
+    kb.add(InlineKeyboardButton("♻️ بارگذاری بک‌آپ / ری‌استور", callback_data="adm_restore"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_back"))
+    return kb
+
+
+async def cb_backup_menu(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await _replace_callback_message(
+        c,
+        "💾 بک‌آپ و ری‌استور\n\nقبل از ری‌استور، فایل بررسی می‌شود و از دیتابیس فعلی بک‌آپ اضطراری گرفته می‌شود.",
+        reply_markup=backup_menu_kb(),
+    )
+
+
+async def cb_backup_health(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    info = backup.inspect_sqlite_file(db.DB_PATH)
+    await _replace_callback_message(c, backup.format_backup_info(info), reply_markup=backup_menu_kb())
+
+
+async def cb_backup_files(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    files = backup.list_local_backups(limit=10)
+    if not files:
+        return await _replace_callback_message(c, "بک‌آپ محلی ذخیره‌شده‌ای پیدا نشد.", reply_markup=backup_menu_kb())
+    lines = ["🗂 آخرین بک‌آپ‌های محلی:\n"]
+    for f in files:
+        stat = f.stat()
+        lines.append(f"• {f.name} | {stat.st_size:,} بایت | {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}")
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=backup_menu_kb())
+
+
+async def cb_backup_logs(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    rows = db.list_backup_logs(limit=10)
+    if not rows:
+        return await _replace_callback_message(c, "هنوز لاگ بک‌آپ ثبت نشده.", reply_markup=backup_menu_kb())
+    lines = ["📜 آخرین لاگ‌های بک‌آپ/ری‌استور:\n"]
+    for r in rows:
+        lines.append(f"• #{r['id']} | {r['operation_type']} | {r['status']} | {r['backup_file_name'] or '-'} | admin {r['admin_id'] or '-'} | {r['created_at']}")
+        if r["note"]:
+            lines.append(f"  note: {_short(r['note'], 120)}")
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=backup_menu_kb())
 
 BROADCAST_SCOPES = {
     "all": "همه کاربران غیر بن‌شده",
@@ -1210,42 +1745,120 @@ async def cb_broadcast_confirm(c: types.CallbackQuery, state: FSMContext):
     )
 
 
+
 async def cb_backup(c: types.CallbackQuery):
     bot = Bot.get_current()
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer("در حال آماده‌سازی بک‌آپ...")
-    await backup.send_backup(bot, c.from_user.id)
-    await c.message.answer("✅ بک‌آپ ارسال شد.", reply_markup=admin_back_kb())
+    path = await backup.send_backup(bot, c.from_user.id, admin_id=c.from_user.id)
+    await c.message.answer(f"✅ بک‌آپ ارسال و ذخیره شد.\nمسیر محلی: {path}", reply_markup=backup_menu_kb())
 
 
 async def cb_restore_start(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
 
+    if not is_owner(c.from_user.id):
+        return await c.answer("فقط مالک اصلی اجازه ری‌استور دارد.", show_alert=True)
+
     await c.answer()
-    await _replace_callback_message(c, "⚠️ فایل دیتابیس (.db) رو بفرستید.", reply_markup=cancel_kb())
+    await _replace_callback_message(
+        c,
+        "⚠️ فایل دیتابیس (.db) رو به‌صورت Document بفرستید.\n\n"
+        "قبل از ری‌استور، فایل بررسی می‌شود و از دیتابیس فعلی بک‌آپ اضطراری گرفته می‌شود.",
+        reply_markup=cancel_kb(),
+    )
     await AdminStates.waiting_restore_file.set()
 
 
 async def process_restore_file(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return
+
+    if not is_owner(m.from_user.id):
+        await state.finish()
+        return await m.answer("فقط مالک اصلی اجازه ری‌استور دارد.", reply_markup=backup_menu_kb())
+
     if m.content_type != "document":
         return await m.answer("لطفا فایل دیتابیس رو به‌صورت Document بفرستید.", reply_markup=cancel_kb())
-    await state.finish()
-    await m.answer("⏳ در حال بررسی و بازگردانی فایل...")
+
+    await m.answer("⏳ در حال دانلود و بررسی فایل...")
     tmp_path = f"/tmp/restore_upload_{m.document.file_unique_id}.db"
     await m.document.download(destination_file=tmp_path)
-    if not backup.validate_sqlite_file(tmp_path):
-        os.remove(tmp_path)
-        return await m.answer("❌ این فایل دیتابیس معتبر نیست.", reply_markup=admin_back_kb())
-    safety_path = backup.perform_restore(tmp_path)
-    os.remove(tmp_path)
-    await m.answer(f"✅ بازگردانی انجام شد.\nنسخه امن قبلی:\n{safety_path}\n\nربات الان ری‌استارت میشه...")
-    logging.getLogger(__name__).warning("Database restored by admin %s, restarting process.", m.from_user.id)
-    sys.exit(1)
 
+    info = backup.inspect_sqlite_file(tmp_path)
+    if not info.get("ok"):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        await state.finish()
+        return await m.answer("❌ این فایل برای ری‌استور معتبر نیست.\n\n" + backup.format_backup_info(info), reply_markup=backup_menu_kb())
+
+    await state.update_data(restore_path=tmp_path)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ بله، ری‌استور انجام شود", callback_data="restore_confirm"),
+        InlineKeyboardButton("❌ لغو", callback_data="restore_cancel"),
+    )
+    await m.answer(
+        backup.format_backup_info(info)
+        + "\n\n⚠️ مطمئن هستید می‌خواهید دیتابیس فعلی جایگزین شود؟",
+        reply_markup=kb,
+    )
+    await AdminStates.waiting_restore_confirm.set()
+
+
+async def cb_restore_cancel(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer("لغو شد")
+    data = await state.get_data()
+    tmp_path = data.get("restore_path")
+    if tmp_path:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    await state.finish()
+    await c.message.answer("❌ ری‌استور لغو شد.", reply_markup=backup_menu_kb())
+
+
+async def cb_restore_confirm(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    if not is_owner(c.from_user.id):
+        return await c.answer("فقط مالک اصلی اجازه ری‌استور دارد.", show_alert=True)
+
+    await c.answer()
+    data = await state.get_data()
+    tmp_path = data.get("restore_path")
+    if not tmp_path or not os.path.exists(tmp_path):
+        await state.finish()
+        return await c.message.answer("فایل موقت ری‌استور پیدا نشد. دوباره تلاش کنید.", reply_markup=backup_menu_kb())
+
+    await c.message.answer("⏳ در حال ری‌استور... ابتدا بک‌آپ اضطراری از دیتابیس فعلی گرفته می‌شود.")
+    try:
+        safety_path = backup.perform_restore(tmp_path, admin_id=c.from_user.id)
+    except Exception as exc:
+        await state.finish()
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return await c.message.answer(f"❌ ری‌استور انجام نشد: {exc}", reply_markup=backup_menu_kb())
+
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+
+    await state.finish()
+    await c.message.answer(f"✅ بازگردانی انجام شد.\nنسخه امن قبلی:\n{safety_path}\n\nربات الان ری‌استارت میشه...")
+    logging.getLogger(__name__).warning("Database restored by admin %s, restarting process.", c.from_user.id)
+    sys.exit(1)
 
 def register(dp):
     dp.register_message_handler(cmd_admin, commands=[ADMIN_COMMAND])
@@ -1294,7 +1907,30 @@ def register(dp):
 
     dp.register_callback_query_handler(cb_messages, lambda c: c.data == "adm_messages")
     dp.register_callback_query_handler(cb_msgkey, lambda c: c.data.startswith("msgkey_"))
+    dp.register_callback_query_handler(cb_msg_edit_start, lambda c: c.data.startswith("msg_edit_"))
+    dp.register_callback_query_handler(cb_msg_preview, lambda c: c.data.startswith("msg_preview_"))
+    dp.register_callback_query_handler(cb_msg_publish, lambda c: c.data.startswith("msg_publish_"))
+    dp.register_callback_query_handler(cb_msg_clear_draft, lambda c: c.data.startswith("msg_clear_draft_"))
+    dp.register_callback_query_handler(cb_msg_clear_published, lambda c: c.data.startswith("msg_clear_published_"))
     dp.register_message_handler(process_message_edit, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_message_edit)
+
+    dp.register_callback_query_handler(cb_buttons, lambda c: c.data == "adm_buttons")
+    dp.register_callback_query_handler(cb_button_create, lambda c: c.data == "btn_create")
+    dp.register_callback_query_handler(cb_button_list, lambda c: c.data == "btn_list")
+    dp.register_callback_query_handler(cb_button_detail, lambda c: c.data.startswith("btn_detail_"))
+    dp.register_callback_query_handler(cb_button_edit, lambda c: c.data.startswith("btn_edit_"))
+    dp.register_message_handler(process_custom_button_form, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_custom_button_form)
+    dp.register_callback_query_handler(cb_button_delete_confirm, lambda c: c.data.startswith("btn_delete_confirm_"))
+    dp.register_callback_query_handler(cb_button_delete, lambda c: c.data.startswith("btn_delete_"))
+    dp.register_callback_query_handler(cb_button_toggle, lambda c: c.data.startswith("btn_toggle_"))
+    dp.register_callback_query_handler(cb_button_order, lambda c: c.data.startswith("btn_order_"))
+    dp.register_message_handler(process_button_order, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_button_order)
+    dp.register_callback_query_handler(cb_button_location, lambda c: c.data.startswith("btn_location_"))
+    dp.register_message_handler(process_button_location, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_button_location)
+    dp.register_callback_query_handler(cb_button_preview_main, lambda c: c.data == "btn_preview_main")
+    dp.register_callback_query_handler(cb_button_preview, lambda c: c.data.startswith("btn_preview_"))
+    dp.register_callback_query_handler(cb_button_publish, lambda c: c.data.startswith("btn_publish_"))
+    dp.register_callback_query_handler(lambda c: c.answer("این فقط پیش‌نمایش است."), lambda c: c.data == "btn_preview_noop")
 
     dp.register_callback_query_handler(cb_broadcast_menu, lambda c: c.data == "adm_broadcast")
     dp.register_callback_query_handler(cb_broadcast_scope, lambda c: c.data.startswith("broadcast_scope_"))
@@ -1302,6 +1938,12 @@ def register(dp):
     dp.register_callback_query_handler(cb_broadcast_confirm, lambda c: c.data == "broadcast_confirm", state=AdminStates.waiting_broadcast_confirm)
     dp.register_callback_query_handler(cb_broadcast_cancel, lambda c: c.data == "broadcast_cancel", state=AdminStates.waiting_broadcast_confirm)
 
+    dp.register_callback_query_handler(cb_backup_menu, lambda c: c.data == "adm_backup_menu")
     dp.register_callback_query_handler(cb_backup, lambda c: c.data == "adm_backup")
+    dp.register_callback_query_handler(cb_backup_health, lambda c: c.data == "adm_backup_health")
+    dp.register_callback_query_handler(cb_backup_files, lambda c: c.data == "adm_backup_files")
+    dp.register_callback_query_handler(cb_backup_logs, lambda c: c.data == "adm_backup_logs")
     dp.register_callback_query_handler(cb_restore_start, lambda c: c.data == "adm_restore")
     dp.register_message_handler(process_restore_file, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_restore_file)
+    dp.register_callback_query_handler(cb_restore_confirm, lambda c: c.data == "restore_confirm", state=AdminStates.waiting_restore_confirm)
+    dp.register_callback_query_handler(cb_restore_cancel, lambda c: c.data == "restore_cancel", state=AdminStates.waiting_restore_confirm)

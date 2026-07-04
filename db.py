@@ -190,6 +190,51 @@ def init():
             )
             """
         )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS custom_buttons(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                button_type TEXT,
+                payload TEXT,
+                location TEXT DEFAULT 'main',
+                sort_order INTEGER DEFAULT 100,
+                is_active INTEGER DEFAULT 1,
+                audience TEXT DEFAULT 'all',
+                starts_at TEXT,
+                ends_at TEXT,
+                status TEXT DEFAULT 'draft',
+                draft_title TEXT,
+                draft_button_type TEXT,
+                draft_payload TEXT,
+                draft_location TEXT,
+                draft_sort_order INTEGER,
+                draft_is_active INTEGER,
+                draft_audience TEXT,
+                draft_starts_at TEXT,
+                draft_ends_at TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                published_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backup_logs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id TEXT,
+                operation_type TEXT NOT NULL,
+                backup_file_name TEXT,
+                file_size INTEGER,
+                status TEXT DEFAULT 'ok',
+                note TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS broadcast_logs(
@@ -211,6 +256,23 @@ def init():
         _add_column_if_missing("subs", "status", "TEXT")
         _add_column_if_missing("subs", "purchase_id", "INTEGER")
         _add_column_if_missing("purchase_items", "link", "TEXT")
+        _add_column_if_missing("messages", "draft_text", "TEXT")
+        _add_column_if_missing("messages", "draft_photo_file_id", "TEXT")
+        _add_column_if_missing("messages", "updated_at", "TEXT")
+        _add_column_if_missing("messages", "published_at", "TEXT")
+        cur.execute("""
+            SELECT file_unique_id, COUNT(*) AS c
+            FROM receipts
+            GROUP BY file_unique_id
+            HAVING c > 1
+            LIMIT 1
+        """)
+        if cur.fetchone() is None:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_unique_file ON receipts(file_unique_id)")
+        else:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_file ON receipts(file_unique_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_custom_buttons_location ON custom_buttons(location, sort_order)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_backup_logs_created ON backup_logs(created_at)")
 
         cur.execute("UPDATE subs SET status='available' WHERE status IS NULL AND used=0")
         cur.execute("UPDATE subs SET status='delivered' WHERE status IS NULL AND used=1")
@@ -583,11 +645,16 @@ def find_receipt(file_unique_id):
 
 
 def record_receipt(file_unique_id, user_id, topup_id):
-    cur.execute(
-        "INSERT INTO receipts(file_unique_id, user_id, topup_id) VALUES (?, ?, ?)",
-        (file_unique_id, str(user_id), int(topup_id)),
-    )
-    conn.commit()
+    try:
+        cur.execute(
+            "INSERT INTO receipts(file_unique_id, user_id, topup_id) VALUES (?, ?, ?)",
+            (file_unique_id, str(user_id), int(topup_id)),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return False
 
 
 def is_low_stock_alerted():
@@ -863,3 +930,360 @@ def purchase_count_by_user(user_id):
 def delivered_sub_count_by_user(user_id):
     cur.execute("SELECT COUNT(*) AS c FROM subs WHERE owner=? AND used=1", (str(user_id),))
     return cur.fetchone()["c"]
+
+
+
+def approve_topup_atomic(topup_id, admin_id=None):
+    """
+    تایید شارژ به صورت اتمیک:
+    اگر وضعیت هنوز pending_review باشد، وضعیت approved می‌شود و همان داخل تراکنش موجودی اضافه می‌شود.
+    خروجی: (ok, reason, topup_row, new_balance)
+    """
+    topup_id = int(topup_id)
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM topups WHERE id=?", (topup_id,))
+            topup = cur.fetchone()
+            if not topup:
+                conn.rollback()
+                return False, "not_found", None, None
+            if topup["status"] != "pending_review":
+                conn.rollback()
+                return False, "already_reviewed", topup, None
+
+            user_id = str(topup["user_id"])
+            amount = int(topup["amount"])
+            cur.execute("SELECT * FROM users WHERE id=?", (user_id,))
+            user = cur.fetchone()
+            if not user:
+                cur.execute("INSERT INTO users(id) VALUES (?)", (user_id,))
+                before = 0
+            else:
+                before = int(user["balance"] or 0)
+            after = before + amount
+            cur.execute("UPDATE users SET balance=? WHERE id=?", (after, user_id))
+            cur.execute(
+                """
+                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note)
+                VALUES (?, 'topup_approved', ?, ?, ?, ?)
+                """,
+                (user_id, amount, before, after, f"topup_id={topup_id};admin_id={admin_id or '-'}"),
+            )
+            cur.execute(
+                "UPDATE topups SET status='approved', reviewed_at=datetime('now') WHERE id=? AND status='pending_review'",
+                (topup_id,),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "already_reviewed", topup, None
+            conn.commit()
+            cur.execute("SELECT * FROM topups WHERE id=?", (topup_id,))
+            return True, "approved", cur.fetchone(), after
+        except Exception:
+            conn.rollback()
+            raise
+
+# --- Text message drafts / publishing ---
+
+def set_message_draft_text(key, text):
+    row = get_message(key)
+    if row is None:
+        cur.execute(
+            "INSERT INTO messages(key, draft_text, updated_at) VALUES (?, ?, datetime('now'))",
+            (key, text),
+        )
+    else:
+        cur.execute(
+            "UPDATE messages SET draft_text=?, updated_at=datetime('now') WHERE key=?",
+            (text, key),
+        )
+    conn.commit()
+
+
+def set_message_draft_photo(key, photo_file_id):
+    row = get_message(key)
+    if row is None:
+        cur.execute(
+            "INSERT INTO messages(key, draft_photo_file_id, updated_at) VALUES (?, ?, datetime('now'))",
+            (key, photo_file_id),
+        )
+    else:
+        cur.execute(
+            "UPDATE messages SET draft_photo_file_id=?, updated_at=datetime('now') WHERE key=?",
+            (photo_file_id, key),
+        )
+    conn.commit()
+
+
+def publish_message_draft(key):
+    row = get_message(key)
+    if row is None:
+        return False
+    draft_text = row["draft_text"] if "draft_text" in row.keys() else None
+    draft_photo = row["draft_photo_file_id"] if "draft_photo_file_id" in row.keys() else None
+    if draft_text is None and draft_photo is None:
+        return False
+    cur.execute(
+        """
+        UPDATE messages
+        SET text=COALESCE(draft_text, text),
+            photo_file_id=COALESCE(draft_photo_file_id, photo_file_id),
+            draft_text=NULL,
+            draft_photo_file_id=NULL,
+            published_at=datetime('now'),
+            updated_at=datetime('now')
+        WHERE key=?
+        """,
+        (key,),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def clear_message_draft(key):
+    cur.execute(
+        "UPDATE messages SET draft_text=NULL, draft_photo_file_id=NULL, updated_at=datetime('now') WHERE key=?",
+        (key,),
+    )
+    conn.commit()
+
+
+# --- Custom buttons (draft first, publish after preview) ---
+
+ALLOWED_CUSTOM_BUTTON_TYPES = {"text", "link", "submenu", "file", "support", "buy_plan", "faq", "guide"}
+ALLOWED_CUSTOM_BUTTON_LOCATIONS = {"main", "buy", "my_services", "wallet", "support", "guide", "account"}
+ALLOWED_CUSTOM_BUTTON_AUDIENCES = {"all", "buyers", "no_buy", "has_service", "no_service", "admins"}
+
+
+def _normalize_custom_button_payload(data):
+    data = dict(data or {})
+    title = (data.get("title") or "").strip()
+    button_type = (data.get("button_type") or "text").strip().lower()
+    payload = (data.get("payload") or "").strip()
+    location = (data.get("location") or "main").strip().lower()
+    audience = (data.get("audience") or "all").strip().lower()
+
+    if not title:
+        raise ValueError("button title is required")
+    if button_type not in ALLOWED_CUSTOM_BUTTON_TYPES:
+        raise ValueError("invalid button type")
+    if location not in ALLOWED_CUSTOM_BUTTON_LOCATIONS:
+        raise ValueError("invalid button location")
+    if audience not in ALLOWED_CUSTOM_BUTTON_AUDIENCES:
+        raise ValueError("invalid button audience")
+
+    sort_order = int(data.get("sort_order") if data.get("sort_order") not in (None, "") else 100)
+    is_active = 1 if str(data.get("is_active", "1")).lower() in {"1", "true", "active", "yes", "on", "فعال"} else 0
+    starts_at = (data.get("starts_at") or "").strip() or None
+    ends_at = (data.get("ends_at") or "").strip() or None
+
+    return {
+        "title": title,
+        "button_type": button_type,
+        "payload": payload,
+        "location": location,
+        "sort_order": sort_order,
+        "is_active": is_active,
+        "audience": audience,
+        "starts_at": starts_at,
+        "ends_at": ends_at,
+    }
+
+
+def create_custom_button_draft(data):
+    data = _normalize_custom_button_payload(data)
+    cur.execute(
+        """
+        INSERT INTO custom_buttons(
+            status,
+            draft_title, draft_button_type, draft_payload, draft_location,
+            draft_sort_order, draft_is_active, draft_audience, draft_starts_at, draft_ends_at,
+            updated_at
+        ) VALUES ('draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """,
+        (
+            data["title"], data["button_type"], data["payload"], data["location"],
+            data["sort_order"], data["is_active"], data["audience"], data["starts_at"], data["ends_at"],
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def save_custom_button_draft(button_id, data):
+    data = _normalize_custom_button_payload(data)
+    cur.execute(
+        """
+        UPDATE custom_buttons
+        SET draft_title=?, draft_button_type=?, draft_payload=?, draft_location=?,
+            draft_sort_order=?, draft_is_active=?, draft_audience=?, draft_starts_at=?, draft_ends_at=?,
+            updated_at=datetime('now')
+        WHERE id=?
+        """,
+        (
+            data["title"], data["button_type"], data["payload"], data["location"],
+            data["sort_order"], data["is_active"], data["audience"], data["starts_at"], data["ends_at"],
+            int(button_id),
+        ),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def publish_custom_button(button_id):
+    row = get_custom_button(button_id)
+    if not row:
+        return False
+    if not row["draft_title"]:
+        return False
+    cur.execute(
+        """
+        UPDATE custom_buttons
+        SET title=draft_title,
+            button_type=draft_button_type,
+            payload=draft_payload,
+            location=draft_location,
+            sort_order=draft_sort_order,
+            is_active=draft_is_active,
+            audience=draft_audience,
+            starts_at=draft_starts_at,
+            ends_at=draft_ends_at,
+            status='published',
+            draft_title=NULL,
+            draft_button_type=NULL,
+            draft_payload=NULL,
+            draft_location=NULL,
+            draft_sort_order=NULL,
+            draft_is_active=NULL,
+            draft_audience=NULL,
+            draft_starts_at=NULL,
+            draft_ends_at=NULL,
+            published_at=datetime('now'),
+            updated_at=datetime('now')
+        WHERE id=?
+        """,
+        (int(button_id),),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def get_custom_button(button_id):
+    cur.execute("SELECT * FROM custom_buttons WHERE id=?", (int(button_id),))
+    return cur.fetchone()
+
+
+def delete_custom_button(button_id):
+    cur.execute("DELETE FROM custom_buttons WHERE id=?", (int(button_id),))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def list_custom_buttons(location=None, include_drafts=True, limit=50):
+    sql = "SELECT * FROM custom_buttons"
+    params = []
+    where = []
+    if location:
+        where.append("COALESCE(draft_location, location)=?")
+        params.append(location)
+    if not include_drafts:
+        where.append("status='published'")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY COALESCE(draft_sort_order, sort_order, 100), id DESC LIMIT ?"
+    params.append(int(limit))
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def list_active_custom_buttons(location="main"):
+    cur.execute(
+        """
+        SELECT * FROM custom_buttons
+        WHERE status='published'
+          AND is_active=1
+          AND location=?
+          AND (starts_at IS NULL OR starts_at='' OR starts_at <= datetime('now'))
+          AND (ends_at IS NULL OR ends_at='' OR ends_at >= datetime('now'))
+        ORDER BY sort_order, id
+        """,
+        (location,),
+    )
+    return cur.fetchall()
+
+
+def get_active_custom_button_by_title(title):
+    cur.execute(
+        """
+        SELECT * FROM custom_buttons
+        WHERE status='published'
+          AND is_active=1
+          AND location='main'
+          AND title=?
+          AND (starts_at IS NULL OR starts_at='' OR starts_at <= datetime('now'))
+          AND (ends_at IS NULL OR ends_at='' OR ends_at >= datetime('now'))
+        ORDER BY sort_order, id
+        LIMIT 1
+        """,
+        ((title or "").strip(),),
+    )
+    return cur.fetchone()
+
+
+def custom_button_has_draft(row):
+    return bool(row and row["draft_title"])
+
+
+def stage_custom_button_toggle(button_id):
+    row = get_custom_button(button_id)
+    if not row:
+        return False
+    base = custom_button_effective_data(row)
+    base["is_active"] = 0 if int(base.get("is_active") or 0) else 1
+    return save_custom_button_draft(button_id, base)
+
+
+def custom_button_effective_data(row, prefer_draft=True):
+    if prefer_draft and row["draft_title"]:
+        return {
+            "title": row["draft_title"],
+            "button_type": row["draft_button_type"],
+            "payload": row["draft_payload"],
+            "location": row["draft_location"],
+            "sort_order": row["draft_sort_order"],
+            "is_active": row["draft_is_active"],
+            "audience": row["draft_audience"],
+            "starts_at": row["draft_starts_at"],
+            "ends_at": row["draft_ends_at"],
+        }
+    return {
+        "title": row["title"],
+        "button_type": row["button_type"],
+        "payload": row["payload"],
+        "location": row["location"],
+        "sort_order": row["sort_order"],
+        "is_active": row["is_active"],
+        "audience": row["audience"],
+        "starts_at": row["starts_at"],
+        "ends_at": row["ends_at"],
+    }
+
+
+# --- Backup logs / schema metadata ---
+
+def log_backup_operation(admin_id, operation_type, backup_file_name=None, file_size=0, status="ok", note=""):
+    cur.execute(
+        """
+        INSERT INTO backup_logs(admin_id, operation_type, backup_file_name, file_size, status, note)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (str(admin_id) if admin_id is not None else None, operation_type, backup_file_name, int(file_size or 0), status, note or ""),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_backup_logs(limit=10):
+    cur.execute("SELECT * FROM backup_logs ORDER BY id DESC LIMIT ?", (int(limit),))
+    return cur.fetchall()

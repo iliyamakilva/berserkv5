@@ -192,6 +192,11 @@ async def text_wallet(m: types.Message):
     await show_wallet(m, m.from_user.id, m.from_user.username or "")
 
 
+@dp.message_handler(lambda m: m.text == menus.BTN_GUIDE)
+async def text_guide(m: types.Message):
+    await show_guide_menu(m, m.from_user.id, m.from_user.username or "")
+
+
 @dp.message_handler(lambda m: m.text == menus.BTN_REFERRAL)
 async def text_referral(m: types.Message):
     await show_referral(m, m.from_user.id, m.from_user.username or "")
@@ -199,7 +204,9 @@ async def text_referral(m: types.Message):
 
 @dp.message_handler(lambda m: m.text == menus.BTN_TICKET)
 async def text_ticket(m: types.Message):
-    await m.answer(
+    await messages.send(
+        m,
+        "support_intro",
         "برای ارسال پیام به پشتیبانی، روی دکمه زیر بزنید:",
         reply_markup=types.InlineKeyboardMarkup().add(
             types.InlineKeyboardButton("🎫 ارسال پیام پشتیبانی", callback_data="ticket_start")
@@ -400,12 +407,14 @@ async def show_my_subs(target, user_id: int, username: str = ""):
     rows = subs.user_subs(user_id_str)
 
     if not rows:
-        return await target.answer(
-            "هنوز هیچ اشتراکی خریداری نکردید.",
+        return await messages.send(
+            target,
+            "my_services_empty",
+            "هنوز هیچ سرویسی خریداری نکردید.",
             reply_markup=menus.main_reply_kb(user_id),
         )
 
-    lines = ["📦 اشتراک‌های شما:\n"]
+    lines = ["📦 سرویس‌های شما:\n"]
 
     for r in rows:
         lines.append(
@@ -422,6 +431,135 @@ async def my_subs(c: types.CallbackQuery):
     await c.answer()
     await show_my_subs(c.message, c.from_user.id, c.from_user.username or "")
 
+
+
+
+def guide_menu_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("📱 آموزش اندروید", callback_data="guide_android"))
+    kb.add(types.InlineKeyboardButton("🍎 آموزش آیفون", callback_data="guide_ios"))
+    kb.add(types.InlineKeyboardButton("💻 آموزش ویندوز", callback_data="guide_windows"))
+    kb.add(types.InlineKeyboardButton("🖥 آموزش مک", callback_data="guide_mac"))
+    kb.add(types.InlineKeyboardButton("❓ مشکل اتصال دارم", callback_data="guide_troubleshoot"))
+    kb.add(types.InlineKeyboardButton("🔄 بروزرسانی ساب‌لینک", callback_data="guide_update"))
+    kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
+    return kb
+
+
+_GUIDE_DEFAULTS = {
+    "guide_home": "📚 آموزش اتصال\n\nدستگاه خود را انتخاب کنید:",
+    "guide_android": "📱 آموزش اندروید\n\n۱. یک برنامه سازگار با ساب‌لینک نصب کنید.\n۲. لینک سرویس را از بخش سرویس‌های من کپی کنید.\n۳. داخل برنامه گزینه Import/Subscription را بزنید.\n۴. لینک را وارد و بروزرسانی کنید.",
+    "guide_ios": "🍎 آموزش آیفون\n\n۱. یک کلاینت سازگار نصب کنید.\n۲. ساب‌لینک را کپی کنید.\n۳. از بخش Subscription یا Import، لینک را اضافه کنید.\n۴. اتصال را تست کنید.",
+    "guide_windows": "💻 آموزش ویندوز\n\n۱. برنامه مناسب ویندوز را نصب کنید.\n۲. لینک سرویس را از بخش سرویس‌های من کپی کنید.\n۳. از بخش Subscription لینک را اضافه کنید.\n۴. Update subscription را بزنید.",
+    "guide_mac": "🖥 آموزش مک\n\n۱. کلاینت سازگار با مک را نصب کنید.\n۲. لینک سرویس را اضافه کنید.\n۳. ساب‌لینک را بروزرسانی و اتصال را فعال کنید.",
+    "guide_troubleshoot": "❓ مشکل اتصال دارم\n\nاول اینترنت اصلی را بررسی کنید، سپس ساب‌لینک را بروزرسانی کنید. اگر مشکل ادامه داشت، از بخش پشتیبانی پیام بدهید.",
+    "guide_update": "🔄 بروزرسانی ساب‌لینک\n\nدر برنامه خود گزینه Update/Refresh Subscription را بزنید تا لیست سرورها تازه شود.",
+}
+
+
+async def show_guide_menu(target, user_id: int, username: str = ""):
+    db.touch_active(str(user_id), username)
+    await messages.send(
+        target,
+        "guide_home",
+        _GUIDE_DEFAULTS["guide_home"],
+        reply_markup=guide_menu_kb(),
+    )
+
+
+async def show_guide_page(target, key: str, user_id: int):
+    await messages.send(
+        target,
+        key,
+        _GUIDE_DEFAULTS.get(key, "📚 آموزش اتصال"),
+        reply_markup=guide_menu_kb(),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "guide_home")
+async def cb_guide_home(c: types.CallbackQuery):
+    await c.answer()
+    await show_guide_menu(c.message, c.from_user.id, c.from_user.username or "")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("guide_") and c.data != "guide_home")
+async def cb_guide_page(c: types.CallbackQuery):
+    await c.answer()
+    key = c.data
+    await show_guide_page(c.message, key, c.from_user.id)
+
+
+def _custom_button_allowed(row, user_id):
+    audience = row["audience"] or "all"
+    if audience == "all":
+        return True
+    if audience == "admins":
+        return menus.is_admin_user(user_id)
+
+    try:
+        user = db.get_user(str(user_id))
+        purchased = int(user["purchased"] or 0) if user else 0
+        service_count = db.delivered_sub_count_by_user(str(user_id))
+    except Exception:
+        return False
+
+    if audience == "buyers":
+        return purchased > 0
+    if audience == "no_buy":
+        return purchased == 0
+    if audience == "has_service":
+        return service_count > 0
+    if audience == "no_service":
+        return service_count == 0
+    return False
+
+
+async def render_custom_button(target, row, user_id: int, username: str = ""):
+    db.touch_active(str(user_id), username)
+    if not _custom_button_allowed(row, user_id):
+        return await target.answer("این دکمه برای حساب شما فعال نیست.", reply_markup=menus.main_reply_kb(user_id))
+
+    button_type = row["button_type"] or "text"
+    payload = row["payload"] or ""
+    title = row["title"] or "دکمه اختصاصی"
+
+    if button_type == "link":
+        if not payload.startswith(("http://", "https://", "tg://")):
+            return await target.answer("لینک این دکمه معتبر نیست. لطفاً به پشتیبانی اطلاع دهید.", reply_markup=menus.main_reply_kb(user_id))
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(types.InlineKeyboardButton(title, url=payload))
+        kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
+        return await target.answer(f"برای باز کردن «{title}» روی دکمه زیر بزنید:", reply_markup=kb)
+
+    if button_type == "support":
+        return await messages.send(
+            target,
+            "support_intro",
+            payload or "برای ارسال پیام به پشتیبانی، روی دکمه زیر بزنید:",
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("🎫 ارسال پیام پشتیبانی", callback_data="ticket_start")
+            ),
+        )
+
+    if button_type == "buy_plan":
+        return await render_buy(target, user_id, username)
+
+    if button_type == "file":
+        if payload:
+            try:
+                return await target.answer_document(payload, caption=title, reply_markup=menus.main_reply_kb(user_id))
+            except Exception:
+                pass
+        return await target.answer("فایل این دکمه در دسترس نیست.", reply_markup=menus.main_reply_kb(user_id))
+
+    # text / faq / guide / submenu در نسخه ربات به صورت پیام امن نمایش داده می‌شوند.
+    await target.answer(payload or title, reply_markup=menus.main_reply_kb(user_id))
+
+
+@dp.message_handler(lambda m: db.get_active_custom_button_by_title(m.text or "") is not None)
+async def text_custom_button(m: types.Message):
+    row = db.get_active_custom_button_by_title(m.text or "")
+    await render_custom_button(m, row, m.from_user.id, m.from_user.username or "")
 
 async def show_wallet(target, user_id: int, username: str = ""):
     user_id_str = str(user_id)

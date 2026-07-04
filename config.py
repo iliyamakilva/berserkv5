@@ -26,6 +26,11 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 
+# اگر OWNER_ID ست شود، عملیات خیلی حساس مثل ری‌استور فقط برای مالک فعال می‌شود.
+# اگر ست نشود، برای سازگاری با نسخه‌های قبلی همه ADMIN_IDها مالک محسوب می‌شوند.
+OWNER_ID = _get_int("OWNER_ID")
+OWNER_IDS = {OWNER_ID} if OWNER_ID else set(ADMIN_IDS)
+
 REF_REWARD = _get_int("REF_REWARD", 30000)
 
 # مسیر دیتابیس برای Railway Volume:

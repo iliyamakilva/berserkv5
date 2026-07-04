@@ -128,7 +128,9 @@ async def process_receipt(m: types.Message, state: FSMContext):
     previous_uses = db.find_receipt(photo.file_unique_id)
     is_duplicate = len(previous_uses) > 0
 
-    db.record_receipt(photo.file_unique_id, m.from_user.id, topup_id)
+    receipt_recorded = db.record_receipt(photo.file_unique_id, m.from_user.id, topup_id)
+    if not receipt_recorded:
+        is_duplicate = True
     db.set_topup_status(topup_id, "pending_review")
     await state.finish()
 
