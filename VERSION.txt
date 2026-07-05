@@ -1,5 +1,5 @@
 Berserk VPN Bot
-Version: v5.6.1 Admin User Controls + Jalali Dates + Reports
+Version: v5.6.2 Admin User Controls + Jalali Dates + Reports
 Build Type: Safe Full Source Patch / Original 22 Files
 Date: 2026-07-05
 
@@ -34,3 +34,7 @@ Date: 2026-07-05
 
 نکته عملیاتی:
 قبل از نصب روی سرور اصلی، از دیتابیس فعلی بک‌آپ بگیرید و نسخه را ابتدا روی محیط تست اجرا کنید.
+
+
+v5.6.2:
+- Fixed Telegram BUTTON_USER_PRIVACY_RESTRICTED by replacing direct tg://user URL button with safe profile-info callback.

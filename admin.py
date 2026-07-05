@@ -220,7 +220,10 @@ async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_mar
 
 def user_detail_kb(user_id):
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("👁 مشاهده پروفایل", url=f"tg://user?id={user_id}"))
+    # ساخت دکمه URL با tg://user?id برای بعضی کاربران توسط تلگرام با
+    # BUTTON_USER_PRIVACY_RESTRICTED رد می‌شود و کل پیام را fail می‌کند.
+    # به همین دلیل پروفایل را با callback امن نمایش می‌دهیم و URL خام داخل متن می‌آید.
+    kb.add(InlineKeyboardButton("👁 اطلاعات پروفایل", callback_data=f"adm_user_profile_{user_id}"))
     kb.add(InlineKeyboardButton("💬 ارسال پیام به کاربر", callback_data=f"adm_msg_user_{user_id}"))
     kb.add(InlineKeyboardButton("📝 یادداشت ادمین", callback_data=f"adm_user_note_{user_id}"))
     kb.add(InlineKeyboardButton("🧪 تغییر وضعیت کاربر تست", callback_data=f"adm_user_test_{user_id}"))
@@ -444,6 +447,31 @@ async def cb_user_detail(c: types.CallbackQuery):
     await _send_long(c.message, _fmt_user_detail(user_id), reply_markup=user_detail_kb(user_id))
     if subs.user_subs(user_id, limit=1):
         await c.message.answer("🔁 عملیات سریع روی سرویس‌های این کاربر:", reply_markup=user_services_kb(user_id))
+
+
+async def cb_user_profile_info(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_user_profile_", 1)[1]
+    user = db.get_user(user_id)
+    if not user:
+        return await c.message.answer("کاربر پیدا نشد.", reply_markup=admin_back_kb())
+
+    username = f"@{user['username']}" if user['username'] else "ندارد"
+    display = _display_username(user)
+    text = (
+        "👁 اطلاعات دسترسی به پروفایل کاربر\n\n"
+        f"نمایش: {display}\n"
+        f"یوزرنیم: {username}\n"
+        f"شناسه عددی: {user_id}\n\n"
+        "برای کاربران بدون یوزرنیم، مطمئن‌ترین شناسه همین Telegram ID است.\n"
+        "اگر کلاینت تلگرام اجازه بدهد، می‌توانید این لینک داخلی را کپی و باز کنید:\n"
+        f"tg://user?id={user_id}\n\n"
+        "اگر لینک باز نشد، یعنی محدودیت حریم خصوصی/کلاینت تلگرام اجازه نمایش مستقیم نمی‌دهد. "
+        "در این حالت از دکمه «💬 ارسال پیام به کاربر» استفاده کنید."
+    )
+    await _replace_callback_message(c, text, reply_markup=user_detail_kb(user_id))
 
 
 async def cb_user_note(c: types.CallbackQuery, state: FSMContext):
@@ -2835,7 +2863,8 @@ def register(dp):
     dp.register_callback_query_handler(cb_section_reports, lambda c: c.data == "adm_section_reports")
 
     dp.register_callback_query_handler(cb_users, lambda c: c.data == "adm_users")
-    dp.register_callback_query_handler(cb_user_detail, lambda c: c.data.startswith("adm_user_") and not c.data.startswith(("adm_user_note_", "adm_user_test_")))
+    dp.register_callback_query_handler(cb_user_profile_info, lambda c: c.data.startswith("adm_user_profile_"))
+    dp.register_callback_query_handler(cb_user_detail, lambda c: c.data.startswith("adm_user_") and not c.data.startswith(("adm_user_note_", "adm_user_test_", "adm_user_profile_")))
     dp.register_callback_query_handler(cb_user_note, lambda c: c.data.startswith("adm_user_note_"))
     dp.register_message_handler(process_user_note, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_user_note)
     dp.register_callback_query_handler(cb_user_test_toggle, lambda c: c.data.startswith("adm_user_test_"))
