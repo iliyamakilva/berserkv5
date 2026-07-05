@@ -281,6 +281,8 @@ def init():
                 tag TEXT DEFAULT '',
                 show_stock INTEGER DEFAULT 1,
                 low_stock_threshold INTEGER DEFAULT 5,
+                pre_purchase_text TEXT DEFAULT '',
+                post_purchase_text TEXT DEFAULT '',
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
             )
@@ -336,6 +338,8 @@ def init():
         _add_column_if_missing("messages", "draft_photo_file_id", "TEXT")
         _add_column_if_missing("messages", "updated_at", "TEXT")
         _add_column_if_missing("messages", "published_at", "TEXT")
+        _add_column_if_missing("plans", "pre_purchase_text", "TEXT DEFAULT ''")
+        _add_column_if_missing("plans", "post_purchase_text", "TEXT DEFAULT ''")
         cur.execute("""
             SELECT file_unique_id, COUNT(*) AS c
             FROM receipts
@@ -1455,8 +1459,9 @@ def create_plan(data):
     cur.execute(
         """
         INSERT INTO plans(title, volume_label, duration_label, price, description, sort_order,
-                          is_active, max_per_order, cost_price, tag, show_stock, low_stock_threshold)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          is_active, max_per_order, cost_price, tag, show_stock, low_stock_threshold,
+                          pre_purchase_text, post_purchase_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             title,
@@ -1471,6 +1476,8 @@ def create_plan(data):
             (data.get("tag") or "").strip(),
             1 if int(data.get("show_stock", 1) or 0) else 0,
             int(data.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
+            (data.get("pre_purchase_text") or "").strip(),
+            (data.get("post_purchase_text") or "").strip(),
         ),
     )
     conn.commit()
@@ -1493,7 +1500,7 @@ def update_plan(plan_id, data):
         UPDATE plans
         SET title=?, volume_label=?, duration_label=?, price=?, description=?, sort_order=?,
             is_active=?, max_per_order=?, cost_price=?, tag=?, show_stock=?, low_stock_threshold=?,
-            updated_at=datetime('now')
+            pre_purchase_text=?, post_purchase_text=?, updated_at=datetime('now')
         WHERE id=?
         """,
         (
@@ -1509,6 +1516,8 @@ def update_plan(plan_id, data):
             (merged.get("tag") or "").strip(),
             1 if int(merged.get("show_stock") or 0) else 0,
             int(merged.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
+            (merged.get("pre_purchase_text") or "").strip(),
+            (merged.get("post_purchase_text") or "").strip(),
             int(plan_id),
         ),
     )

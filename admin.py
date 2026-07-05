@@ -51,6 +51,7 @@ class AdminStates(StatesGroup):
     waiting_system_button_order = State()
     waiting_system_button_location = State()
     waiting_plan_form = State()
+    waiting_plan_setting_value = State()
     waiting_broadcast_content = State()
     waiting_broadcast_confirm = State()
 
@@ -96,6 +97,7 @@ def admin_services_section_kb():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("🏷 مدیریت پلن‌ها", callback_data="adm_plans"),
+        InlineKeyboardButton("➕ ساخت سریع پلن", callback_data="plan_create"),
         InlineKeyboardButton("🔗 مدیریت لینک‌ها", callback_data="adm_links"),
         InlineKeyboardButton("➕ افزودن لینک", callback_data="adm_link_add"),
         InlineKeyboardButton("🔎 جستجوی لینک", callback_data="adm_link_search"),
@@ -1278,7 +1280,7 @@ async def cb_admin_logs(c: types.CallbackQuery):
 
 def plans_menu_kb():
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("➕ ساخت پلن جدید", callback_data="plan_create"))
+    kb.add(InlineKeyboardButton("➕ ساخت سریع پلن", callback_data="plan_create"))
     for plan in db.list_plans(limit=30):
         active = "✅" if int(plan["is_active"] or 0) else "🚫"
         default = " ⭐" if int(plan["is_default"] or 0) else ""
@@ -1290,17 +1292,58 @@ def plans_menu_kb():
 def plan_detail_kb(plan_id):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("✏️ ویرایش", callback_data=f"plan_edit_{plan_id}"),
+        InlineKeyboardButton("⚙️ تنظیمات پلن", callback_data=f"plan_settings_{plan_id}"),
         InlineKeyboardButton("👁 فعال/غیرفعال", callback_data=f"plan_toggle_{plan_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("📥 افزودن لینک به این پلن", callback_data=f"adm_addsub_plan_{plan_id}"),
+        InlineKeyboardButton("✏️ ویرایش فرم کامل", callback_data=f"plan_edit_{plan_id}"),
     )
     kb.add(InlineKeyboardButton("⬅️ مدیریت پلن‌ها", callback_data="adm_plans"))
     kb.add(InlineKeyboardButton("🏠 پنل مدیریت", callback_data="adm_back"))
     return kb
 
 
+PLAN_EDIT_FIELDS = {
+    "title": ("عنوان پلن", "text"),
+    "volume_label": ("حجم", "text"),
+    "duration_label": ("مدت", "text"),
+    "price": ("قیمت فروش", "int"),
+    "description": ("توضیح کوتاه", "text"),
+    "sort_order": ("ترتیب نمایش", "int"),
+    "max_per_order": ("حداکثر خرید در سفارش", "int"),
+    "cost_price": ("قیمت خرید/هزینه", "int"),
+    "tag": ("برچسب", "text"),
+    "low_stock_threshold": ("حد هشدار موجودی", "int"),
+    "pre_purchase_text": ("متن اختصاصی قبل از خرید", "text"),
+    "post_purchase_text": ("متن اختصاصی بعد از خرید", "text"),
+}
+
+
+def plan_settings_kb(plan_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("عنوان", callback_data=f"plan_set_title_{plan_id}"),
+        InlineKeyboardButton("قیمت", callback_data=f"plan_set_price_{plan_id}"),
+        InlineKeyboardButton("حجم", callback_data=f"plan_set_volume_label_{plan_id}"),
+        InlineKeyboardButton("مدت", callback_data=f"plan_set_duration_label_{plan_id}"),
+        InlineKeyboardButton("حد هشدار", callback_data=f"plan_set_low_stock_threshold_{plan_id}"),
+        InlineKeyboardButton("حداکثر خرید", callback_data=f"plan_set_max_per_order_{plan_id}"),
+        InlineKeyboardButton("توضیح", callback_data=f"plan_set_description_{plan_id}"),
+        InlineKeyboardButton("برچسب", callback_data=f"plan_set_tag_{plan_id}"),
+        InlineKeyboardButton("متن قبل خرید", callback_data=f"plan_set_pre_purchase_text_{plan_id}"),
+        InlineKeyboardButton("متن بعد خرید", callback_data=f"plan_set_post_purchase_text_{plan_id}"),
+    )
+    kb.add(InlineKeyboardButton("👁 نمایش/عدم نمایش موجودی", callback_data=f"plan_toggle_stock_{plan_id}"))
+    kb.add(InlineKeyboardButton("⬅️ جزئیات پلن", callback_data=f"plan_detail_{plan_id}"))
+    return kb
+
+
 def _fmt_plan(plan):
     stock = db.plan_stock_count(plan["id"])
     sold = db.plan_sold_count(plan["id"])
+    pre_text = (plan["pre_purchase_text"] if "pre_purchase_text" in plan.keys() else "") or ""
+    post_text = (plan["post_purchase_text"] if "post_purchase_text" in plan.keys() else "") or ""
     return (
         f"🏷 پلن #{plan['id']}\n\n"
         f"عنوان: {plan['title']}\n"
@@ -1314,6 +1357,8 @@ def _fmt_plan(plan):
         f"حداکثر خرید در سفارش: {plan['max_per_order']}\n"
         f"نمایش موجودی به کاربر: {'بله' if int(plan['show_stock'] or 0) else 'خیر'}\n"
         f"آستانه هشدار موجودی: {plan['low_stock_threshold']}\n"
+        f"متن قبل خرید: {_short(pre_text, 80)}\n"
+        f"متن بعد خرید: {_short(post_text, 80)}\n"
         f"وضعیت: {'فعال' if int(plan['is_active'] or 0) else 'غیرفعال'}\n"
         f"پیش‌فرض: {'بله' if int(plan['is_default'] or 0) else 'خیر'}\n"
         f"موجودی آزاد این پلن: {stock}\n"
@@ -1334,11 +1379,13 @@ def _plan_form_help(current=None):
         "هزینه: 0\n"
         "برچسب: پرفروش\n"
         "نمایش موجودی: yes\n"
-        "هشدار موجودی: 5"
+        "هشدار موجودی: 5\n"
+        "متن قبل خرید: \n"
+        "متن بعد خرید: "
     )
     if current:
         sample = current
-    return "فرم پلن را به این شکل بفرستید:\n\n" + sample
+    return "فرم کامل پلن را به این شکل بفرستید:\n\n" + sample
 
 
 def _parse_plan_form(text):
@@ -1355,6 +1402,8 @@ def _parse_plan_form(text):
         "برچسب": "tag", "tag": "tag",
         "نمایش موجودی": "show_stock", "show_stock": "show_stock",
         "هشدار موجودی": "low_stock_threshold", "low_stock": "low_stock_threshold",
+        "متن قبل خرید": "pre_purchase_text", "pre_purchase_text": "pre_purchase_text",
+        "متن بعد خرید": "post_purchase_text", "post_purchase_text": "post_purchase_text",
     }
     data = {}
     for raw in (text or "").splitlines():
@@ -1397,8 +1446,12 @@ async def cb_plan_create(c: types.CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
-    await state.update_data(plan_action="create")
-    await _replace_callback_message(c, "➕ ساخت پلن جدید\n\n" + _plan_form_help(), reply_markup=cancel_kb())
+    await state.update_data(plan_action="create_wizard", plan_step="title", plan_data={})
+    await _replace_callback_message(
+        c,
+        "➕ ساخت سریع پلن\n\nمرحله ۱ از ۶\nعنوان پلن را بفرستید.\nمثال: 50GB یک‌ماهه",
+        reply_markup=cancel_kb(),
+    )
     await AdminStates.waiting_plan_form.set()
 
 
@@ -1422,19 +1475,90 @@ async def cb_plan_edit(c: types.CallbackQuery, state: FSMContext):
         f"هزینه: {plan['cost_price'] or 0}\n"
         f"برچسب: {plan['tag'] or ''}\n"
         f"نمایش موجودی: {'yes' if int(plan['show_stock'] or 0) else 'no'}\n"
-        f"هشدار موجودی: {plan['low_stock_threshold']}"
+        f"هشدار موجودی: {plan['low_stock_threshold']}\n"
+        f"متن قبل خرید: {(plan['pre_purchase_text'] if 'pre_purchase_text' in plan.keys() else '') or ''}\n"
+        f"متن بعد خرید: {(plan['post_purchase_text'] if 'post_purchase_text' in plan.keys() else '') or ''}"
     )
     await state.update_data(plan_action="edit", plan_id=plan_id)
-    await _replace_callback_message(c, "✏️ ویرایش پلن\n\n" + _plan_form_help(current), reply_markup=cancel_kb())
+    await _replace_callback_message(c, "✏️ ویرایش فرم کامل پلن\n\n" + _plan_form_help(current), reply_markup=cancel_kb())
     await AdminStates.waiting_plan_form.set()
+
+
+def _plan_wizard_preview(data):
+    return (
+        "🧪 پیش‌نمایش پلن جدید:\n\n"
+        f"عنوان: {data.get('title') or '-'}\n"
+        f"حجم: {data.get('volume_label') or '-'}\n"
+        f"مدت: {data.get('duration_label') or '-'}\n"
+        f"قیمت: {int(data.get('price') or 0):,} تومان\n"
+        f"حد هشدار موجودی: {int(data.get('low_stock_threshold') or settings.low_stock_threshold())}\n"
+        f"توضیح: {data.get('description') or '-'}"
+    )
+
+
+def _plan_wizard_confirm_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("✅ ثبت پلن", callback_data="plan_wizard_save"))
+    kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
+    return kb
 
 
 async def process_plan_form(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return
     if m.content_type != "text":
-        return await m.answer("لطفاً فرم پلن را به صورت متن بفرستید.", reply_markup=cancel_kb())
+        return await m.answer("لطفاً مقدار را به صورت متن بفرستید.", reply_markup=cancel_kb())
     data = await state.get_data()
+
+    if data.get("plan_action") == "create_wizard":
+        step = data.get("plan_step") or "title"
+        plan_data = dict(data.get("plan_data") or {})
+        value = (m.text or "").strip()
+        if value in {"-", "رد", "skip", "Skip"}:
+            value = ""
+
+        if step == "title":
+            if not value:
+                return await m.answer("عنوان پلن الزامی است. مثال: 50GB یک‌ماهه", reply_markup=cancel_kb())
+            plan_data["title"] = value
+            await state.update_data(plan_step="volume", plan_data=plan_data)
+            return await m.answer("مرحله ۲ از ۶\nحجم پلن را بفرستید.\nمثال: 50GB\nاگر حجم نمی‌خواهید، - بفرستید.", reply_markup=cancel_kb())
+
+        if step == "volume":
+            plan_data["volume_label"] = value
+            await state.update_data(plan_step="duration", plan_data=plan_data)
+            return await m.answer("مرحله ۳ از ۶\nمدت پلن را بفرستید.\nمثال: 30 روز", reply_markup=cancel_kb())
+
+        if step == "duration":
+            plan_data["duration_label"] = value or "30 روز"
+            await state.update_data(plan_step="price", plan_data=plan_data)
+            return await m.answer("مرحله ۴ از ۶\nقیمت فروش را فقط عددی بفرستید.\nمثال: 180000", reply_markup=cancel_kb())
+
+        if step == "price":
+            raw = value.replace(",", "")
+            if not raw.isdigit() or int(raw) <= 0:
+                return await m.answer("قیمت معتبر نیست. فقط عدد مثبت بفرستید. مثال: 180000", reply_markup=cancel_kb())
+            plan_data["price"] = int(raw)
+            await state.update_data(plan_step="low_stock", plan_data=plan_data)
+            return await m.answer("مرحله ۵ از ۶\nحد هشدار موجودی را بفرستید.\nمثال: 5", reply_markup=cancel_kb())
+
+        if step == "low_stock":
+            raw = value.replace(",", "")
+            if not raw.isdigit():
+                return await m.answer("حد هشدار باید عدد باشد. مثال: 5", reply_markup=cancel_kb())
+            plan_data["low_stock_threshold"] = int(raw)
+            await state.update_data(plan_step="description", plan_data=plan_data)
+            return await m.answer("مرحله ۶ از ۶\nتوضیح کوتاه پلن را بفرستید.\nمثال: مناسب استفاده روزمره\nاگر توضیح نمی‌خواهید، - بفرستید.", reply_markup=cancel_kb())
+
+        if step == "description":
+            plan_data["description"] = value
+            plan_data.setdefault("max_per_order", 4)
+            plan_data.setdefault("show_stock", 1)
+            plan_data.setdefault("is_active", 1)
+            plan_data.setdefault("sort_order", 100)
+            await state.update_data(plan_step="confirm", plan_data=plan_data)
+            return await m.answer(_plan_wizard_preview(plan_data), reply_markup=_plan_wizard_confirm_kb())
+
     form = _parse_plan_form(m.text)
     try:
         if data.get("plan_action") == "edit":
@@ -1454,6 +1578,99 @@ async def process_plan_form(m: types.Message, state: FSMContext):
     await m.answer("✅ پلن ذخیره شد.\n\n" + _fmt_plan(plan), reply_markup=plan_detail_kb(plan_id))
 
 
+async def cb_plan_wizard_save(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    data = await state.get_data()
+    if data.get("plan_action") != "create_wizard" or data.get("plan_step") != "confirm":
+        return await c.answer("فرم ساخت پلن آماده ثبت نیست.", show_alert=True)
+    plan_data = dict(data.get("plan_data") or {})
+    try:
+        plan_id = db.create_plan(plan_data)
+    except Exception as exc:
+        return await c.answer(f"خطا در ثبت پلن: {exc}", show_alert=True)
+    await state.finish()
+    db.log_admin_action(c.from_user.id, "create_plan", None, f"plan_id={plan_id}; title={plan_data.get('title','')}")
+    plan = db.get_plan(plan_id)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("📥 افزودن لینک برای این پلن", callback_data=f"adm_addsub_plan_{plan_id}"))
+    kb.add(InlineKeyboardButton("⚙️ تنظیمات این پلن", callback_data=f"plan_settings_{plan_id}"))
+    kb.add(InlineKeyboardButton("⬅️ مدیریت پلن‌ها", callback_data="adm_plans"))
+    await _replace_callback_message(c, "✅ پلن ساخته شد.\n\n" + _fmt_plan(plan), reply_markup=kb)
+
+
+async def cb_plan_settings(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    plan_id = int(c.data.split("plan_settings_", 1)[1])
+    plan = db.get_plan(plan_id)
+    if not plan:
+        return await _replace_callback_message(c, "این پلن پیدا نشد.", reply_markup=plans_menu_kb())
+    await _replace_callback_message(c, "⚙️ تنظیمات اختصاصی این پلن\n\n" + _fmt_plan(plan), reply_markup=plan_settings_kb(plan_id))
+
+
+async def cb_plan_set_field(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("plan_set_", 1)[1]
+    field, plan_id = raw.rsplit("_", 1)
+    info = PLAN_EDIT_FIELDS.get(field)
+    if not info:
+        return await c.message.answer("این فیلد قابل ویرایش نیست.", reply_markup=plans_menu_kb())
+    plan = db.get_plan(int(plan_id))
+    if not plan:
+        return await c.message.answer("این پلن پیدا نشد.", reply_markup=plans_menu_kb())
+    label, ftype = info
+    current = plan[field] if field in plan.keys() else ""
+    await state.update_data(plan_id=int(plan_id), plan_field=field, plan_field_type=ftype, plan_field_label=label)
+    hint = "فقط عدد بفرستید." if ftype == "int" else "متن جدید را بفرستید. برای خالی کردن، - بفرستید."
+    await c.message.answer(f"✏️ ویرایش «{label}»\nمقدار فعلی:\n{current or '-'}\n\n{hint}", reply_markup=cancel_kb())
+    await AdminStates.waiting_plan_setting_value.set()
+
+
+async def process_plan_setting_value(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    data = await state.get_data()
+    plan_id = int(data["plan_id"])
+    field = data["plan_field"]
+    ftype = data["plan_field_type"]
+    label = data.get("plan_field_label") or field
+    value = (m.text or "").strip()
+    if value == "-":
+        value = ""
+    if ftype == "int":
+        raw = value.replace(",", "")
+        if not raw.isdigit():
+            return await m.answer("لطفاً فقط عدد بفرستید.", reply_markup=cancel_kb())
+        value = int(raw)
+    try:
+        db.update_plan(plan_id, {field: value})
+    except Exception as exc:
+        return await m.answer(f"❌ ذخیره نشد: {exc}", reply_markup=cancel_kb())
+    await state.finish()
+    db.log_admin_action(m.from_user.id, "update_plan_field", None, f"plan_id={plan_id}; field={field}; label={label}")
+    plan = db.get_plan(plan_id)
+    await m.answer("✅ تنظیمات پلن به‌روزرسانی شد.\n\n" + _fmt_plan(plan), reply_markup=plan_settings_kb(plan_id))
+
+
+async def cb_plan_toggle_stock(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    plan_id = int(c.data.split("plan_toggle_stock_", 1)[1])
+    plan = db.get_plan(plan_id)
+    if not plan:
+        return await _replace_callback_message(c, "این پلن پیدا نشد.", reply_markup=plans_menu_kb())
+    new_value = 0 if int(plan["show_stock"] or 0) else 1
+    db.update_plan(plan_id, {"show_stock": new_value})
+    db.log_admin_action(c.from_user.id, "toggle_plan_show_stock", None, f"plan_id={plan_id}; show_stock={new_value}")
+    plan = db.get_plan(plan_id)
+    await _replace_callback_message(c, "✅ وضعیت نمایش موجودی تغییر کرد.\n\n" + _fmt_plan(plan), reply_markup=plan_settings_kb(plan_id))
+
+
 async def cb_plan_toggle(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
@@ -1468,20 +1685,25 @@ async def cb_plan_toggle(c: types.CallbackQuery):
 
 
 SETTING_FIELDS = [
-    ("plan_title", "عنوان پلن", settings.plan_title, "text"),
-    ("plan_duration_label", "مدت پلن", settings.plan_duration_label, "text"),
-    ("plan_price", "قیمت پلن", settings.plan_price, "int"),
     ("ref_reward", "پاداش رفرال", settings.ref_reward, "int"),
     ("card_number", "شماره کارت", settings.card_number, "text"),
     ("card_holder", "نام صاحب کارت", settings.card_holder, "text"),
     ("min_topup", "حداقل شارژ", settings.min_topup, "int"),
-    ("low_stock_threshold", "آستانه هشدار موجودی", settings.low_stock_threshold, "int"),
 ]
+_STATUS_MESSAGE_FIELDS = {
+    "bot_disabled_message": ("پیام خاموش بودن ربات", settings.bot_disabled_message, "text"),
+    "sales_closed_message": ("پیام بسته بودن فروش", settings.sales_closed_message, "text"),
+}
 _FIELDS_BY_KEY = {f[0]: f for f in SETTING_FIELDS}
+_FIELDS_BY_KEY.update(_STATUS_MESSAGE_FIELDS)
 
 
 def settings_menu_kb():
     kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(f"🤖 وضعیت ربات: {'روشن' if settings.bot_enabled() else 'خاموش'}", callback_data="adm_bot_status"))
+    kb.add(InlineKeyboardButton(f"🛒 وضعیت فروش: {'باز' if settings.sales_enabled() else 'بسته'}", callback_data="adm_sales_status"))
+    kb.add(InlineKeyboardButton("✏️ پیام خاموش بودن ربات", callback_data="setkey_bot_disabled_message"))
+    kb.add(InlineKeyboardButton("✏️ پیام بسته بودن فروش", callback_data="setkey_sales_closed_message"))
     for key, label, getter, _ in SETTING_FIELDS:
         value = getter()
         display = f"{value:,}" if isinstance(value, int) else value
@@ -1497,9 +1719,30 @@ async def cb_settings(c: types.CallbackQuery):
     await c.answer()
     await _replace_callback_message(
         c,
-        "⚙️ تنظیمات — روی هر مورد بزنید تا مقدارش رو تغییر بدید:",
+        "⚙️ تنظیمات کل ربات\n\n"
+        "تنظیمات عمومی اینجا می‌ماند. تنظیمات اختصاصی هر پلن از بخش «📦 سرویس‌ها و پلن‌ها» مدیریت می‌شود.",
         reply_markup=settings_menu_kb(),
     )
+
+
+async def cb_toggle_bot_status(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    new_value = 0 if settings.bot_enabled() else 1
+    db.set_setting("bot_enabled", new_value)
+    db.log_admin_action(c.from_user.id, "toggle_bot_status", None, f"bot_enabled={new_value}")
+    await c.answer("وضعیت ربات تغییر کرد.", show_alert=False)
+    await _replace_callback_message(c, "✅ وضعیت ربات به‌روزرسانی شد.", reply_markup=settings_menu_kb())
+
+
+async def cb_toggle_sales_status(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    new_value = 0 if settings.sales_enabled() else 1
+    db.set_setting("sales_enabled", new_value)
+    db.log_admin_action(c.from_user.id, "toggle_sales_status", None, f"sales_enabled={new_value}")
+    await c.answer("وضعیت فروش تغییر کرد.", show_alert=False)
+    await _replace_callback_message(c, "✅ وضعیت فروش به‌روزرسانی شد.", reply_markup=settings_menu_kb())
 
 
 async def cb_setkey(c: types.CallbackQuery, state: FSMContext):
@@ -1514,7 +1757,7 @@ async def cb_setkey(c: types.CallbackQuery, state: FSMContext):
     current = getter()
     hint = " (فقط عدد)" if ftype == "int" else ""
     await state.update_data(setting_key=key, setting_type=ftype)
-    await c.message.answer(f"مقدار جدید برای «{label}»{hint} رو بفرستید.\nمقدار فعلی: {current}", reply_markup=cancel_kb())
+    await c.message.answer(f"مقدار جدید برای «{label}»{hint} رو بفرستید.\nمقدار فعلی:\n{current}", reply_markup=cancel_kb())
     await AdminStates.waiting_setting_value.set()
 
 
@@ -1529,6 +1772,7 @@ async def process_setting_value(m: types.Message, state: FSMContext):
             return await m.answer("لطفا فقط عدد بفرستید.", reply_markup=cancel_kb())
         value = int(value.replace(",", ""))
     db.set_setting(key, value)
+    db.log_admin_action(m.from_user.id, "update_setting", None, f"key={key}")
     await state.finish()
     await m.answer("✅ تنظیمات به‌روزرسانی شد.", reply_markup=settings_menu_kb())
 
@@ -2913,10 +3157,17 @@ def register(dp):
     dp.register_callback_query_handler(cb_plan_create, lambda c: c.data == "plan_create")
     dp.register_callback_query_handler(cb_plan_detail, lambda c: c.data.startswith("plan_detail_"))
     dp.register_callback_query_handler(cb_plan_edit, lambda c: c.data.startswith("plan_edit_"))
+    dp.register_callback_query_handler(cb_plan_settings, lambda c: c.data.startswith("plan_settings_"))
+    dp.register_callback_query_handler(cb_plan_set_field, lambda c: c.data.startswith("plan_set_"))
+    dp.register_callback_query_handler(cb_plan_toggle_stock, lambda c: c.data.startswith("plan_toggle_stock_"))
     dp.register_callback_query_handler(cb_plan_toggle, lambda c: c.data.startswith("plan_toggle_"))
+    dp.register_callback_query_handler(cb_plan_wizard_save, lambda c: c.data == "plan_wizard_save", state=AdminStates.waiting_plan_form)
     dp.register_message_handler(process_plan_form, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_plan_form)
+    dp.register_message_handler(process_plan_setting_value, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_plan_setting_value)
 
     dp.register_callback_query_handler(cb_settings, lambda c: c.data == "adm_settings")
+    dp.register_callback_query_handler(cb_toggle_bot_status, lambda c: c.data == "adm_bot_status")
+    dp.register_callback_query_handler(cb_toggle_sales_status, lambda c: c.data == "adm_sales_status")
     dp.register_callback_query_handler(cb_setkey, lambda c: c.data.startswith("setkey_"))
     dp.register_message_handler(process_setting_value, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_setting_value)
 

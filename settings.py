@@ -9,6 +9,10 @@ DEFAULTS = {
     "card_holder": "نام صاحب کارت",
     "min_topup": "50000",
     "low_stock_threshold": "5",
+    "bot_enabled": "1",
+    "bot_disabled_message": "⛔ ربات موقتاً غیرفعال است.\n\nلطفاً کمی بعد دوباره مراجعه کنید.",
+    "sales_enabled": "1",
+    "sales_closed_message": "⛔ فروش در حال حاضر بسته است.\n\nدر حال بروزرسانی موجودی سرویس‌ها هستیم. لطفاً بعداً دوباره تلاش کنید.",
 }
 
 
@@ -48,3 +52,20 @@ def min_topup():
 
 def low_stock_threshold():
     return get_setting_int("low_stock_threshold", int(DEFAULTS["low_stock_threshold"]))
+
+
+
+def bot_enabled():
+    return get_setting_int("bot_enabled", int(DEFAULTS["bot_enabled"])) == 1
+
+
+def bot_disabled_message():
+    return get_setting("bot_disabled_message", DEFAULTS["bot_disabled_message"])
+
+
+def sales_enabled():
+    return get_setting_int("sales_enabled", int(DEFAULTS["sales_enabled"])) == 1
+
+
+def sales_closed_message():
+    return get_setting("sales_closed_message", DEFAULTS["sales_closed_message"])

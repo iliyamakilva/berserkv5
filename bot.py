@@ -156,6 +156,9 @@ async def render_buy(target, user_id: int, username: str = "", plan_id=None):
     if user and user["banned"]:
         return await _send_answer(target, user_id, "⛔ حساب شما مسدود است.", context="buy")
 
+    if not _is_admin_user(user_id) and not settings.sales_enabled():
+        return await _send_template(target, user_id, "menu_buy", settings.sales_closed_message(), reply_markup=menus.main_reply_kb(user_id), context="buy_closed")
+
     db.touch_active(user_id_str, username, getattr(target.from_user, "full_name", None) if hasattr(target, "from_user") else None)
 
     if user is None:
@@ -195,6 +198,10 @@ async def render_buy(target, user_id: int, username: str = "", plan_id=None):
         f"موجودی کیف پول شما: {balance:,} تومان\n"
         f"موجودی سرویس: {stock}\n\n"
     )
+
+    pre_purchase_text = (plan["pre_purchase_text"] if "pre_purchase_text" in plan.keys() else "") or ""
+    if pre_purchase_text.strip():
+        text += pre_purchase_text.strip() + "\n\n"
 
     if stock <= 0:
         text += (
@@ -244,6 +251,32 @@ async def check_low_stock_alert(plan_id=None):
             except Exception:
                 pass
         db.set_plan_low_stock_alerted(plan["id"], True)
+
+
+def _is_admin_user(user_id) -> bool:
+    try:
+        return int(user_id) in ADMIN_IDS
+    except Exception:
+        return False
+
+
+async def _send_bot_disabled(target, user_id):
+    return await target.answer(settings.bot_disabled_message(), reply_markup=menus.main_reply_kb(user_id))
+
+
+async def _send_sales_closed(target, user_id):
+    return await target.answer(settings.sales_closed_message(), reply_markup=menus.main_reply_kb(user_id))
+
+
+@dp.message_handler(lambda m: not _is_admin_user(m.from_user.id) and not settings.bot_enabled(), content_types=types.ContentTypes.ANY, state="*")
+async def bot_disabled_message_handler(m: types.Message):
+    await _send_bot_disabled(m, m.from_user.id)
+
+
+@dp.callback_query_handler(lambda c: not _is_admin_user(c.from_user.id) and not settings.bot_enabled(), state="*")
+async def bot_disabled_callback_handler(c: types.CallbackQuery):
+    await c.answer()
+    await _send_bot_disabled(c.message, c.from_user.id)
 
 
 @dp.message_handler(commands=["start"])
@@ -378,6 +411,10 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
     if user and user["banned"]:
         return await c.answer("⛔ حساب شما مسدود است.", show_alert=True)
 
+    if not _is_admin_user(c.from_user.id) and not settings.sales_enabled():
+        await c.answer()
+        return await _send_sales_closed(c.message, c.from_user.id)
+
     await c.answer()
 
     try:
@@ -457,13 +494,19 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
 
     await check_low_stock_alert(plan_id)
 
-    sent = await c.message.answer(
+    post_purchase_text = (plan["post_purchase_text"] if "post_purchase_text" in plan.keys() else "") or ""
+    success_text = (
         f"✅ خرید موفق!\n"
         f"شماره خرید: #{result['purchase_id']}\n"
         f"پلن: {plan['title']}\n"
         f"تعداد تحویل‌شده: {len(result['items'])} عدد\n"
         f"مبلغ کسرشده: {result['amount']:,} تومان\n"
-        f"موجودی جدید: {result['balance_after']:,} تومان",
+        f"موجودی جدید: {result['balance_after']:,} تومان"
+    )
+    if post_purchase_text.strip():
+        success_text += "\n\n" + post_purchase_text.strip()
+    sent = await c.message.answer(
+        success_text,
         reply_markup=menus.main_reply_kb(c.from_user.id),
     )
     await _track_sent(c.from_user.id, sent, "purchase_result")
@@ -508,6 +551,8 @@ async def confirm_buy(c: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "buy_bulk")
 async def buy_bulk(c: types.CallbackQuery):
     await c.answer()
+    if not _is_admin_user(c.from_user.id) and not settings.sales_enabled():
+        return await _send_sales_closed(c.message, c.from_user.id)
     user_id = str(c.from_user.id)
     db.touch_active(user_id, c.from_user.username)
     ticket_id = db.create_ticket(user_id)

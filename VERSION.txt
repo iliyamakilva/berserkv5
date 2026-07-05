@@ -38,3 +38,10 @@ Date: 2026-07-05
 
 v5.6.2:
 - Fixed Telegram BUTTON_USER_PRIVACY_RESTRICTED by replacing direct tg://user URL button with safe profile-info callback.
+
+
+v5.6.3
+- ساده‌سازی ساخت پلن جدید با ویزارد مرحله‌ای.
+- انتقال تنظیمات اختصاصی پلن‌ها به بخش سرویس‌ها و پلن‌ها.
+- اضافه شدن متن اختصاصی قبل/بعد خرید برای هر پلن.
+- اضافه شدن کنترل خاموش/روشن بودن ربات و باز/بسته بودن فروش با پیام سفارشی.
