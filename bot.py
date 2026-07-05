@@ -51,12 +51,28 @@ def wallet_menu_kb(include_bulk=False):
     return kb
 
 
-def buy_quantity_kb(max_qty: int):
-    kb = types.InlineKeyboardMarkup(row_width=2)
+def plans_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for plan in db.list_plans(active_only=True):
+        stock = subs.stock_count(plan["id"])
+        label = f"{plan['title']} | {int(plan['price']):,} تومان"
+        if int(plan["show_stock"] or 0):
+            label += f" | موجودی {stock}"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"buy_plan_{plan['id']}"))
+    kb.add(types.InlineKeyboardButton("📦 خرید عمده", callback_data="buy_bulk"))
+    kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
+    return kb
 
+
+def buy_quantity_kb(max_qty: int, plan_id=None):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    plan_suffix = f"_{int(plan_id)}" if plan_id is not None else ""
+
+    # گزینه‌های ۱ تا ۴ حتی اگر موجودی کیف پول کافی نباشد نمایش داده می‌شوند؛
+    # بررسی پرداخت در مرحله بعد انجام می‌شود.
     for qty in range(1, 5):
         if qty <= max_qty:
-            kb.insert(types.InlineKeyboardButton(f"{qty} عدد", callback_data=f"buy_qty_{qty}"))
+            kb.insert(types.InlineKeyboardButton(f"{qty} عدد", callback_data=f"buy_qty_{qty}{plan_suffix}"))
 
     kb.add(types.InlineKeyboardButton("📦 خرید عمده", callback_data="buy_bulk"))
     kb.add(types.InlineKeyboardButton("💳 شارژ کیف پول", callback_data="topup_start"))
@@ -83,29 +99,97 @@ async def _safe_delete_callback_message(c: types.CallbackQuery):
         return False
 
 
-async def render_buy(target, user_id: int, username: str = ""):
+async def _track_sent(user_id, sent, context=""):
+    if sent is None:
+        return
+    if not isinstance(sent, (list, tuple)):
+        sent = [sent]
+    for msg in sent:
+        try:
+            db.track_bot_message(msg.chat.id, user_id, msg.message_id, context)
+        except Exception:
+            pass
+
+
+async def _cleanup_user_messages(chat_id, user_id):
+    rows = db.list_tracked_bot_messages(chat_id, user_id, limit=40)
+    for row in rows:
+        try:
+            await bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
+        except Exception:
+            try:
+                await bot.edit_message_reply_markup(int(row["chat_id"]), int(row["message_id"]), reply_markup=None)
+            except Exception:
+                pass
+        finally:
+            db.clear_tracked_bot_message(row["chat_id"], row["message_id"])
+
+
+async def _start_clean_section(target, user_id, context=""):
+    try:
+        chat_id = target.chat.id
+    except Exception:
+        try:
+            chat_id = target.message.chat.id
+        except Exception:
+            return
+    await _cleanup_user_messages(chat_id, user_id)
+
+
+async def _send_template(target, user_id, key, body_text, reply_markup=None, context=""):
+    sent = await messages.send(target, key, body_text, reply_markup=reply_markup)
+    await _track_sent(user_id, sent, context or key)
+    return sent
+
+
+async def _send_answer(target, user_id, text, reply_markup=None, context=""):
+    sent = await target.answer(text, reply_markup=reply_markup)
+    await _track_sent(user_id, sent, context)
+    return sent
+
+
+async def render_buy(target, user_id: int, username: str = "", plan_id=None):
+    await _start_clean_section(target, user_id, "buy")
     user_id_str = str(user_id)
     user = db.get_user(user_id_str)
 
     if user and user["banned"]:
-        return await target.answer("⛔ حساب شما مسدود است.")
+        return await _send_answer(target, user_id, "⛔ حساب شما مسدود است.", context="buy")
 
     db.touch_active(user_id_str, username)
 
     if user is None:
         user, _ = db.get_or_create_user(user_id_str, username)
 
-    price = settings.plan_price()
-    title = settings.plan_title()
-    duration = settings.plan_duration_label()
+    active_plans = db.list_plans(active_only=True)
+    if plan_id is None and len(active_plans) > 1:
+        lines = ["🛒 خرید سرویس", "", "لطفاً پلن موردنظر را انتخاب کنید:", ""]
+        for idx, plan in enumerate(active_plans, start=1):
+            stock = subs.stock_count(plan["id"])
+            extra = f" | {plan['volume_label']}" if plan["volume_label"] else ""
+            duration = f" | {plan['duration_label']}" if plan["duration_label"] else ""
+            stock_text = f" | موجودی: {stock}" if int(plan["show_stock"] or 0) else ""
+            tag = f" | {plan['tag']}" if plan["tag"] else ""
+            lines.append(f"{idx}. {plan['title']}{extra}{duration}{tag}\nقیمت: {int(plan['price']):,} تومان{stock_text}\n")
+        return await _send_template(target, user_id, "menu_buy", "\n".join(lines), reply_markup=plans_kb(), context="buy")
+
+    plan = db.get_plan(plan_id) if plan_id is not None else (active_plans[0] if active_plans else db.get_plan())
+    if not plan:
+        return await _send_answer(target, user_id, "❌ پلنی برای فروش تنظیم نشده است.", reply_markup=menus.main_reply_kb(user_id), context="buy")
+
+    plan_id = int(plan["id"])
+    price = int(plan["price"])
+    title = plan["title"]
+    duration = plan["duration_label"] or settings.plan_duration_label()
     balance = int(user["balance"] or 0) if user else 0
-    stock = subs.stock_count()
-    affordable_qty = balance // price if price > 0 else 0
-    max_qty = min(4, stock, affordable_qty)
+    stock = subs.stock_count(plan_id)
+    max_per_order = max(1, min(4, int(plan["max_per_order"] or 4)))
+    max_qty = min(max_per_order, 4, stock) if stock > 0 else 0
 
     text = (
         f"🛒 خرید سرویس\n\n"
         f"پلن: {title}\n"
+        f"حجم: {plan['volume_label'] or '-'}\n"
         f"⏳ مدت: {duration}\n"
         f"قیمت هر عدد: {price:,} تومان\n"
         f"موجودی کیف پول شما: {balance:,} تومان\n"
@@ -114,28 +198,21 @@ async def render_buy(target, user_id: int, username: str = ""):
 
     if stock <= 0:
         text += (
-            "❌ در حال حاضر موجودی آماده نداریم.\n"
+            "❌ در حال حاضر موجودی آماده برای این پلن نداریم.\n"
             "اگر تعداد بالا می‌خواهید یا هماهنگی دستی لازم دارید، خرید عمده را بزنید."
         )
         kb = types.InlineKeyboardMarkup(row_width=1)
+        if len(active_plans) > 1:
+            kb.add(types.InlineKeyboardButton("⬅️ انتخاب پلن دیگر", callback_data="buy"))
         kb.add(types.InlineKeyboardButton("📦 خرید عمده", callback_data="buy_bulk"))
         kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
-        return await messages.send(target, "menu_buy", text, reply_markup=kb)
-
-    if balance < price:
-        need = price - balance
-        text += (
-            f"⚠️ موجودی کافی نیست. {need:,} تومان دیگر شارژ کنید.\n"
-            "برای هماهنگی دستی یا تعداد بالا می‌توانید خرید عمده بزنید."
-        )
-        return await messages.send(target, "menu_buy", text, reply_markup=wallet_menu_kb(include_bulk=True))
+        return await _send_template(target, user_id, "menu_buy", text, reply_markup=kb, context="buy")
 
     text += (
-        "تعداد مورد نظر را انتخاب کنید:\n"
-        "دکمه‌های ۱ تا ۴ فقط تا سقف موجودی لینک و موجودی کیف پول نمایش داده می‌شوند."
+        "تعداد مورد نظر را انتخاب کنید.\n"
+        "اگر موجودی کیف پول کافی نباشد، مستقیم به پرداخت همان تعداد هدایت می‌شوید."
     )
-    await messages.send(target, "menu_buy", text, reply_markup=buy_quantity_kb(max_qty))
-
+    return await _send_template(target, user_id, "menu_buy", text, reply_markup=buy_quantity_kb(max_qty, plan_id), context="buy")
 
 async def check_low_stock_alert():
     threshold = settings.low_stock_threshold()
@@ -177,32 +254,32 @@ async def start(m: types.Message):
     )
 
 
-@dp.message_handler(lambda m: m.text == menus.BTN_BUY)
+@dp.message_handler(lambda m: menus.matches_system_button(m.text, "buy"))
 async def text_buy(m: types.Message):
     await render_buy(m, m.from_user.id, m.from_user.username or "")
 
 
-@dp.message_handler(lambda m: m.text == menus.BTN_MY_SUBS)
+@dp.message_handler(lambda m: menus.matches_system_button(m.text, "my_subs"))
 async def text_my_subs(m: types.Message):
     await show_my_subs(m, m.from_user.id, m.from_user.username or "")
 
 
-@dp.message_handler(lambda m: m.text == menus.BTN_WALLET)
+@dp.message_handler(lambda m: menus.matches_system_button(m.text, "wallet"))
 async def text_wallet(m: types.Message):
     await show_wallet(m, m.from_user.id, m.from_user.username or "")
 
 
-@dp.message_handler(lambda m: m.text == menus.BTN_GUIDE)
+@dp.message_handler(lambda m: menus.matches_system_button(m.text, "guide"))
 async def text_guide(m: types.Message):
     await show_guide_menu(m, m.from_user.id, m.from_user.username or "")
 
 
-@dp.message_handler(lambda m: m.text == menus.BTN_REFERRAL)
+@dp.message_handler(lambda m: menus.matches_system_button(m.text, "referral"))
 async def text_referral(m: types.Message):
     await show_referral(m, m.from_user.id, m.from_user.username or "")
 
 
-@dp.message_handler(lambda m: m.text == menus.BTN_TICKET)
+@dp.message_handler(lambda m: menus.matches_system_button(m.text, "ticket"))
 async def text_ticket(m: types.Message):
     await messages.send(
         m,
@@ -214,7 +291,7 @@ async def text_ticket(m: types.Message):
     )
 
 
-@dp.message_handler(lambda m: m.text == menus.BTN_ADMIN)
+@dp.message_handler(lambda m: menus.matches_system_button(m.text, "admin"))
 async def text_admin(m: types.Message):
     if not admin.is_admin(m.from_user.id):
         return
@@ -268,8 +345,18 @@ async def buy(c: types.CallbackQuery):
     await render_buy(c.message, c.from_user.id, c.from_user.username or "")
 
 
+@dp.callback_query_handler(lambda c: c.data.startswith("buy_plan_"))
+async def buy_plan(c: types.CallbackQuery):
+    await c.answer()
+    try:
+        plan_id = int(c.data.split("buy_plan_", 1)[1])
+    except Exception:
+        plan_id = None
+    await render_buy(c.message, c.from_user.id, c.from_user.username or "", plan_id=plan_id)
+
+
 @dp.callback_query_handler(lambda c: c.data.startswith("buy_qty_"))
-async def buy_qty(c: types.CallbackQuery):
+async def buy_qty(c: types.CallbackQuery, state: FSMContext):
     user_id = str(c.from_user.id)
     user = db.get_user(user_id)
 
@@ -279,7 +366,9 @@ async def buy_qty(c: types.CallbackQuery):
     await c.answer()
 
     try:
-        qty = int(c.data.split("_")[-1])
+        parts = c.data.split("_")
+        qty = int(parts[2])
+        plan_id = int(parts[3]) if len(parts) > 3 else db.default_plan_id()
     except ValueError:
         return await c.message.answer("درخواست خرید نامعتبر است.", reply_markup=menus.main_reply_kb(c.from_user.id))
 
@@ -289,11 +378,44 @@ async def buy_qty(c: types.CallbackQuery):
     if user is None:
         user, _ = db.get_or_create_user(user_id, c.from_user.username)
 
+    plan = db.get_plan(plan_id)
+    if not plan or int(plan["is_active"] or 0) != 1:
+        return await c.message.answer("این پلن فعال نیست یا پیدا نشد.", reply_markup=menus.main_reply_kb(c.from_user.id))
+
     was_first_purchase = int(user["purchased"] or 0) == 0
-    price = settings.plan_price()
+    price = int(plan["price"])
+    total = qty * price
+    balance = int(user["balance"] or 0)
+    missing = max(0, total - balance)
+
+    if missing > 0:
+        topup_id = db.create_topup(
+            user_id,
+            missing,
+            target_quantity=qty,
+            target_plan_id=plan_id,
+            target_total=total,
+            target_unit_price=price,
+        )
+        await state.update_data(topup_id=topup_id)
+        await wallet.TopupStates.waiting_receipt.set()
+        text = (
+            f"💳 پرداخت خرید {qty} سرویس\n\n"
+            f"پلن: {plan['title']}\n"
+            f"قیمت کل: {total:,} تومان\n"
+            f"موجودی فعلی کیف پول: {balance:,} تومان\n"
+            f"مبلغ قابل پرداخت برای تکمیل خرید: {missing:,} تومان\n\n"
+            f"شماره کارت:\n`{settings.card_number()}`\n"
+            f"به نام: {settings.card_holder()}\n\n"
+            "بعد از واریز، عکس رسید پرداخت را همینجا ارسال کنید.\n"
+            "بعد از تأیید ادمین، ربات تلاش می‌کند همین خرید را خودکار تکمیل کند."
+        )
+        sent = await c.message.answer(text, parse_mode="Markdown", reply_markup=wallet.cancel_kb())
+        await _track_sent(c.from_user.id, sent, "targeted_topup")
+        return
 
     try:
-        result = db.complete_purchase(user_id, qty, price)
+        result = db.complete_purchase(user_id, qty, price, plan_id=plan_id)
     except db.PurchaseError as exc:
         if exc.code == "insufficient_balance":
             return await c.message.answer(exc.message, reply_markup=wallet_menu_kb(include_bulk=True))
@@ -320,20 +442,22 @@ async def buy_qty(c: types.CallbackQuery):
 
     await check_low_stock_alert()
 
-    await c.message.answer(
+    sent = await c.message.answer(
         f"✅ خرید موفق!\n"
         f"شماره خرید: #{result['purchase_id']}\n"
+        f"پلن: {plan['title']}\n"
         f"تعداد تحویل‌شده: {len(result['items'])} عدد\n"
         f"مبلغ کسرشده: {result['amount']:,} تومان\n"
         f"موجودی جدید: {result['balance_after']:,} تومان",
         reply_markup=menus.main_reply_kb(c.from_user.id),
     )
+    await _track_sent(c.from_user.id, sent, "purchase_result")
 
     for index, item in enumerate(result["items"], start=1):
         qr_path = make_qr(item["link"], user_id)
         try:
             with open(qr_path, "rb") as f:
-                await c.message.answer_photo(
+                sent_photo = await c.message.answer_photo(
                     f,
                     caption=(
                         f"✅ سرویس #{index}\n"
@@ -341,6 +465,7 @@ async def buy_qty(c: types.CallbackQuery):
                         f"لینک سرویس:\n{item['link']}"
                     ),
                 )
+                await _track_sent(c.from_user.id, sent_photo, "purchase_link")
         finally:
             cleanup_qr(qr_path)
 
@@ -352,24 +477,17 @@ async def buy_qty(c: types.CallbackQuery):
                 f"کاربر: {c.from_user.full_name} (@{c.from_user.username or '-'})\n"
                 f"ID: {user_id}\n"
                 f"شماره خرید: #{result['purchase_id']}\n"
+                f"پلن: {plan['title']}\n"
                 f"تعداد: {len(result['items'])}\n"
                 f"مبلغ: {result['amount']:,} تومان",
             )
         except Exception:
             pass
 
-
 @dp.callback_query_handler(lambda c: c.data == "confirm_buy")
 async def confirm_buy(c: types.CallbackQuery):
-    class _Shim:
-        data = "buy_qty_1"
-        from_user = c.from_user
-        message = c.message
-
-        async def answer(self, *args, **kwargs):
-            return await c.answer(*args, **kwargs)
-
-    await buy_qty(_Shim())
+    await c.answer()
+    await render_buy(c.message, c.from_user.id, c.from_user.username or "", plan_id=db.default_plan_id())
 
 
 @dp.callback_query_handler(lambda c: c.data == "buy_bulk")
@@ -402,29 +520,34 @@ async def buy_bulk(c: types.CallbackQuery):
 
 
 async def show_my_subs(target, user_id: int, username: str = ""):
+    await _start_clean_section(target, user_id, "my_subs")
     user_id_str = str(user_id)
     db.touch_active(user_id_str, username)
     rows = subs.user_subs(user_id_str)
 
     if not rows:
-        return await messages.send(
+        return await _send_template(
             target,
+            user_id,
             "my_services_empty",
             "هنوز هیچ سرویسی خریداری نکردید.",
             reply_markup=menus.main_reply_kb(user_id),
+            context="my_subs",
         )
 
     lines = ["📦 سرویس‌های شما:\n"]
 
-    for r in rows:
+    for index, r in enumerate(rows, start=1):
+        plan = db.get_plan(r["plan_id"]) if "plan_id" in r.keys() and r["plan_id"] else None
+        plan_title = plan["title"] if plan else "سرویس"
         lines.append(
+            f"{index}️⃣ {plan_title}\n"
             f"شناسه سرویس: {r['account_name'] or '-'}\n"
             f"تاریخ خرید: {r['assigned_at'] or '-'}\n"
             f"لینک:\n{r['link']}\n"
         )
 
-    await target.answer("\n".join(lines), reply_markup=menus.main_reply_kb(user_id))
-
+    await _send_answer(target, user_id, "\n".join(lines), reply_markup=menus.main_reply_kb(user_id), context="my_subs")
 
 @dp.callback_query_handler(lambda c: c.data == "my_subs")
 async def my_subs(c: types.CallbackQuery):
@@ -434,7 +557,7 @@ async def my_subs(c: types.CallbackQuery):
 
 
 
-def guide_menu_kb():
+def guide_menu_kb(user_id=None):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("📱 آموزش اندروید", callback_data="guide_android"))
     kb.add(types.InlineKeyboardButton("🍎 آموزش آیفون", callback_data="guide_ios"))
@@ -442,9 +565,22 @@ def guide_menu_kb():
     kb.add(types.InlineKeyboardButton("🖥 آموزش مک", callback_data="guide_mac"))
     kb.add(types.InlineKeyboardButton("❓ مشکل اتصال دارم", callback_data="guide_troubleshoot"))
     kb.add(types.InlineKeyboardButton("🔄 بروزرسانی ساب‌لینک", callback_data="guide_update"))
+
+    callback_map = {
+        "buy": "buy",
+        "my_subs": "my_subs",
+        "wallet": "wallet",
+        "referral": "referral",
+        "ticket": "ticket_start",
+        "guide": "guide_home",
+    }
+    for key, title in menus.system_buttons_for_location("guide", user_id):
+        cb = callback_map.get(key)
+        if cb and key != "admin":
+            kb.add(types.InlineKeyboardButton(title, callback_data=cb))
+
     kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
-
 
 _GUIDE_DEFAULTS = {
     "guide_home": "📚 آموزش اتصال\n\nدستگاه خود را انتخاب کنید:",
@@ -459,20 +595,25 @@ _GUIDE_DEFAULTS = {
 
 async def show_guide_menu(target, user_id: int, username: str = ""):
     db.touch_active(str(user_id), username)
-    await messages.send(
+    await _start_clean_section(target, user_id, "guide")
+    await _send_template(
         target,
+        user_id,
         "guide_home",
         _GUIDE_DEFAULTS["guide_home"],
-        reply_markup=guide_menu_kb(),
+        reply_markup=guide_menu_kb(user_id),
+        context="guide",
     )
 
 
 async def show_guide_page(target, key: str, user_id: int):
-    await messages.send(
+    await _send_template(
         target,
+        user_id,
         key,
         _GUIDE_DEFAULTS.get(key, "📚 آموزش اتصال"),
-        reply_markup=guide_menu_kb(),
+        reply_markup=guide_menu_kb(user_id),
+        context="guide_page",
     )
 
 
@@ -542,7 +683,10 @@ async def render_custom_button(target, row, user_id: int, username: str = ""):
         )
 
     if button_type == "buy_plan":
-        return await render_buy(target, user_id, username)
+        plan_id = None
+        if str(payload).strip().isdigit():
+            plan_id = int(str(payload).strip())
+        return await render_buy(target, user_id, username, plan_id=plan_id)
 
     if button_type == "file":
         if payload:

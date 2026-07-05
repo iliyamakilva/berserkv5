@@ -108,23 +108,25 @@ def compose_preview(key, default_text):
 
 async def send(target, key, body_text, reply_markup=None):
     final_text, photo_file_id = compose(key, body_text)
+    sent_messages = []
 
     if photo_file_id:
         if final_text and len(final_text) <= 1024:
-            await target.answer_photo(
+            sent_messages.append(await target.answer_photo(
                 photo_file_id,
                 caption=final_text,
                 reply_markup=reply_markup,
-            )
+            ))
         else:
-            await target.answer_photo(photo_file_id)
+            sent_messages.append(await target.answer_photo(photo_file_id))
             if final_text:
-                await target.answer(final_text, reply_markup=reply_markup)
+                sent_messages.append(await target.answer(final_text, reply_markup=reply_markup))
             elif reply_markup:
-                await target.answer("از منوی پایین استفاده کنید.", reply_markup=reply_markup)
-        return
+                sent_messages.append(await target.answer("از منوی پایین استفاده کنید.", reply_markup=reply_markup))
+        return sent_messages
 
-    await target.answer(final_text, reply_markup=reply_markup)
+    sent_messages.append(await target.answer(final_text, reply_markup=reply_markup))
+    return sent_messages
 
 
 def set_text(key, text):

@@ -14,15 +14,17 @@ def _generate_account_name():
     return db.generate_service_code()
 
 
-def get_sub():
+def get_sub(plan_id=None):
+    plan_id = int(plan_id) if plan_id is not None else db.default_plan_id()
     cur.execute(
         """
-        SELECT id, link, account_name, status, price_paid, assigned_at, owner, purchase_id
+        SELECT id, link, account_name, status, price_paid, assigned_at, owner, purchase_id, plan_id
         FROM subs
-        WHERE used=0
+        WHERE used=0 AND plan_id=?
         ORDER BY id
         LIMIT 1
-        """
+        """,
+        (plan_id,),
     )
     return cur.fetchone()
 
@@ -30,7 +32,7 @@ def get_sub():
 def get_sub_detail(sub_id):
     cur.execute(
         """
-        SELECT id, link, account_name, status, price_paid, assigned_at, owner, purchase_id, used
+        SELECT id, link, account_name, status, price_paid, assigned_at, owner, purchase_id, used, plan_id
         FROM subs
         WHERE id=?
         """,
@@ -62,11 +64,12 @@ def assign_sub(sub_id, user_id, price_paid=None):
     return False
 
 
-def add_sub(link):
+def add_sub(link, plan_id=None):
     link = (link or "").strip()
     if not link:
         return None
 
+    plan_id = int(plan_id) if plan_id is not None else db.default_plan_id()
     cur.execute("SELECT id FROM subs WHERE link=?", (link,))
     if cur.fetchone():
         return None
@@ -74,37 +77,43 @@ def add_sub(link):
     account_name = _generate_account_name()
     cur.execute(
         """
-        INSERT INTO subs(link, account_name, status)
-        VALUES (?, ?, 'available')
+        INSERT INTO subs(link, account_name, status, plan_id)
+        VALUES (?, ?, 'available', ?)
         """,
-        (link, account_name),
+        (link, account_name, plan_id),
     )
     conn.commit()
     db.set_low_stock_alerted(False)
     return cur.lastrowid
 
 
-def add_subs_bulk(links):
+def add_subs_bulk(links, plan_id=None):
     added = 0
     for raw_link in links:
-        if add_sub(raw_link):
+        if add_sub(raw_link, plan_id=plan_id):
             added += 1
     return added
 
 
-def stock_count():
-    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0")
+def stock_count(plan_id=None):
+    if plan_id is None:
+        cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0")
+        return cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND plan_id=?", (int(plan_id),))
     return cur.fetchone()["c"]
 
 
-def sold_count():
-    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1")
+def sold_count(plan_id=None):
+    if plan_id is None:
+        cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1")
+        return cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1 AND plan_id=?", (int(plan_id),))
     return cur.fetchone()["c"]
 
 
 def user_subs(user_id, limit=None):
     sql = """
-        SELECT id, link, account_name, assigned_at, price_paid, status, purchase_id, used
+        SELECT id, link, account_name, assigned_at, price_paid, status, purchase_id, used, plan_id
         FROM subs
         WHERE owner=?
         ORDER BY assigned_at DESC, id DESC
@@ -161,7 +170,7 @@ def list_links(kind="all", limit=15, offset=0):
         where = "WHERE status='disabled'"
 
     sql = f"""
-        SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+        SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id, plan_id
         FROM subs
         {where}
         ORDER BY id DESC
@@ -184,7 +193,7 @@ def search_links(query, limit=15):
     if q.isdigit():
         cur.execute(
             """
-            SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+            SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id, plan_id
             FROM subs
             WHERE id=? OR owner=? OR link LIKE ? OR account_name LIKE ?
             ORDER BY id DESC
@@ -195,7 +204,7 @@ def search_links(query, limit=15):
     else:
         cur.execute(
             """
-            SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+            SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id, plan_id
             FROM subs
             WHERE link LIKE ? OR account_name LIKE ? OR owner LIKE ?
             ORDER BY id DESC
@@ -246,7 +255,7 @@ def return_delivered_link_to_pool(link_id, admin_id=None, reason=""):
             conn.execute("BEGIN IMMEDIATE")
             cur.execute(
                 """
-                SELECT id, link, used, owner, assigned_at, price_paid, account_name, status, purchase_id
+                SELECT id, link, used, owner, assigned_at, price_paid, account_name, status, purchase_id, plan_id
                 FROM subs
                 WHERE id=?
                 """,
@@ -332,7 +341,7 @@ def return_delivered_link_to_pool(link_id, admin_id=None, reason=""):
 def get_link_detail(link_id):
     cur.execute(
         """
-        SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id
+        SELECT id, link, used, owner, added_at, assigned_at, price_paid, account_name, status, purchase_id, plan_id
         FROM subs
         WHERE id=?
         """,

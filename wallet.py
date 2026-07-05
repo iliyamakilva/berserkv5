@@ -14,7 +14,9 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 import db
 import menus
 import settings
+from affiliate import reward_ref
 from config import ADMIN_IDS
+from utils import cleanup_qr, make_qr
 
 
 class TopupStates(StatesGroup):
@@ -175,30 +177,78 @@ async def cb_confirm(c: types.CallbackQuery):
 
     await c.answer()
     topup_id = int(c.data.split("_")[-1])
-    topup = db.get_topup(topup_id)
+    ok, reason, topup, new_balance = db.approve_topup_atomic(topup_id, admin_id=c.from_user.id)
 
-    if not topup:
-        return await _edit_safely(c, "این درخواست پیدا نشد.")
-
-    if topup["status"] != "pending_review":
+    if not ok:
+        if reason == "not_found":
+            return await _edit_safely(c, "این درخواست پیدا نشد.")
         return await _edit_safely(c, "این درخواست قبلاً بررسی شده.")
 
-    db.add_balance(topup["user_id"], topup["amount"])
-    db.set_topup_status(topup_id, "approved")
     user = db.get_user(topup["user_id"])
+    auto_purchase_msg = ""
+
+    target_qty = topup["target_quantity"] if "target_quantity" in topup.keys() else None
+    target_plan_id = topup["target_plan_id"] if "target_plan_id" in topup.keys() else None
+    target_unit_price = topup["target_unit_price"] if "target_unit_price" in topup.keys() else None
+
+    if target_qty and target_plan_id and not topup["purchase_completed_at"]:
+        was_first_purchase = int(user["purchased"] or 0) == 0 if user else False
+        try:
+            result = db.complete_purchase(
+                topup["user_id"],
+                int(target_qty),
+                int(target_unit_price) if target_unit_price else None,
+                note=f"auto_after_topup_id={topup_id}",
+                plan_id=int(target_plan_id),
+            )
+            db.mark_topup_purchase_completed(topup_id)
+            plan = db.get_plan(target_plan_id)
+            auto_purchase_msg = (
+                f"\n\n🛒 خرید شما خودکار تکمیل شد.\n"
+                f"شماره خرید: #{result['purchase_id']}\n"
+                f"پلن: {plan['title'] if plan else '-'}\n"
+                f"تعداد سرویس: {len(result['items'])}\n"
+                f"مبلغ کسرشده: {result['amount']:,} تومان\n"
+                f"موجودی جدید: {result['balance_after']:,} تومان"
+            )
+
+            if was_first_purchase:
+                reward_ref(topup["user_id"])
+
+            for index, item in enumerate(result["items"], start=1):
+                qr_path = make_qr(item["link"], topup["user_id"])
+                try:
+                    with open(qr_path, "rb") as f:
+                        await bot.send_photo(
+                            int(topup["user_id"]),
+                            f,
+                            caption=(
+                                f"✅ سرویس #{index}\n"
+                                f"شناسه سرویس: {item['account_name']}\n\n"
+                                f"لینک سرویس:\n{item['link']}"
+                            ),
+                        )
+                finally:
+                    cleanup_qr(qr_path)
+        except db.PurchaseError as exc:
+            auto_purchase_msg = (
+                "\n\n⚠️ پرداخت تأیید شد و کیف پول شارژ شد، اما خرید خودکار تکمیل نشد.\n"
+                f"دلیل: {exc.message}\n"
+                "لطفاً از بخش خرید سرویس دوباره تلاش کنید یا با پشتیبانی تماس بگیرید."
+            )
 
     try:
         await bot.send_message(
             int(topup["user_id"]),
             f"✅ کیف پول شما به مبلغ {topup['amount']:,} تومان شارژ شد.\n"
-            f"💰 موجودی فعلی: {user['balance']:,} تومان",
+            f"💰 موجودی فعلی: {new_balance:,} تومان"
+            f"{auto_purchase_msg}",
             reply_markup=menus.main_reply_kb(topup["user_id"]),
         )
     except Exception:
         pass
 
-    await _edit_safely(c, f"✅ درخواست #{topup_id} تایید و کیف پول شارژ شد.")
-
+    await _edit_safely(c, f"✅ درخواست #{topup_id} تایید شد.{auto_purchase_msg}")
 
 async def cb_reject(c: types.CallbackQuery):
     bot = Bot.get_current()

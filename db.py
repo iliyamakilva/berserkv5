@@ -251,10 +251,67 @@ def init():
             """
         )
 
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plans(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                volume_label TEXT DEFAULT '',
+                duration_label TEXT DEFAULT '',
+                price INTEGER NOT NULL DEFAULT 0,
+                description TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 100,
+                is_active INTEGER DEFAULT 1,
+                is_default INTEGER DEFAULT 0,
+                max_per_order INTEGER DEFAULT 4,
+                cost_price INTEGER DEFAULT 0,
+                tag TEXT DEFAULT '',
+                show_stock INTEGER DEFAULT 1,
+                low_stock_threshold INTEGER DEFAULT 5,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_buttons(
+                key TEXT PRIMARY KEY,
+                default_title TEXT NOT NULL,
+                title TEXT,
+                location TEXT DEFAULT 'main',
+                sort_order INTEGER DEFAULT 100,
+                is_active INTEGER DEFAULT 1,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_messages(
+                chat_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                context TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY(chat_id, message_id)
+            )
+            """
+        )
+
         _add_column_if_missing("subs", "price_paid", "INTEGER")
         _add_column_if_missing("subs", "account_name", "TEXT")
         _add_column_if_missing("subs", "status", "TEXT")
         _add_column_if_missing("subs", "purchase_id", "INTEGER")
+        _add_column_if_missing("subs", "plan_id", "INTEGER")
+        _add_column_if_missing("purchases", "plan_id", "INTEGER")
+        _add_column_if_missing("purchase_items", "plan_id", "INTEGER")
+        _add_column_if_missing("topups", "target_quantity", "INTEGER")
+        _add_column_if_missing("topups", "target_plan_id", "INTEGER")
+        _add_column_if_missing("topups", "target_total", "INTEGER")
+        _add_column_if_missing("topups", "target_unit_price", "INTEGER")
+        _add_column_if_missing("topups", "purchase_completed_at", "TEXT")
         _add_column_if_missing("purchase_items", "link", "TEXT")
         _add_column_if_missing("purchase_items", "status", "TEXT DEFAULT 'active'")
         _add_column_if_missing("purchase_items", "reverted_at", "TEXT")
@@ -277,6 +334,12 @@ def init():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_file ON receipts(file_unique_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_custom_buttons_location ON custom_buttons(location, sort_order)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_backup_logs_created ON backup_logs(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_plan_used ON subs(plan_id, used)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_messages_user ON bot_messages(user_id, created_at)")
+
+        _ensure_default_plan()
+        _ensure_system_buttons()
+        cur.execute("UPDATE subs SET plan_id=? WHERE plan_id IS NULL", (default_plan_id(),))
 
         cur.execute("UPDATE subs SET status='available' WHERE status IS NULL AND used=0")
         cur.execute("UPDATE subs SET status='delivered' WHERE status IS NULL AND used=1")
@@ -582,8 +645,21 @@ def set_setting(key, value):
     conn.commit()
 
 
-def create_topup(user_id, amount):
-    cur.execute("INSERT INTO topups(user_id, amount) VALUES (?, ?)", (str(user_id), int(amount)))
+def create_topup(user_id, amount, target_quantity=None, target_plan_id=None, target_total=None, target_unit_price=None):
+    cur.execute(
+        """
+        INSERT INTO topups(user_id, amount, target_quantity, target_plan_id, target_total, target_unit_price)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(user_id),
+            int(amount),
+            int(target_quantity) if target_quantity is not None else None,
+            int(target_plan_id) if target_plan_id is not None else None,
+            int(target_total) if target_total is not None else None,
+            int(target_unit_price) if target_unit_price is not None else None,
+        ),
+    )
     conn.commit()
     return cur.lastrowid
 
@@ -775,10 +851,15 @@ def clear_message(key):
     conn.commit()
 
 
-def complete_purchase(user_id, quantity, unit_price, note=""):
+def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None):
     user_id = str(user_id)
     quantity = int(quantity)
-    unit_price = int(unit_price)
+    plan_id = int(plan_id) if plan_id is not None else default_plan_id()
+    plan = get_plan(plan_id) or get_plan(default_plan_id())
+    if unit_price is None:
+        unit_price = int(plan["price"] if plan else 0)
+    else:
+        unit_price = int(unit_price)
     total = quantity * unit_price
 
     if quantity < 1 or quantity > 4:
@@ -798,17 +879,17 @@ def complete_purchase(user_id, quantity, unit_price, note=""):
             if balance_before < total:
                 raise PurchaseError("insufficient_balance", "موجودی کیف پول کافی نیست.")
 
-            cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0")
+            cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND plan_id=?", (plan_id,))
             stock = int(cur.fetchone()["c"])
             if stock < quantity:
                 raise PurchaseError("insufficient_stock", "موجودی سرویس کافی نیست.")
 
             cur.execute(
                 """
-                INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note)
-                VALUES (?, ?, ?, ?, 'completed', ?)
+                INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note, plan_id)
+                VALUES (?, ?, ?, ?, 'completed', ?, ?)
                 """,
-                (user_id, quantity, total, unit_price, note or ""),
+                (user_id, quantity, total, unit_price, note or "", plan_id),
             )
             purchase_id = cur.lastrowid
 
@@ -822,7 +903,7 @@ def complete_purchase(user_id, quantity, unit_price, note=""):
                 (user_id, -total, balance_before, balance_after, f"purchase_id={purchase_id}"),
             )
 
-            cur.execute("SELECT * FROM subs WHERE used=0 ORDER BY id LIMIT ?", (quantity,))
+            cur.execute("SELECT * FROM subs WHERE used=0 AND plan_id=? ORDER BY id LIMIT ?", (plan_id, quantity))
             available = cur.fetchall()
             items = []
 
@@ -847,7 +928,7 @@ def complete_purchase(user_id, quantity, unit_price, note=""):
 
                 cur.execute(
                     """
-                    SELECT id, link, account_name, assigned_at, price_paid, status, purchase_id
+                    SELECT id, link, account_name, assigned_at, price_paid, status, purchase_id, plan_id
                     FROM subs
                     WHERE id=?
                     """,
@@ -856,8 +937,8 @@ def complete_purchase(user_id, quantity, unit_price, note=""):
                 assigned = cur.fetchone()
                 cur.execute(
                     """
-                    INSERT INTO purchase_items(purchase_id, sub_id, user_id, account_name, link, price_paid, assigned_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO purchase_items(purchase_id, sub_id, user_id, account_name, link, price_paid, assigned_at, status, plan_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
                     """,
                     (
                         purchase_id,
@@ -867,6 +948,7 @@ def complete_purchase(user_id, quantity, unit_price, note=""):
                         assigned["link"],
                         unit_price,
                         assigned["assigned_at"],
+                        plan_id,
                     ),
                 )
                 items.append(dict(assigned))
@@ -1272,6 +1354,290 @@ def custom_button_effective_data(row, prefer_draft=True):
         "starts_at": row["starts_at"],
         "ends_at": row["ends_at"],
     }
+
+
+
+# --- Plans ---
+
+DEFAULT_SYSTEM_BUTTONS = [
+    ("buy", "🛒 خرید سرویس", "main", 10),
+    ("my_subs", "📦 سرویس‌های من", "main", 20),
+    ("wallet", "💳 کیف پول", "main", 30),
+    ("guide", "📚 آموزش اتصال", "main", 40),
+    ("referral", "👥 دعوت دوستان", "main", 50),
+    ("ticket", "🎫 پشتیبانی", "main", 60),
+    ("admin", "⚙️ مدیریت", "main", 900),
+]
+
+
+def _ensure_default_plan():
+    cur.execute("SELECT COUNT(*) AS c FROM plans")
+    if int(cur.fetchone()["c"] or 0) == 0:
+        title = get_setting("plan_title", "یک ماهه | ۱۰۰ گیگ | ۳ کاربره")
+        duration = get_setting("plan_duration_label", "۳۰ روز")
+        price = get_setting_int("plan_price", 100000)
+        low_stock = get_setting_int("low_stock_threshold", 5)
+        cur.execute(
+            """
+            INSERT INTO plans(title, volume_label, duration_label, price, description, sort_order,
+                              is_active, is_default, max_per_order, low_stock_threshold)
+            VALUES (?, '', ?, ?, 'پلن پیش‌فرض سازگار با نسخه‌های قبلی', 10, 1, 1, 4, ?)
+            """,
+            (title, duration, int(price), int(low_stock)),
+        )
+    cur.execute("SELECT COUNT(*) AS c FROM plans WHERE is_default=1")
+    if int(cur.fetchone()["c"] or 0) == 0:
+        cur.execute("UPDATE plans SET is_default=1 WHERE id=(SELECT id FROM plans ORDER BY id LIMIT 1)")
+
+
+def default_plan_id():
+    cur.execute("SELECT id FROM plans WHERE is_default=1 ORDER BY id LIMIT 1")
+    row = cur.fetchone()
+    if row:
+        return int(row["id"])
+    cur.execute("SELECT id FROM plans ORDER BY id LIMIT 1")
+    row = cur.fetchone()
+    return int(row["id"]) if row else 1
+
+
+def get_plan(plan_id=None):
+    if plan_id is None:
+        plan_id = default_plan_id()
+    cur.execute("SELECT * FROM plans WHERE id=?", (int(plan_id),))
+    return cur.fetchone()
+
+
+def list_plans(active_only=False, limit=50):
+    sql = "SELECT * FROM plans"
+    params = []
+    if active_only:
+        sql += " WHERE is_active=1"
+    sql += " ORDER BY sort_order, id LIMIT ?"
+    params.append(int(limit))
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def count_active_plans():
+    cur.execute("SELECT COUNT(*) AS c FROM plans WHERE is_active=1")
+    return int(cur.fetchone()["c"] or 0)
+
+
+def create_plan(data):
+    title = (data.get("title") or "").strip()
+    if not title:
+        raise ValueError("عنوان پلن الزامی است")
+    price = int(str(data.get("price") or 0).replace(",", ""))
+    if price <= 0:
+        raise ValueError("قیمت پلن باید عدد مثبت باشد")
+    max_per_order = int(data.get("max_per_order") or 4)
+    if max_per_order < 1:
+        max_per_order = 1
+    if max_per_order > 4:
+        max_per_order = 4
+    cur.execute(
+        """
+        INSERT INTO plans(title, volume_label, duration_label, price, description, sort_order,
+                          is_active, max_per_order, cost_price, tag, show_stock, low_stock_threshold)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            title,
+            (data.get("volume_label") or "").strip(),
+            (data.get("duration_label") or "").strip(),
+            price,
+            (data.get("description") or "").strip(),
+            int(data.get("sort_order") or 100),
+            1 if int(data.get("is_active", 1) or 0) else 0,
+            max_per_order,
+            int(str(data.get("cost_price") or 0).replace(",", "")),
+            (data.get("tag") or "").strip(),
+            1 if int(data.get("show_stock", 1) or 0) else 0,
+            int(data.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_plan(plan_id, data):
+    row = get_plan(plan_id)
+    if not row:
+        return False
+    merged = {k: row[k] for k in row.keys()}
+    merged.update({k: v for k, v in (data or {}).items() if v is not None})
+    title = (merged.get("title") or "").strip()
+    price = int(str(merged.get("price") or 0).replace(",", ""))
+    if not title or price <= 0:
+        raise ValueError("عنوان و قیمت معتبر الزامی است")
+    max_per_order = max(1, min(4, int(merged.get("max_per_order") or 4)))
+    cur.execute(
+        """
+        UPDATE plans
+        SET title=?, volume_label=?, duration_label=?, price=?, description=?, sort_order=?,
+            is_active=?, max_per_order=?, cost_price=?, tag=?, show_stock=?, low_stock_threshold=?,
+            updated_at=datetime('now')
+        WHERE id=?
+        """,
+        (
+            title,
+            (merged.get("volume_label") or "").strip(),
+            (merged.get("duration_label") or "").strip(),
+            price,
+            (merged.get("description") or "").strip(),
+            int(merged.get("sort_order") or 100),
+            1 if int(merged.get("is_active") or 0) else 0,
+            max_per_order,
+            int(str(merged.get("cost_price") or 0).replace(",", "")),
+            (merged.get("tag") or "").strip(),
+            1 if int(merged.get("show_stock") or 0) else 0,
+            int(merged.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
+            int(plan_id),
+        ),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def toggle_plan(plan_id):
+    row = get_plan(plan_id)
+    if not row:
+        return False
+    if int(row["is_default"] or 0) == 1 and int(row["is_active"] or 0) == 1:
+        # پلن پیش‌فرض را می‌شود ویرایش کرد، اما غیرفعال کامل کردنش برای سازگاری نسخه‌های قدیمی خطرناک است.
+        return False
+    cur.execute("UPDATE plans SET is_active=CASE WHEN is_active=1 THEN 0 ELSE 1 END, updated_at=datetime('now') WHERE id=?", (int(plan_id),))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def plan_stock_count(plan_id):
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND plan_id=?", (int(plan_id),))
+    return int(cur.fetchone()["c"] or 0)
+
+
+def plan_sold_count(plan_id):
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1 AND plan_id=?", (int(plan_id),))
+    return int(cur.fetchone()["c"] or 0)
+
+
+# --- System buttons ---
+
+
+def _ensure_system_buttons():
+    for key, default_title, location, sort_order in DEFAULT_SYSTEM_BUTTONS:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO system_buttons(key, default_title, title, location, sort_order, is_active)
+            VALUES (?, ?, ?, ?, ?, 1)
+            """,
+            (key, default_title, default_title, location, int(sort_order)),
+        )
+
+
+def list_system_buttons(location=None, active_only=False):
+    sql = "SELECT * FROM system_buttons"
+    params = []
+    where = []
+    if location:
+        where.append("location=?")
+        params.append(location)
+    if active_only:
+        where.append("is_active=1")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY sort_order, key"
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def get_system_button(key):
+    cur.execute("SELECT * FROM system_buttons WHERE key=?", ((key or "").strip(),))
+    return cur.fetchone()
+
+
+def system_button_title(key):
+    row = get_system_button(key)
+    if row:
+        return row["title"] or row["default_title"]
+    for k, title, _, _ in DEFAULT_SYSTEM_BUTTONS:
+        if k == key:
+            return title
+    return key
+
+
+def update_system_button(key, title=None, location=None, sort_order=None, is_active=None):
+    row = get_system_button(key)
+    if not row:
+        return False
+    title = row["title"] if title is None else (title or row["default_title"]).strip()
+    location = row["location"] if location is None else (location or "main").strip().lower()
+    sort_order = row["sort_order"] if sort_order is None else int(sort_order)
+    is_active = row["is_active"] if is_active is None else (1 if int(is_active) else 0)
+    cur.execute(
+        "UPDATE system_buttons SET title=?, location=?, sort_order=?, is_active=?, updated_at=datetime('now') WHERE key=?",
+        (title, location, int(sort_order), int(is_active), key),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def reset_system_button(key):
+    row = get_system_button(key)
+    if not row:
+        return False
+    cur.execute(
+        "UPDATE system_buttons SET title=default_title, location='main', is_active=1, updated_at=datetime('now') WHERE key=?",
+        (key,),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def find_system_button_by_title(title):
+    cur.execute(
+        "SELECT * FROM system_buttons WHERE is_active=1 AND title=? LIMIT 1",
+        ((title or "").strip(),),
+    )
+    return cur.fetchone()
+
+
+# --- Bot message cleanup ---
+
+
+def track_bot_message(chat_id, user_id, message_id, context=""):
+    try:
+        cur.execute(
+            "INSERT OR REPLACE INTO bot_messages(chat_id, user_id, message_id, context) VALUES (?, ?, ?, ?)",
+            (str(chat_id), str(user_id), int(message_id), context or ""),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def list_tracked_bot_messages(chat_id, user_id, limit=30):
+    cur.execute(
+        "SELECT * FROM bot_messages WHERE chat_id=? AND user_id=? ORDER BY created_at DESC LIMIT ?",
+        (str(chat_id), str(user_id), int(limit)),
+    )
+    return cur.fetchall()
+
+
+def clear_tracked_bot_message(chat_id, message_id):
+    cur.execute("DELETE FROM bot_messages WHERE chat_id=? AND message_id=?", (str(chat_id), int(message_id)))
+    conn.commit()
+
+
+def clear_tracked_bot_messages(chat_id, user_id):
+    cur.execute("DELETE FROM bot_messages WHERE chat_id=? AND user_id=?", (str(chat_id), str(user_id)))
+    conn.commit()
+
+
+def mark_topup_purchase_completed(topup_id):
+    cur.execute("UPDATE topups SET purchase_completed_at=datetime('now') WHERE id=?", (int(topup_id),))
+    conn.commit()
+    return cur.rowcount == 1
 
 
 # --- Backup logs / schema metadata ---
