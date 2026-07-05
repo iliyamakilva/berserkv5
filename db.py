@@ -250,6 +250,18 @@ def init():
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_logs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id TEXT,
+                action_type TEXT NOT NULL,
+                target_user_id TEXT,
+                details TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
 
 
         cur.execute(
@@ -300,6 +312,9 @@ def init():
             """
         )
 
+        _add_column_if_missing("users", "display_name", "TEXT DEFAULT ''")
+        _add_column_if_missing("users", "admin_note", "TEXT DEFAULT ''")
+        _add_column_if_missing("users", "is_test", "INTEGER DEFAULT 0")
         _add_column_if_missing("subs", "price_paid", "INTEGER")
         _add_column_if_missing("subs", "account_name", "TEXT")
         _add_column_if_missing("subs", "status", "TEXT")
@@ -336,6 +351,8 @@ def init():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_backup_logs_created ON backup_logs(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_plan_used ON subs(plan_id, used)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_messages_user ON bot_messages(user_id, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON admin_logs(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_joined ON users(joined_at)")
 
         _ensure_default_plan()
         _ensure_system_buttons()
@@ -376,7 +393,7 @@ def get_user(user_id):
     return cur.fetchone()
 
 
-def get_or_create_user(user_id, username=None, ref=None):
+def get_or_create_user(user_id, username=None, ref=None, display_name=None):
     user_id = str(user_id)
     with LOCK:
         row = get_user(user_id)
@@ -387,26 +404,26 @@ def get_or_create_user(user_id, username=None, ref=None):
             if ref == user_id or not get_user(ref):
                 ref = None
         cur.execute(
-            "INSERT INTO users(id, username, ref) VALUES (?, ?, ?)",
-            (user_id, username or "", ref),
+            "INSERT INTO users(id, username, ref, display_name) VALUES (?, ?, ?, ?)",
+            (user_id, username or "", ref, display_name or ""),
         )
         _bump_daily_tx("new_users")
         conn.commit()
         return get_user(user_id), True
 
 
-def touch_active(user_id, username=None):
+def touch_active(user_id, username=None, display_name=None):
     with LOCK:
+        updates = ["last_active=datetime('now')"]
+        params = []
         if username is not None:
-            cur.execute(
-                "UPDATE users SET username=?, last_active=datetime('now') WHERE id=?",
-                (username or "", str(user_id)),
-            )
-        else:
-            cur.execute(
-                "UPDATE users SET last_active=datetime('now') WHERE id=?",
-                (str(user_id),),
-            )
+            updates.append("username=?")
+            params.append(username or "")
+        if display_name is not None:
+            updates.append("display_name=?")
+            params.append(display_name or "")
+        params.append(str(user_id))
+        cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=?", params)
         conn.commit()
 
 
@@ -459,7 +476,7 @@ def search_users(query, limit=10):
         """
         SELECT * FROM users
         WHERE id LIKE ? OR username LIKE ?
-        ORDER BY joined_at DESC
+        ORDER BY joined_at ASC
         LIMIT ?
         """,
         (q, q, int(limit)),
@@ -469,7 +486,7 @@ def search_users(query, limit=10):
 
 def list_users(offset=0, limit=10):
     cur.execute(
-        "SELECT * FROM users ORDER BY joined_at DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM users ORDER BY joined_at ASC LIMIT ? OFFSET ?",
         (int(limit), int(offset)),
     )
     return cur.fetchall()
@@ -576,7 +593,7 @@ def referred_users(user_id, limit=20):
         SELECT id, username, purchased, rewarded, joined_at
         FROM users
         WHERE ref=?
-        ORDER BY joined_at DESC
+        ORDER BY joined_at ASC
         LIMIT ?
         """,
         (str(user_id), int(limit)),
@@ -1638,6 +1655,90 @@ def mark_topup_purchase_completed(topup_id):
     cur.execute("UPDATE topups SET purchase_completed_at=datetime('now') WHERE id=?", (int(topup_id),))
     conn.commit()
     return cur.rowcount == 1
+
+
+# --- Admin user notes / testing / logs / reports ---
+
+def set_user_admin_note(user_id, note):
+    cur.execute(
+        "UPDATE users SET admin_note=? WHERE id=?",
+        ((note or "").strip()[:2000], str(user_id)),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def toggle_user_test(user_id):
+    cur.execute(
+        "UPDATE users SET is_test=CASE WHEN COALESCE(is_test,0)=1 THEN 0 ELSE 1 END WHERE id=?",
+        (str(user_id),),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def set_user_test(user_id, flag: bool):
+    cur.execute("UPDATE users SET is_test=? WHERE id=?", (1 if flag else 0, str(user_id)))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def log_admin_action(admin_id, action_type, target_user_id=None, details=""):
+    try:
+        cur.execute(
+            """
+            INSERT INTO admin_logs(admin_id, action_type, target_user_id, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(admin_id) if admin_id is not None else None, action_type, str(target_user_id) if target_user_id is not None else None, (details or "")[:2000]),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception:
+        return None
+
+
+def list_admin_logs(limit=20):
+    cur.execute("SELECT * FROM admin_logs ORDER BY id DESC LIMIT ?", (int(limit),))
+    return cur.fetchall()
+
+
+def today_sales_total():
+    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND date(created_at)=date('now')")
+    return int(cur.fetchone()["s"] or 0)
+
+
+def yesterday_sales_total():
+    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND date(created_at)=date('now','-1 day')")
+    return int(cur.fetchone()["s"] or 0)
+
+
+def period_sales_total(days=7):
+    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND created_at >= datetime('now', ?)", (f"-{int(days)} days",))
+    return int(cur.fetchone()["s"] or 0)
+
+
+def period_purchase_count(days=7):
+    cur.execute("SELECT COUNT(*) AS c FROM purchases WHERE status='completed' AND created_at >= datetime('now', ?)", (f"-{int(days)} days",))
+    return int(cur.fetchone()["c"] or 0)
+
+
+def approved_topups_total_for_days(days=1):
+    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM topups WHERE status='approved' AND reviewed_at >= datetime('now', ?)", (f"-{int(days)} days",))
+    return int(cur.fetchone()["s"] or 0)
+
+
+def is_plan_low_stock_alerted(plan_id):
+    return get_setting(f"plan_low_stock_alerted_{int(plan_id)}", "0") == "1"
+
+
+def set_plan_low_stock_alerted(plan_id, flag: bool):
+    set_setting(f"plan_low_stock_alerted_{int(plan_id)}", "1" if flag else "0")
+
+
+def reset_plan_low_stock_alerts():
+    cur.execute("DELETE FROM settings WHERE key LIKE 'plan_low_stock_alerted_%'")
+    conn.commit()
 
 
 # --- Backup logs / schema metadata ---

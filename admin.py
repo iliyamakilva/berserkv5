@@ -16,7 +16,7 @@ import messages
 import settings
 import subs
 from config import ADMIN_COMMAND, ADMIN_IDS, BROADCAST_DELAY, OWNER_IDS
-from utils import cleanup_qr, make_qr
+from utils import cleanup_qr, make_qr, format_dual_datetime
 
 
 def is_admin(user_id) -> bool:
@@ -33,6 +33,8 @@ class AdminStates(StatesGroup):
     waiting_balance_amount = State()
     waiting_ban_id = State()
     waiting_unban_id = State()
+    waiting_user_note = State()
+    waiting_direct_message = State()
     waiting_add_sub = State()
     waiting_link_search = State()
     waiting_link_delete_id = State()
@@ -121,6 +123,8 @@ def admin_personalize_section_kb():
 def admin_reports_section_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("📊 آمار و درآمد", callback_data="adm_stats"))
+    kb.add(InlineKeyboardButton("💹 گزارش فروش سریع", callback_data="adm_sales_report"))
+    kb.add(InlineKeyboardButton("🧾 لاگ عملیات ادمین", callback_data="adm_admin_logs"))
     kb.add(InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
@@ -135,6 +139,33 @@ def _short(value, size=45):
     if len(value) <= size:
         return value
     return value[:size] + "..."
+
+def _display_username(user):
+    username = user["username"] if user and "username" in user.keys() else ""
+    display_name = user["display_name"] if user and "display_name" in user.keys() else ""
+    if username:
+        return f"@{username}"
+    if display_name:
+        return f"{display_name} (بدون یوزرنیم)"
+    return "بدون یوزرنیم"
+
+
+def _user_button_label(row, index=None):
+    prefix = f"{index}. " if index is not None else ""
+    test_mark = "🧪 " if "is_test" in row.keys() and int(row["is_test"] or 0) else ""
+    username = row["username"] if row["username"] else ""
+    display_name = row["display_name"] if "display_name" in row.keys() else ""
+    if username:
+        name = f"@{username}"
+    elif display_name:
+        name = f"{display_name} | بدون یوزرنیم"
+    else:
+        name = "بدون یوزرنیم"
+    return f"{prefix}👤 {test_mark}{name} | {row['id']}"
+
+
+def _dual(value):
+    return format_dual_datetime(value)
 
 
 async def _send_long(message, text, reply_markup=None):
@@ -189,6 +220,10 @@ async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_mar
 
 def user_detail_kb(user_id):
     kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("👁 مشاهده پروفایل", url=f"tg://user?id={user_id}"))
+    kb.add(InlineKeyboardButton("💬 ارسال پیام به کاربر", callback_data=f"adm_msg_user_{user_id}"))
+    kb.add(InlineKeyboardButton("📝 یادداشت ادمین", callback_data=f"adm_user_note_{user_id}"))
+    kb.add(InlineKeyboardButton("🧪 تغییر وضعیت کاربر تست", callback_data=f"adm_user_test_{user_id}"))
     kb.add(InlineKeyboardButton("🔄 بروزرسانی جزئیات", callback_data=f"adm_user_{user_id}"))
     kb.add(InlineKeyboardButton("💳 افزایش / کاهش موجودی", callback_data="adm_addbal"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به بخش کاربران", callback_data="adm_section_users"))
@@ -217,6 +252,9 @@ def _fmt_user_detail(user_id):
         return "کاربر پیدا نشد."
 
     status = "⛔ بن شده" if user["banned"] else "✅ فعال"
+    username_text = _display_username(user)
+    test_text = "🧪 کاربر تست" if "is_test" in user.keys() and int(user["is_test"] or 0) else "عادی"
+    admin_note = user["admin_note"] if "admin_note" in user.keys() and user["admin_note"] else "-"
     owned = subs.user_subs(user_id, limit=20)
     purchases = db.list_user_purchases(user_id, limit=10)
     ledger = db.list_user_ledger(user_id, limit=10)
@@ -234,13 +272,16 @@ def _fmt_user_detail(user_id):
         f"👤 جزئیات کامل کاربر\n\n"
         f"User ID: {user['id']}\n"
         f"Username: @{user['username'] or '-'}\n"
+        f"نمایش: {username_text}\n"
+        f"نوع کاربر: {test_text}\n"
+        f"یادداشت ادمین: {admin_note}\n"
         f"وضعیت: {status}\n"
         f"موجودی کیف پول: {_fmt_money(user['balance'])}\n"
         f"تعداد خرید ثبت‌شده روی کاربر: {user['purchased']}\n"
         f"تعداد سرویس تحویل‌شده: {db.delivered_sub_count_by_user(user_id)}\n"
         f"معرف: {referrer_text}\n"
-        f"عضویت: {user['joined_at']}\n"
-        f"آخرین فعالیت: {user['last_active']}\n"
+        f"عضویت: {_dual(user['joined_at'])}\n"
+        f"آخرین فعالیت: {_dual(user['last_active'])}\n"
     )
 
     text += (
@@ -254,14 +295,14 @@ def _fmt_user_detail(user_id):
         text += "آخرین زیرمجموعه‌ها:\n"
         for row in referred:
             mark = "✅ خرید کرده" if row["rewarded"] else "⏳ بدون خرید"
-            text += f"• {row['id']} @{row['username'] or '-'} | {mark} | خرید: {row['purchased']}\n"
+            text += f"• {row['id']} {_display_username(row)} | {mark} | خرید: {row['purchased']} | عضویت: {_dual(row['joined_at'])}\n"
 
     text += "\n🧾 خریدها\n"
     if purchases:
         for p in purchases[:7]:
             text += (
                 f"• خرید #{p['id']} | تعداد {p['quantity']} | "
-                f"مبلغ {_fmt_money(p['amount'])} | قیمت واحد {_fmt_money(p['unit_price'])} | {p['created_at']}\n"
+                f"مبلغ {_fmt_money(p['amount'])} | قیمت واحد {_fmt_money(p['unit_price'])} | {_dual(p['created_at'])}\n"
             )
     else:
         text += "خرید ثبت نشده.\n"
@@ -271,7 +312,7 @@ def _fmt_user_detail(user_id):
         for s in owned[:12]:
             text += (
                 f"• Sub #{s['id']} | {s['account_name'] or '-'}\n"
-                f"  خرید/تحویل: {s['assigned_at'] or '-'} | مبلغ: {_fmt_money(s['price_paid'])}\n"
+                f"  خرید/تحویل: {_dual(s['assigned_at'])} | مبلغ: {_fmt_money(s['price_paid'])}\n"
                 f"  وضعیت: {s['status'] or 'delivered'} | خرید #{s['purchase_id'] or '-'}\n"
                 f"  لینک کوتاه: {_short(s['link'])}\n"
             )
@@ -281,7 +322,7 @@ def _fmt_user_detail(user_id):
     text += "\n💳 شارژهای کیف پول\n"
     if topups:
         for t in topups:
-            text += f"• شارژ #{t['id']} | {_fmt_money(t['amount'])} | {t['status']} | {t['created_at']}\n"
+            text += f"• شارژ #{t['id']} | {_fmt_money(t['amount'])} | {t['status']} | {_dual(t['created_at'])}\n"
     else:
         text += "شارژ ثبت نشده.\n"
 
@@ -290,7 +331,7 @@ def _fmt_user_detail(user_id):
         for l in ledger:
             text += (
                 f"• #{l['id']} | {l['action']} | {_fmt_money(l['amount'])}\n"
-                f"  قبل: {_fmt_money(l['balance_before'])} | بعد: {_fmt_money(l['balance_after'])} | {l['created_at']}\n"
+                f"  قبل: {_fmt_money(l['balance_before'])} | بعد: {_fmt_money(l['balance_after'])} | {_dual(l['created_at'])}\n"
             )
     else:
         text += "تراکنش ثبت نشده.\n"
@@ -302,7 +343,7 @@ def _fmt_user_detail(user_id):
     if tickets:
         text += "آخرین تیکت‌ها:\n"
         for t in tickets:
-            text += f"• تیکت #{t['id']} | {t['status']} | {t['created_at']}\n"
+            text += f"• تیکت #{t['id']} | {t['status']} | {_dual(t['created_at'])}\n"
 
     text += (
         "\nℹ️ نکته: چون API پنل VPN نداریم، تاریخ اولین اتصال یا مصرف واقعی قابل تشخیص نیست؛ "
@@ -378,17 +419,18 @@ async def cb_users(c: types.CallbackQuery):
     if not rows:
         return await _replace_callback_message(c, "هیچ کاربری ثبت نشده.", reply_markup=admin_back_kb())
 
-    lines = ["👥 آخرین ۱۵ کاربر:\n"]
+    lines = ["👥 کاربران بر اساس زمان عضویت؛ از قدیمی‌ترین تا جدیدترین:\n"]
     kb = InlineKeyboardMarkup(row_width=1)
 
     for index, r in enumerate(rows, start=1):
         flag = "⛔" if r["banned"] else "✅"
-        username = f"@{r['username']}" if r["username"] else "بدون یوزرنیم"
+        username = _display_username(r)
         delivered = db.delivered_sub_count_by_user(r["id"])
+        test_mark = " | 🧪 تست" if "is_test" in r.keys() and int(r["is_test"] or 0) else ""
         lines.append(
-            f"{index}. {flag} {r['id']} | {username} | خرید: {r['purchased']} | سرویس: {delivered} | موجودی: {_fmt_money(r['balance'])}"
+            f"{index}. {flag} {r['id']} | {username}{test_mark} | خرید: {r['purchased']} | سرویس: {delivered} | موجودی: {_fmt_money(r['balance'])} | عضویت: {_dual(r['joined_at'])}"
         )
-        kb.add(InlineKeyboardButton(f"{index}. 👤 {username} | {r['id']}", callback_data=f"adm_user_{r['id']}"))
+        kb.add(InlineKeyboardButton(_user_button_label(r, index), callback_data=f"adm_user_{r['id']}"))
 
     kb.add(InlineKeyboardButton("⬅️ بازگشت به بخش کاربران", callback_data="adm_section_users"))
     await _replace_callback_message(c, "\n".join(lines), reply_markup=kb)
@@ -402,6 +444,96 @@ async def cb_user_detail(c: types.CallbackQuery):
     await _send_long(c.message, _fmt_user_detail(user_id), reply_markup=user_detail_kb(user_id))
     if subs.user_subs(user_id, limit=1):
         await c.message.answer("🔁 عملیات سریع روی سرویس‌های این کاربر:", reply_markup=user_services_kb(user_id))
+
+
+async def cb_user_note(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_user_note_", 1)[1]
+    user = db.get_user(user_id)
+    if not user:
+        return await c.message.answer("کاربر پیدا نشد.", reply_markup=admin_back_kb())
+    current = user["admin_note"] if "admin_note" in user.keys() and user["admin_note"] else ""
+    await state.update_data(note_user_id=user_id)
+    await _replace_callback_message(
+        c,
+        "📝 یادداشت ادمین برای کاربر\n\n"
+        f"کاربر: {_display_username(user)} | ID: {user_id}\n"
+        f"یادداشت فعلی:\n{current or '-'}\n\n"
+        "متن یادداشت جدید را بفرستید. برای پاک کردن یادداشت، فقط یک خط تیره - بفرستید.",
+        reply_markup=cancel_kb(),
+    )
+    await AdminStates.waiting_user_note.set()
+
+
+async def process_user_note(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.content_type != "text":
+        return await m.answer("لطفاً یادداشت را به صورت متن بفرستید.", reply_markup=cancel_kb())
+    data = await state.get_data()
+    user_id = data.get("note_user_id")
+    note = "" if m.text.strip() == "-" else m.text.strip()
+    db.set_user_admin_note(user_id, note)
+    db.log_admin_action(m.from_user.id, "user_note_update", user_id, f"note_len={len(note)}")
+    await state.finish()
+    await m.answer("✅ یادداشت ادمین ذخیره شد.\n\n" + _fmt_user_detail(user_id), reply_markup=user_detail_kb(user_id))
+
+
+async def cb_user_test_toggle(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_user_test_", 1)[1]
+    if not db.get_user(user_id):
+        return await c.message.answer("کاربر پیدا نشد.", reply_markup=admin_back_kb())
+    db.toggle_user_test(user_id)
+    user = db.get_user(user_id)
+    db.log_admin_action(c.from_user.id, "toggle_test_user", user_id, f"is_test={user['is_test'] if 'is_test' in user.keys() else '-'}")
+    await _replace_callback_message(c, "✅ وضعیت کاربر تست تغییر کرد.\n\n" + _fmt_user_detail(user_id), reply_markup=user_detail_kb(user_id))
+
+
+async def cb_direct_message_start(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_msg_user_", 1)[1]
+    user = db.get_user(user_id)
+    if not user:
+        return await c.message.answer("کاربر پیدا نشد.", reply_markup=admin_back_kb())
+    await state.update_data(direct_user_id=user_id)
+    await _replace_callback_message(
+        c,
+        "💬 ارسال پیام مستقیم به کاربر\n\n"
+        f"گیرنده: {_display_username(user)} | ID: {user_id}\n\n"
+        "متن پیام را بفرستید. پیام از طرف ربات برای کاربر ارسال می‌شود.",
+        reply_markup=cancel_kb(),
+    )
+    await AdminStates.waiting_direct_message.set()
+
+
+async def process_direct_message(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.content_type != "text" or not m.text.strip():
+        return await m.answer("لطفاً متن پیام را بفرستید.", reply_markup=cancel_kb())
+    data = await state.get_data()
+    user_id = data.get("direct_user_id")
+    bot = Bot.get_current()
+    body = (
+        "📩 پیام پشتیبانی\n\n"
+        f"{m.text.strip()}\n\n"
+        "برای پاسخ، از بخش پشتیبانی ربات استفاده کنید."
+    )
+    try:
+        await bot.send_message(int(user_id), body, reply_markup=menus.main_reply_kb(user_id))
+        db.log_admin_action(m.from_user.id, "send_direct_message", user_id, f"len={len(m.text.strip())}")
+        await state.finish()
+        await m.answer("✅ پیام برای کاربر ارسال شد.", reply_markup=user_detail_kb(user_id))
+    except Exception as exc:
+        await m.answer(f"❌ ارسال پیام ناموفق بود: {exc}", reply_markup=user_detail_kb(user_id))
+
 
 
 async def cb_resend_link(c: types.CallbackQuery):
@@ -516,6 +648,7 @@ async def process_balance_amount(m: types.Message, state: FSMContext):
     except ValueError:
         return await m.answer("لطفا فقط عدد بفرستید.", reply_markup=cancel_kb())
     db.add_balance(data["target_id"], amount, action="admin_adjustment", note=f"admin_id={m.from_user.id}")
+    db.log_admin_action(m.from_user.id, "balance_adjustment", data["target_id"], f"amount={amount}")
     await state.finish()
     await m.answer(f"✅ موجودی کاربر {data['target_id']} به‌روزرسانی شد.", reply_markup=admin_back_kb())
 
@@ -536,6 +669,7 @@ async def process_ban(m: types.Message, state: FSMContext):
     if not db.get_user(target):
         return await m.answer("این کاربر پیدا نشد. دوباره بفرستید یا لغو کنید:", reply_markup=cancel_kb())
     db.set_ban(target, True)
+    db.log_admin_action(m.from_user.id, "ban_user", target, "manual_ban")
     await state.finish()
     await m.answer(f"⛔ کاربر {target} بن شد.", reply_markup=admin_back_kb())
 
@@ -556,6 +690,7 @@ async def process_unban(m: types.Message, state: FSMContext):
     if not db.get_user(target):
         return await m.answer("این کاربر پیدا نشد. دوباره بفرستید یا لغو کنید:", reply_markup=cancel_kb())
     db.set_ban(target, False)
+    db.log_admin_action(m.from_user.id, "unban_user", target, "manual_unban")
     await state.finish()
     await m.answer(f"✅ کاربر {target} آنبن شد.", reply_markup=admin_back_kb())
 
@@ -764,6 +899,7 @@ async def cb_link_delete_confirm(c: types.CallbackQuery):
     ok, reason = subs.delete_available_link(link_id)
 
     if ok:
+        db.log_admin_action(c.from_user.id, "delete_available_link", None, f"link_id={link_id}")
         counts = subs.link_counts()
         return await _replace_callback_message(
             c,
@@ -832,6 +968,7 @@ async def cb_link_repool_confirm(c: types.CallbackQuery):
     if ok:
         counts = subs.link_counts()
         owner = old_row["owner"] if old_row else "-"
+        db.log_admin_action(c.from_user.id, "return_link_to_pool", owner if owner != "-" else None, f"link_id={link_id}")
         return await _replace_callback_message(
             c,
             f"✅ لینک #{link_id} از حساب {owner or '-'} حذف شد و به استخر برگشت.\n\n"
@@ -1068,6 +1205,49 @@ async def cb_stats(c: types.CallbackQuery):
 
 # -------------------- مدیریت پلن‌ها --------------------
 
+
+async def cb_sales_report(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    lines = [
+        "💹 گزارش فروش سریع",
+        "",
+        f"فروش امروز: {_fmt_money(db.today_sales_total())}",
+        f"فروش دیروز: {_fmt_money(db.yesterday_sales_total())}",
+        f"فروش ۷ روز اخیر: {_fmt_money(db.period_sales_total(7))}",
+        f"فروش ۳۰ روز اخیر: {_fmt_money(db.period_sales_total(30))}",
+        f"تعداد خرید ۷ روز اخیر: {db.period_purchase_count(7)}",
+        f"پرداخت‌های تأییدشده ۷ روز اخیر: {_fmt_money(db.approved_topups_total_for_days(7))}",
+        f"موجودی کل کیف پول کاربران: {_fmt_money(db.sum_all_balances())}",
+        "",
+        "📦 موجودی پلن‌ها:",
+    ]
+    for plan in db.list_plans(limit=30):
+        stock = subs.stock_count(plan["id"])
+        sold = subs.sold_count(plan["id"])
+        warn = " ⚠️" if stock <= int(plan["low_stock_threshold"] or 0) else ""
+        lines.append(f"• #{plan['id']} {plan['title']}: موجودی {stock} | فروش {sold} | قیمت {_fmt_money(plan['price'])}{warn}")
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=admin_reports_section_kb())
+
+
+async def cb_admin_logs(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    rows = db.list_admin_logs(limit=25)
+    if not rows:
+        return await _replace_callback_message(c, "🧾 لاگ عملیات ادمین\n\nهنوز لاگی ثبت نشده.", reply_markup=admin_reports_section_kb())
+    lines = ["🧾 آخرین عملیات ادمین‌ها:\n"]
+    for idx, row in enumerate(rows, start=1):
+        lines.append(
+            f"{idx}. admin={row['admin_id'] or '-'} | action={row['action_type']} | target={row['target_user_id'] or '-'}\n"
+            f"   زمان: {_dual(row['created_at'])}\n"
+            f"   توضیح: {_short(row['details'], 120)}"
+        )
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=admin_reports_section_kb())
+
+
 def plans_menu_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("➕ ساخت پلن جدید", callback_data="plan_create"))
@@ -1240,6 +1420,8 @@ async def process_plan_form(m: types.Message, state: FSMContext):
     except Exception as exc:
         return await m.answer(f"❌ اطلاعات پلن معتبر نیست: {exc}\n\n" + _plan_form_help(), reply_markup=cancel_kb())
     await state.finish()
+    action_type = "update_plan" if data.get("plan_action") == "edit" else "create_plan"
+    db.log_admin_action(m.from_user.id, action_type, None, f"plan_id={plan_id}; title={form.get('title','')}")
     plan = db.get_plan(plan_id)
     await m.answer("✅ پلن ذخیره شد.\n\n" + _fmt_plan(plan), reply_markup=plan_detail_kb(plan_id))
 
@@ -1251,6 +1433,8 @@ async def cb_plan_toggle(c: types.CallbackQuery):
     plan_id = int(c.data.split("plan_toggle_", 1)[1])
     ok = db.toggle_plan(plan_id)
     plan = db.get_plan(plan_id)
+    if ok:
+        db.log_admin_action(c.from_user.id, "toggle_plan", None, f"plan_id={plan_id}; active={plan['is_active'] if plan else '-'}")
     msg = "✅ وضعیت پلن تغییر کرد." if ok else "❌ امکان تغییر وضعیت این پلن وجود ندارد. پلن پیش‌فرض را غیرفعال نکنید."
     await _replace_callback_message(c, msg + ("\n\n" + _fmt_plan(plan) if plan else ""), reply_markup=plan_detail_kb(plan_id) if plan else plans_menu_kb())
 
@@ -2651,7 +2835,12 @@ def register(dp):
     dp.register_callback_query_handler(cb_section_reports, lambda c: c.data == "adm_section_reports")
 
     dp.register_callback_query_handler(cb_users, lambda c: c.data == "adm_users")
-    dp.register_callback_query_handler(cb_user_detail, lambda c: c.data.startswith("adm_user_"))
+    dp.register_callback_query_handler(cb_user_detail, lambda c: c.data.startswith("adm_user_") and not c.data.startswith(("adm_user_note_", "adm_user_test_")))
+    dp.register_callback_query_handler(cb_user_note, lambda c: c.data.startswith("adm_user_note_"))
+    dp.register_message_handler(process_user_note, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_user_note)
+    dp.register_callback_query_handler(cb_user_test_toggle, lambda c: c.data.startswith("adm_user_test_"))
+    dp.register_callback_query_handler(cb_direct_message_start, lambda c: c.data.startswith("adm_msg_user_"))
+    dp.register_message_handler(process_direct_message, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_direct_message)
     dp.register_callback_query_handler(cb_resend_link, lambda c: c.data.startswith("adm_resend_link_"))
     dp.register_callback_query_handler(cb_resend_qr, lambda c: c.data.startswith("adm_resend_qr_"))
 
@@ -2688,6 +2877,8 @@ def register(dp):
 
     dp.register_callback_query_handler(cb_topups, lambda c: c.data == "adm_topups")
     dp.register_callback_query_handler(cb_stats, lambda c: c.data == "adm_stats")
+    dp.register_callback_query_handler(cb_sales_report, lambda c: c.data == "adm_sales_report")
+    dp.register_callback_query_handler(cb_admin_logs, lambda c: c.data == "adm_admin_logs")
 
     dp.register_callback_query_handler(cb_plans, lambda c: c.data == "adm_plans")
     dp.register_callback_query_handler(cb_plan_create, lambda c: c.data == "plan_create")

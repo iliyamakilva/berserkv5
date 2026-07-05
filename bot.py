@@ -18,7 +18,7 @@ import wallet
 from affiliate import reward_ref
 from config import ADMIN_COMMAND, ADMIN_IDS, BOT_TOKEN, validate
 from fsm_storage import SQLiteStorage
-from utils import cleanup_qr, make_qr
+from utils import cleanup_qr, make_qr, format_dual_datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,7 +156,7 @@ async def render_buy(target, user_id: int, username: str = "", plan_id=None):
     if user and user["banned"]:
         return await _send_answer(target, user_id, "⛔ حساب شما مسدود است.", context="buy")
 
-    db.touch_active(user_id_str, username)
+    db.touch_active(user_id_str, username, getattr(target.from_user, "full_name", None) if hasattr(target, "from_user") else None)
 
     if user is None:
         user, _ = db.get_or_create_user(user_id_str, username)
@@ -214,21 +214,36 @@ async def render_buy(target, user_id: int, username: str = "", plan_id=None):
     )
     return await _send_template(target, user_id, "menu_buy", text, reply_markup=buy_quantity_kb(max_qty, plan_id), context="buy")
 
-async def check_low_stock_alert():
-    threshold = settings.low_stock_threshold()
-    current_stock = subs.stock_count()
+async def check_low_stock_alert(plan_id=None):
+    """هشدار موجودی کم برای هر پلن، بدون ارسال تکراری تا وقتی موجودی دوباره بالا برود."""
+    plans = []
+    if plan_id is not None:
+        plan = db.get_plan(plan_id)
+        if plan:
+            plans = [plan]
+    else:
+        plans = db.list_plans(active_only=True, limit=50)
 
-    if current_stock <= threshold and not db.is_low_stock_alerted():
+    for plan in plans:
+        threshold = int(plan["low_stock_threshold"] or settings.low_stock_threshold())
+        current_stock = subs.stock_count(plan["id"])
+        if current_stock > threshold:
+            db.set_plan_low_stock_alerted(plan["id"], False)
+            continue
+        if db.is_plan_low_stock_alerted(plan["id"]):
+            continue
         for admin_id in ADMIN_IDS:
             try:
                 await bot.send_message(
                     admin_id,
-                    f"⚠️ موجودی سرویس کم شد! فقط {current_stock} لینک باقی مونده "
-                    f"(آستانه: {threshold}).\nلطفاً لینک جدید اضافه کنید.",
+                    f"⚠️ موجودی پلن «{plan['title']}» کم شده است.\n"
+                    f"موجودی فعلی: {current_stock} لینک\n"
+                    f"حد هشدار: {threshold} لینک\n"
+                    "لطفاً برای این پلن لینک جدید وارد کنید.",
                 )
             except Exception:
                 pass
-        db.set_low_stock_alerted(True)
+        db.set_plan_low_stock_alerted(plan["id"], True)
 
 
 @dp.message_handler(commands=["start"])
@@ -240,8 +255,8 @@ async def start(m: types.Message):
     if args and args.isdigit() and args != user_id:
         ref = args
 
-    row, _ = db.get_or_create_user(user_id, m.from_user.username, ref)
-    db.touch_active(user_id, m.from_user.username)
+    row, _ = db.get_or_create_user(user_id, m.from_user.username, ref, m.from_user.full_name)
+    db.touch_active(user_id, m.from_user.username, m.from_user.full_name)
 
     if row["banned"]:
         return await m.answer("⛔ حساب شما مسدود شده.\nبرای پیگیری با پشتیبانی تماس بگیرید.")
@@ -376,7 +391,7 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
         return await c.message.answer("تعداد انتخاب‌شده معتبر نیست.", reply_markup=menus.main_reply_kb(c.from_user.id))
 
     if user is None:
-        user, _ = db.get_or_create_user(user_id, c.from_user.username)
+        user, _ = db.get_or_create_user(user_id, c.from_user.username, display_name=c.from_user.full_name)
 
     plan = db.get_plan(plan_id)
     if not plan or int(plan["is_active"] or 0) != 1:
@@ -440,7 +455,7 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
                 except Exception:
                     pass
 
-    await check_low_stock_alert()
+    await check_low_stock_alert(plan_id)
 
     sent = await c.message.answer(
         f"✅ خرید موفق!\n"
@@ -522,7 +537,7 @@ async def buy_bulk(c: types.CallbackQuery):
 async def show_my_subs(target, user_id: int, username: str = ""):
     await _start_clean_section(target, user_id, "my_subs")
     user_id_str = str(user_id)
-    db.touch_active(user_id_str, username)
+    db.touch_active(user_id_str, username, getattr(target.from_user, "full_name", None) if hasattr(target, "from_user") else None)
     rows = subs.user_subs(user_id_str)
 
     if not rows:
@@ -543,7 +558,7 @@ async def show_my_subs(target, user_id: int, username: str = ""):
         lines.append(
             f"{index}️⃣ {plan_title}\n"
             f"شناسه سرویس: {r['account_name'] or '-'}\n"
-            f"تاریخ خرید: {r['assigned_at'] or '-'}\n"
+            f"تاریخ خرید: {format_dual_datetime(r['assigned_at'])}\n"
             f"لینک:\n{r['link']}\n"
         )
 
@@ -707,7 +722,7 @@ async def text_custom_button(m: types.Message):
 
 async def show_wallet(target, user_id: int, username: str = ""):
     user_id_str = str(user_id)
-    db.touch_active(user_id_str, username)
+    db.touch_active(user_id_str, username, getattr(target.from_user, "full_name", None) if hasattr(target, "from_user") else None)
     user = db.get_user(user_id_str)
 
     if user is None:

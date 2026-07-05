@@ -184,6 +184,7 @@ async def cb_confirm(c: types.CallbackQuery):
             return await _edit_safely(c, "این درخواست پیدا نشد.")
         return await _edit_safely(c, "این درخواست قبلاً بررسی شده.")
 
+    db.log_admin_action(c.from_user.id, "approve_topup", topup["user_id"], f"topup_id={topup_id}; amount={topup['amount']}")
     user = db.get_user(topup["user_id"])
     auto_purchase_msg = ""
 
@@ -267,6 +268,7 @@ async def cb_reject(c: types.CallbackQuery):
         return await _edit_safely(c, "این درخواست قبلاً بررسی شده.")
 
     db.set_topup_status(topup_id, "rejected")
+    db.log_admin_action(c.from_user.id, "reject_topup", topup["user_id"], f"topup_id={topup_id}; amount={topup['amount']}")
 
     try:
         await bot.send_message(
