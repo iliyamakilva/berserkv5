@@ -308,6 +308,7 @@ def init():
                 user_id TEXT NOT NULL,
                 message_id INTEGER NOT NULL,
                 context TEXT DEFAULT '',
+                kind TEXT DEFAULT 'menu',
                 created_at TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY(chat_id, message_id)
             )
@@ -340,6 +341,7 @@ def init():
         _add_column_if_missing("messages", "published_at", "TEXT")
         _add_column_if_missing("plans", "pre_purchase_text", "TEXT DEFAULT ''")
         _add_column_if_missing("plans", "post_purchase_text", "TEXT DEFAULT ''")
+        _add_column_if_missing("bot_messages", "kind", "TEXT DEFAULT 'menu'")
         cur.execute("""
             SELECT file_unique_id, COUNT(*) AS c
             FROM receipts
@@ -1631,22 +1633,32 @@ def find_system_button_by_title(title):
 # --- Bot message cleanup ---
 
 
-def track_bot_message(chat_id, user_id, message_id, context=""):
+def track_bot_message(chat_id, user_id, message_id, context="", kind="menu"):
     try:
         cur.execute(
-            "INSERT OR REPLACE INTO bot_messages(chat_id, user_id, message_id, context) VALUES (?, ?, ?, ?)",
-            (str(chat_id), str(user_id), int(message_id), context or ""),
+            """
+            INSERT OR REPLACE INTO bot_messages(chat_id, user_id, message_id, context, kind)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(chat_id), str(user_id), int(message_id), context or "", kind or "menu"),
         )
         conn.commit()
     except Exception:
         pass
 
 
-def list_tracked_bot_messages(chat_id, user_id, limit=30):
-    cur.execute(
-        "SELECT * FROM bot_messages WHERE chat_id=? AND user_id=? ORDER BY created_at DESC LIMIT ?",
-        (str(chat_id), str(user_id), int(limit)),
-    )
+def list_tracked_bot_messages(chat_id, user_id, limit=30, kinds=None):
+    if kinds:
+        placeholders = ",".join(["?"] * len(kinds))
+        cur.execute(
+            f"SELECT * FROM bot_messages WHERE chat_id=? AND user_id=? AND kind IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
+            [str(chat_id), str(user_id), *list(kinds), int(limit)],
+        )
+    else:
+        cur.execute(
+            "SELECT * FROM bot_messages WHERE chat_id=? AND user_id=? ORDER BY created_at DESC LIMIT ?",
+            (str(chat_id), str(user_id), int(limit)),
+        )
     return cur.fetchall()
 
 

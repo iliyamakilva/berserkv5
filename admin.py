@@ -170,7 +170,56 @@ def _dual(value):
     return format_dual_datetime(value)
 
 
-async def _send_long(message, text, reply_markup=None):
+ADMIN_CLEANUP_KINDS = ("menu", "temp", "preview", "list")
+
+
+async def _admin_cleanup_tracked(chat_id, user_id, keep_message_id=None, kinds=ADMIN_CLEANUP_KINDS):
+    """
+    پاک‌سازی هوشمند پنل ادمین:
+    فقط پیام‌های موقت/لیستی/منویی که خود ربات ثبت کرده پاک می‌شوند.
+    پیام‌های مهم مثل رسید، فایل بک‌آپ یا لینک تحویل‌شده ثبت‌شده با kind مهم پاک نمی‌شوند.
+    """
+    try:
+        rows = db.list_tracked_bot_messages(chat_id, user_id, limit=60, kinds=kinds)
+    except TypeError:
+        rows = db.list_tracked_bot_messages(chat_id, user_id, limit=60)
+    for row in rows:
+        message_id = int(row["message_id"])
+        if keep_message_id is not None and message_id == int(keep_message_id):
+            continue
+        try:
+            bot = Bot.get_current()
+            await bot.delete_message(int(row["chat_id"]), message_id)
+        except Exception:
+            try:
+                bot = Bot.get_current()
+                await bot.edit_message_reply_markup(int(row["chat_id"]), message_id, reply_markup=None)
+            except Exception:
+                pass
+        finally:
+            try:
+                db.clear_tracked_bot_message(row["chat_id"], message_id)
+            except Exception:
+                pass
+
+
+async def _track_admin_sent(user_id, sent, context="admin", kind="menu"):
+    if sent is None:
+        return
+    if not isinstance(sent, (list, tuple)):
+        sent = [sent]
+    for msg in sent:
+        try:
+            db.track_bot_message(msg.chat.id, user_id, msg.message_id, context, kind=kind)
+        except TypeError:
+            db.track_bot_message(msg.chat.id, user_id, msg.message_id, context)
+        except Exception:
+            pass
+
+
+async def _send_long(message, text, reply_markup=None, owner_user_id=None, context="admin_long", kind="list", cleanup=False):
+    if cleanup:
+        await _admin_cleanup_tracked(message.chat.id, owner_user_id or message.chat.id)
     chunks = []
     while len(text) > 3900:
         split_at = text.rfind("\n", 0, 3900)
@@ -180,8 +229,13 @@ async def _send_long(message, text, reply_markup=None):
         text = text[split_at:].lstrip()
     chunks.append(text)
 
+    sent_messages = []
     for index, chunk in enumerate(chunks):
-        await message.answer(chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None)
+        sent = await message.answer(chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None)
+        sent_messages.append(sent)
+    await _track_admin_sent(owner_user_id or message.chat.id, sent_messages, context=context, kind=kind)
+    return sent_messages
+
 
 async def _safe_remove_inline_keyboard(message):
     try:
@@ -198,15 +252,24 @@ async def _safe_delete_message(message):
         return False
 
 
-async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_markup=None, parse_mode=None):
+async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_markup=None, parse_mode=None, context="admin_view", kind="menu", cleanup=True):
     """
     برای جلوگیری از شلوغ شدن پنل:
-    - اگر پیام قابل ویرایش باشد، همان پیام edit می‌شود.
-    - اگر قابل edit نباشد، پیام قبلی حذف و پیام جدید ارسال می‌شود.
+    - قبل از باز شدن پنجره جدید، پیام‌های موقت/لیستی قبلی همان ادمین جمع می‌شوند.
+    - اگر پیام فعلی قابل ویرایش باشد، همان پیام edit می‌شود.
+    - اگر قابل edit نباشد، پیام قبلی حذف/کیبوردش پاک می‌شود و پیام جدید ارسال می‌شود.
     """
+    if cleanup:
+        await _admin_cleanup_tracked(c.message.chat.id, c.from_user.id, keep_message_id=c.message.message_id)
     try:
         if getattr(c.message, "content_type", None) == types.ContentType.TEXT:
             await c.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            try:
+                db.track_bot_message(c.message.chat.id, c.from_user.id, c.message.message_id, context, kind=kind)
+            except TypeError:
+                db.track_bot_message(c.message.chat.id, c.from_user.id, c.message.message_id, context)
+            except Exception:
+                pass
             return
     except Exception as exc:
         if "message is not modified" in str(exc).lower():
@@ -217,41 +280,98 @@ async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_mar
     if not deleted:
         await _safe_remove_inline_keyboard(c.message)
 
-    await c.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    sent = await c.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    await _track_admin_sent(c.from_user.id, sent, context=context, kind=kind)
 
 
 def user_detail_kb(user_id):
-    kb = InlineKeyboardMarkup(row_width=1)
-    # ساخت دکمه URL با tg://user?id برای بعضی کاربران توسط تلگرام با
-    # BUTTON_USER_PRIVACY_RESTRICTED رد می‌شود و کل پیام را fail می‌کند.
-    # به همین دلیل پروفایل را با callback امن نمایش می‌دهیم و URL خام داخل متن می‌آید.
-    kb.add(InlineKeyboardButton("👁 اطلاعات پروفایل", callback_data=f"adm_user_profile_{user_id}"))
-    kb.add(InlineKeyboardButton("💬 ارسال پیام به کاربر", callback_data=f"adm_msg_user_{user_id}"))
-    kb.add(InlineKeyboardButton("📝 یادداشت ادمین", callback_data=f"adm_user_note_{user_id}"))
-    kb.add(InlineKeyboardButton("🧪 تغییر وضعیت کاربر تست", callback_data=f"adm_user_test_{user_id}"))
-    kb.add(InlineKeyboardButton("🔄 بروزرسانی جزئیات", callback_data=f"adm_user_{user_id}"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📦 سرویس‌ها و خریدها", callback_data=f"adm_user_history_{user_id}"),
+        InlineKeyboardButton("💰 مالی و کیف پول", callback_data=f"adm_user_finance_{user_id}"),
+        InlineKeyboardButton("🎫 تیکت‌ها", callback_data=f"adm_user_tickets_{user_id}"),
+        InlineKeyboardButton("👥 رفرال", callback_data=f"adm_user_referral_{user_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("👁 اطلاعات پروفایل", callback_data=f"adm_user_profile_{user_id}"),
+        InlineKeyboardButton("💬 ارسال پیام", callback_data=f"adm_msg_user_{user_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("📝 یادداشت ادمین", callback_data=f"adm_user_note_{user_id}"),
+        InlineKeyboardButton("🧪 وضعیت تست", callback_data=f"adm_user_test_{user_id}"),
+    )
     kb.add(InlineKeyboardButton("💳 افزایش / کاهش موجودی", callback_data="adm_addbal"))
+    kb.add(InlineKeyboardButton("🔄 بروزرسانی خلاصه", callback_data=f"adm_user_{user_id}"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به بخش کاربران", callback_data="adm_section_users"))
     kb.add(InlineKeyboardButton("🏠 پنل مدیریت", callback_data="adm_back"))
     return kb
 
 
-def user_services_kb(user_id):
-    rows = subs.user_subs(user_id, limit=8)
+def user_history_kb(user_id, purchases, owned):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for p in purchases[:12]:
+        kb.add(InlineKeyboardButton(f"🧾 خرید #{p['id']} | {p['quantity']} عدد | {_fmt_money(p['amount'])}", callback_data=f"adm_user_purchase_{p['id']}_{user_id}"))
+    orphan_items = [s for s in owned if not s["purchase_id"]]
+    for s in orphan_items[:8]:
+        label = s["account_name"] or f"Sub #{s['id']}"
+        kb.add(InlineKeyboardButton(f"🔗 {label} | جزئیات سرویس", callback_data=f"adm_user_sub_detail_{s['id']}_{user_id}"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به جزئیات کاربر", callback_data=f"adm_user_{user_id}"))
+    return kb
+
+
+def purchase_detail_kb(user_id, purchase_id, services):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for index, s in enumerate(services, start=1):
+        label = s["account_name"] or f"Sub #{s['id']}"
+        kb.add(InlineKeyboardButton(f"{index}️⃣ {label} | جزئیات سرویس", callback_data=f"adm_user_sub_detail_{s['id']}_{user_id}"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به سرویس‌ها و خریدها", callback_data=f"adm_user_history_{user_id}"))
+    kb.add(InlineKeyboardButton("👤 بازگشت به جزئیات کاربر", callback_data=f"adm_user_{user_id}"))
+    return kb
+
+
+def service_detail_kb(user_id, sub_id, purchase_id=None):
     kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔗 ارسال لینک به کاربر", callback_data=f"adm_resend_link_{sub_id}_{user_id}"),
+        InlineKeyboardButton("🔳 ارسال QR به کاربر", callback_data=f"adm_resend_qr_{sub_id}_{user_id}"),
+    )
+    kb.add(InlineKeyboardButton("↩️ بازگردانی به استخر", callback_data=f"adm_link_repool_ask_{sub_id}"))
+    if purchase_id:
+        kb.add(InlineKeyboardButton("⬅️ بازگشت به جزئیات خرید", callback_data=f"adm_user_purchase_{purchase_id}_{user_id}"))
+    kb.add(InlineKeyboardButton("📦 بازگشت به سرویس‌ها و خریدها", callback_data=f"adm_user_history_{user_id}"))
+    kb.add(InlineKeyboardButton("👤 بازگشت به جزئیات کاربر", callback_data=f"adm_user_{user_id}"))
+    return kb
 
-    for index, row in enumerate(rows, start=1):
+
+def user_services_kb(user_id):
+    # سازگاری با نسخه‌های قبلی: عملیات سریع دیگر به صورت لیست بزرگ نمایش داده نمی‌شود.
+    owned = subs.user_subs(user_id, limit=8)
+    kb = InlineKeyboardMarkup(row_width=1)
+    for index, row in enumerate(list(reversed(owned)), start=1):
         label = row["account_name"] or f"Sub #{row['id']}"
-        kb.add(
-            InlineKeyboardButton(f"{index}. 🔗 ارسال لینک {label}", callback_data=f"adm_resend_link_{row['id']}_{user_id}"),
-            InlineKeyboardButton(f"{index}. 🔳 QR {label}", callback_data=f"adm_resend_qr_{row['id']}_{user_id}"),
-        )
-
+        kb.add(InlineKeyboardButton(f"{index}️⃣ {label} | جزئیات", callback_data=f"adm_user_sub_detail_{row['id']}_{user_id}"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به جزئیات", callback_data=f"adm_user_{user_id}"))
     return kb
 
 
-def _fmt_user_detail(user_id):
+def _plan_title(plan_id):
+    try:
+        plan = db.get_plan(plan_id)
+        return plan["title"] if plan else "پلن نامشخص"
+    except Exception:
+        return "پلن نامشخص"
+
+
+def _owned_services(user_id, limit=None):
+    rows = list(subs.user_subs(user_id, limit=limit))
+    return sorted(rows, key=lambda r: ((r["assigned_at"] or ""), int(r["id"] or 0)))
+
+
+def _services_for_purchase(user_id, purchase_id):
+    return [s for s in _owned_services(user_id) if str(s["purchase_id"] or "") == str(purchase_id)]
+
+
+def _fmt_user_summary(user_id):
     user = db.get_user(user_id)
     if not user:
         return "کاربر پیدا نشد."
@@ -259,102 +379,202 @@ def _fmt_user_detail(user_id):
     status = "⛔ بن شده" if user["banned"] else "✅ فعال"
     username_text = _display_username(user)
     test_text = "🧪 کاربر تست" if "is_test" in user.keys() and int(user["is_test"] or 0) else "عادی"
-    admin_note = user["admin_note"] if "admin_note" in user.keys() and user["admin_note"] else "-"
-    owned = subs.user_subs(user_id, limit=20)
-    purchases = db.list_user_purchases(user_id, limit=10)
-    ledger = db.list_user_ledger(user_id, limit=10)
-    topups = db.list_user_topups(user_id, limit=8)
-    tickets = db.list_user_tickets(user_id, limit=5)
+    admin_note = user["admin_note"] if "admin_note" in user.keys() and user["admin_note"] else ""
+    purchase_count = db.purchase_count_by_user(user_id)
+    delivered_count = db.delivered_sub_count_by_user(user_id)
+    topups = db.list_user_topups(user_id, limit=50)
+    approved_topups = [t for t in topups if (t["status"] or "") == "approved"]
     ticket_counts = db.user_ticket_counts(user_id)
-    referred = db.referred_users(user_id, limit=8)
 
-    refs_count = db.referral_count(user_id)
-    rewarded_refs = db.rewarded_referral_count(user_id)
-    ref_reward_total = db.referral_reward_total(user_id)
-    referrer_text = user["ref"] or "-"
-
-    text = (
-        f"👤 جزئیات کامل کاربر\n\n"
+    return (
+        "👤 خلاصه کاربر\n\n"
         f"User ID: {user['id']}\n"
         f"Username: @{user['username'] or '-'}\n"
         f"نمایش: {username_text}\n"
         f"نوع کاربر: {test_text}\n"
-        f"یادداشت ادمین: {admin_note}\n"
         f"وضعیت: {status}\n"
-        f"موجودی کیف پول: {_fmt_money(user['balance'])}\n"
-        f"تعداد خرید ثبت‌شده روی کاربر: {user['purchased']}\n"
-        f"تعداد سرویس تحویل‌شده: {db.delivered_sub_count_by_user(user_id)}\n"
-        f"معرف: {referrer_text}\n"
+        f"موجودی کیف پول: {_fmt_money(user['balance'])}\n\n"
+        f"خریدهای ثبت‌شده: {purchase_count}\n"
+        f"سرویس‌های تحویل‌شده: {delivered_count}\n"
+        f"شارژهای موفق: {len(approved_topups)}\n"
+        f"تیکت‌ها: {ticket_counts['total']} | باز: {ticket_counts['open']}\n"
+        f"معرف: {user['ref'] or '-'}\n\n"
         f"عضویت: {_dual(user['joined_at'])}\n"
         f"آخرین فعالیت: {_dual(user['last_active'])}\n"
+        f"یادداشت ادمین: {'دارد' if admin_note else 'ندارد'}\n\n"
+        "برای جزئیات بیشتر از دکمه‌های پایین استفاده کنید."
     )
 
-    text += (
-        f"\n👥 رفرال\n"
-        f"تعداد زیرمجموعه‌ها: {refs_count}\n"
-        f"زیرمجموعه‌های خریدکرده/پاداش‌داده‌شده: {rewarded_refs}\n"
-        f"مجموع پاداش رفرال دریافتی: {_fmt_money(ref_reward_total)}\n"
-    )
 
-    if referred:
-        text += "آخرین زیرمجموعه‌ها:\n"
-        for row in referred:
-            mark = "✅ خرید کرده" if row["rewarded"] else "⏳ بدون خرید"
-            text += f"• {row['id']} {_display_username(row)} | {mark} | خرید: {row['purchased']} | عضویت: {_dual(row['joined_at'])}\n"
+def _fmt_user_history(user_id):
+    user = db.get_user(user_id)
+    if not user:
+        return "کاربر پیدا نشد.", [], []
+    purchases = list(reversed(db.list_user_purchases(user_id, limit=20)))
+    owned = _owned_services(user_id)
+    services_by_purchase = {}
+    for s in owned:
+        services_by_purchase.setdefault(str(s["purchase_id"] or ""), []).append(s)
 
-    text += "\n🧾 خریدها\n"
+    lines = ["📦 سرویس‌ها و خریدهای کاربر\n"]
+    lines.append(f"کاربر: {_display_username(user)} | ID: {user_id}")
+    lines.append(f"تعداد خریدها: {len(purchases)} | سرویس‌ها: {len(owned)}\n")
+
     if purchases:
-        for p in purchases[:7]:
-            text += (
-                f"• خرید #{p['id']} | تعداد {p['quantity']} | "
-                f"مبلغ {_fmt_money(p['amount'])} | قیمت واحد {_fmt_money(p['unit_price'])} | {_dual(p['created_at'])}\n"
+        for index, p in enumerate(purchases, start=1):
+            items = services_by_purchase.get(str(p["id"]), [])
+            lines.append(f"{index}️⃣ خرید #{p['id']} | {_dual(p['created_at'])}")
+            lines.append(f"تعداد: {p['quantity']} | مبلغ: {_fmt_money(p['amount'])} | واحد: {_fmt_money(p['unit_price'])}")
+            if p["plan_id"]:
+                lines.append(f"پلن: {_plan_title(p['plan_id'])}")
+            if items:
+                labels = ", ".join([(s["account_name"] or f"Sub #{s['id']}") for s in items[:4]])
+                more = f" و {len(items) - 4} مورد دیگر" if len(items) > 4 else ""
+                lines.append(f"سرویس‌ها: {labels}{more}")
+            else:
+                lines.append("سرویس ثبت‌شده برای این خرید پیدا نشد.")
+            lines.append("")
+    else:
+        lines.append("خریدی برای این کاربر ثبت نشده.")
+
+    orphan_items = [s for s in owned if not s["purchase_id"]]
+    if orphan_items:
+        lines.append("🔗 سرویس‌های بدون شناسه خرید:")
+        for i, s in enumerate(orphan_items[:8], start=1):
+            label = s["account_name"] or f"Sub #{s['id']}"
+            lines.append(f"{i}. {label} | {_dual(s['assigned_at'])} | {_fmt_money(s['price_paid'])}")
+
+    return "\n".join(lines).strip(), purchases, owned
+
+
+def _fmt_purchase_detail(user_id, purchase_id):
+    p = db.get_purchase(purchase_id)
+    if not p or str(p["user_id"]) != str(user_id):
+        return "این خرید برای این کاربر پیدا نشد.", []
+    services = _services_for_purchase(user_id, purchase_id)
+    lines = [f"🧾 جزئیات خرید #{purchase_id}\n"]
+    lines.append(f"کاربر: {user_id}")
+    lines.append(f"تاریخ: {_dual(p['created_at'])}")
+    lines.append(f"تعداد: {p['quantity']}")
+    lines.append(f"قیمت واحد: {_fmt_money(p['unit_price'])}")
+    lines.append(f"مبلغ کل: {_fmt_money(p['amount'])}")
+    lines.append(f"وضعیت: {p['status']}")
+    if p["plan_id"]:
+        lines.append(f"پلن: {_plan_title(p['plan_id'])}")
+    if p["note"]:
+        lines.append(f"یادداشت: {p['note']}")
+
+    lines.append("\n📦 سرویس‌های این خرید")
+    if services:
+        for i, s in enumerate(services, start=1):
+            label = s["account_name"] or f"Sub #{s['id']}"
+            lines.append(
+                f"{i}️⃣ {label} | "
+                f"وضعیت: {s['status'] or 'delivered'} | تحویل: {_dual(s['assigned_at'])} | مبلغ: {_fmt_money(s['price_paid'])}"
             )
     else:
-        text += "خرید ثبت نشده.\n"
+        lines.append("سرویسی برای این خرید پیدا نشد.")
+    return "\n".join(lines), services
 
-    text += "\n📦 سرویس‌های تحویل‌شده\n"
-    if owned:
-        for s in owned[:12]:
-            text += (
-                f"• Sub #{s['id']} | {s['account_name'] or '-'}\n"
-                f"  خرید/تحویل: {_dual(s['assigned_at'])} | مبلغ: {_fmt_money(s['price_paid'])}\n"
-                f"  وضعیت: {s['status'] or 'delivered'} | خرید #{s['purchase_id'] or '-'}\n"
-                f"  لینک کوتاه: {_short(s['link'])}\n"
-            )
-    else:
-        text += "سرویسی به این کاربر تحویل نشده.\n"
 
-    text += "\n💳 شارژهای کیف پول\n"
-    if topups:
-        for t in topups:
-            text += f"• شارژ #{t['id']} | {_fmt_money(t['amount'])} | {t['status']} | {_dual(t['created_at'])}\n"
-    else:
-        text += "شارژ ثبت نشده.\n"
+def _fmt_service_detail(user_id, sub_id):
+    s = subs.get_sub_detail(sub_id)
+    if not s or str(s["owner"] or "") != str(user_id):
+        return "این سرویس برای این کاربر پیدا نشد.", None
+    plan = db.get_plan(s["plan_id"]) if s["plan_id"] else None
+    lines = [f"📦 جزئیات سرویس #{s['id']}\n"]
+    lines.append(f"شناسه سرویس: {s['account_name'] or '-'}")
+    lines.append(f"کاربر: {user_id}")
+    lines.append(f"پلن: {plan['title'] if plan else 'نامشخص'}")
+    lines.append(f"خرید: #{s['purchase_id'] or '-'}")
+    lines.append(f"تاریخ خرید/تحویل: {_dual(s['assigned_at'])}")
+    lines.append(f"مبلغ: {_fmt_money(s['price_paid'])}")
+    lines.append(f"وضعیت: {s['status'] or 'delivered'}")
+    lines.append("\n🔗 لینک کامل:")
+    lines.append(s["link"] or "-")
+    return "\n".join(lines), s
 
-    text += "\n📒 آخرین تراکنش‌های کیف پول\n"
+
+def _fmt_user_finance(user_id):
+    user = db.get_user(user_id)
+    if not user:
+        return "کاربر پیدا نشد."
+    ledger = db.list_user_ledger(user_id, limit=20)
+    topups = db.list_user_topups(user_id, limit=50)
+    purchases = db.list_user_purchases(user_id, limit=50)
+    approved_total = sum(int(t["amount"] or 0) for t in topups if (t["status"] or "") == "approved")
+    pending_count = sum(1 for t in topups if (t["status"] or "") in ("awaiting_receipt", "pending_review"))
+    purchase_total = sum(int(p["amount"] or 0) for p in purchases if (p["status"] or "") == "completed")
+
+    lines = ["💰 مالی و کیف پول\n"]
+    lines.append(f"کاربر: {_display_username(user)} | ID: {user_id}")
+    lines.append(f"موجودی فعلی: {_fmt_money(user['balance'])}")
+    lines.append(f"کل شارژهای تأییدشده: {_fmt_money(approved_total)}")
+    lines.append(f"کل خریدهای ثبت‌شده: {_fmt_money(purchase_total)}")
+    lines.append(f"شارژهای در انتظار/بررسی: {pending_count}\n")
+    lines.append("📒 خط زمان مالی اخیر")
     if ledger:
-        for l in ledger:
-            text += (
-                f"• #{l['id']} | {l['action']} | {_fmt_money(l['amount'])}\n"
-                f"  قبل: {_fmt_money(l['balance_before'])} | بعد: {_fmt_money(l['balance_after'])} | {_dual(l['created_at'])}\n"
-            )
+        for i, l in enumerate(ledger, start=1):
+            amount = int(l["amount"] or 0)
+            sign = "+" if amount > 0 else ""
+            action_label = {
+                "purchase": "خرید سرویس",
+                "balance_adjustment": "تغییر دستی موجودی",
+                "topup": "شارژ کیف پول",
+                "referral_reward": "پاداش رفرال",
+            }.get(l["action"], l["action"])
+            lines.append(f"{i}️⃣ {action_label} | {sign}{_fmt_money(amount)}")
+            lines.append(f"قبل: {_fmt_money(l['balance_before'])} | بعد: {_fmt_money(l['balance_after'])} | {_dual(l['created_at'])}")
+            if l["note"]:
+                lines.append(f"یادداشت: {_short(l['note'], 80)}")
     else:
-        text += "تراکنش ثبت نشده.\n"
+        lines.append("تراکنشی ثبت نشده.")
+    return "\n".join(lines)
 
-    text += (
-        f"\n🎫 پشتیبانی\n"
-        f"کل تیکت‌ها: {ticket_counts['total']} | باز: {ticket_counts['open']} | بسته: {ticket_counts['closed']}\n"
-    )
+
+def _fmt_user_referral(user_id):
+    user = db.get_user(user_id)
+    if not user:
+        return "کاربر پیدا نشد."
+    referred = db.referred_users(user_id, limit=20)
+    lines = ["👥 رفرال کاربر\n"]
+    lines.append(f"کاربر: {_display_username(user)} | ID: {user_id}")
+    lines.append(f"معرف این کاربر: {user['ref'] or '-'}")
+    lines.append(f"تعداد زیرمجموعه‌ها: {db.referral_count(user_id)}")
+    lines.append(f"زیرمجموعه‌های خریدکرده/پاداش‌داده‌شده: {db.rewarded_referral_count(user_id)}")
+    lines.append(f"مجموع پاداش دریافتی: {_fmt_money(db.referral_reward_total(user_id))}\n")
+    if referred:
+        lines.append("آخرین زیرمجموعه‌ها:")
+        for i, row in enumerate(referred, start=1):
+            mark = "✅ خرید کرده" if row["rewarded"] else "⏳ بدون خرید"
+            lines.append(f"{i}. {row['id']} | {_display_username(row)} | {mark} | خرید: {row['purchased']} | عضویت: {_dual(row['joined_at'])}")
+    else:
+        lines.append("زیرمجموعه‌ای ثبت نشده.")
+    return "\n".join(lines)
+
+
+def _fmt_user_tickets(user_id):
+    user = db.get_user(user_id)
+    if not user:
+        return "کاربر پیدا نشد."
+    counts = db.user_ticket_counts(user_id)
+    tickets = db.list_user_tickets(user_id, limit=15)
+    lines = ["🎫 تیکت‌های کاربر\n"]
+    lines.append(f"کاربر: {_display_username(user)} | ID: {user_id}")
+    lines.append(f"کل: {counts['total']} | باز: {counts['open']} | بسته: {counts['closed']}\n")
     if tickets:
-        text += "آخرین تیکت‌ها:\n"
-        for t in tickets:
-            text += f"• تیکت #{t['id']} | {t['status']} | {_dual(t['created_at'])}\n"
+        for i, t in enumerate(tickets, start=1):
+            lines.append(f"{i}. تیکت #{t['id']} | {t['status']} | {_dual(t['created_at'])}")
+    else:
+        lines.append("تیکتی ثبت نشده.")
+    return "\n".join(lines)
 
-    text += (
-        "\nℹ️ نکته: چون API پنل VPN نداریم، تاریخ اولین اتصال یا مصرف واقعی قابل تشخیص نیست؛ "
-        "اینجا تاریخ خرید/تحویل لینک نمایش داده می‌شود."
-    )
-    return text
+
+# سازگاری با اسم قبلی؛ از این به بعد جزئیات اصلی خلاصه است.
+def _fmt_user_detail(user_id):
+    return _fmt_user_summary(user_id)
+
+
 
 
 async def cmd_admin(m: types.Message):
@@ -446,9 +666,69 @@ async def cb_user_detail(c: types.CallbackQuery):
         return await c.answer()
     await c.answer()
     user_id = c.data.split("adm_user_", 1)[1]
-    await _send_long(c.message, _fmt_user_detail(user_id), reply_markup=user_detail_kb(user_id))
-    if subs.user_subs(user_id, limit=1):
-        await c.message.answer("🔁 عملیات سریع روی سرویس‌های این کاربر:", reply_markup=user_services_kb(user_id))
+    await _replace_callback_message(
+        c,
+        _fmt_user_summary(user_id),
+        reply_markup=user_detail_kb(user_id),
+        context="admin_user_summary",
+        kind="menu",
+    )
+
+
+async def cb_user_history(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_user_history_", 1)[1]
+    text, purchases, owned = _fmt_user_history(user_id)
+    await _replace_callback_message(c, text, reply_markup=user_history_kb(user_id, purchases, owned), context="admin_user_history", kind="list")
+
+
+async def cb_user_purchase_detail(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    payload = c.data.replace("adm_user_purchase_", "", 1)
+    purchase_id, user_id = payload.split("_", 1)
+    text, services = _fmt_purchase_detail(user_id, purchase_id)
+    await _replace_callback_message(c, text, reply_markup=purchase_detail_kb(user_id, purchase_id, services), context="admin_user_purchase", kind="list")
+
+
+async def cb_user_service_detail(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    payload = c.data.replace("adm_user_sub_detail_", "", 1)
+    sub_id, user_id = payload.split("_", 1)
+    text, item = _fmt_service_detail(user_id, sub_id)
+    if not item:
+        return await _replace_callback_message(c, text, reply_markup=user_detail_kb(user_id), context="admin_service_detail", kind="list")
+    purchase_id = item["purchase_id"] if item else None
+    await _replace_callback_message(c, text, reply_markup=service_detail_kb(user_id, sub_id, purchase_id), context="admin_service_detail", kind="list")
+
+
+async def cb_user_finance(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_user_finance_", 1)[1]
+    await _replace_callback_message(c, _fmt_user_finance(user_id), reply_markup=user_detail_kb(user_id), context="admin_user_finance", kind="list")
+
+
+async def cb_user_referral(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_user_referral_", 1)[1]
+    await _replace_callback_message(c, _fmt_user_referral(user_id), reply_markup=user_detail_kb(user_id), context="admin_user_referral", kind="list")
+
+
+async def cb_user_tickets(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_user_tickets_", 1)[1]
+    await _replace_callback_message(c, _fmt_user_tickets(user_id), reply_markup=user_detail_kb(user_id), context="admin_user_tickets", kind="list")
 
 
 async def cb_user_profile_info(c: types.CallbackQuery):
@@ -508,7 +788,9 @@ async def process_user_note(m: types.Message, state: FSMContext):
     db.set_user_admin_note(user_id, note)
     db.log_admin_action(m.from_user.id, "user_note_update", user_id, f"note_len={len(note)}")
     await state.finish()
-    await m.answer("✅ یادداشت ادمین ذخیره شد.\n\n" + _fmt_user_detail(user_id), reply_markup=user_detail_kb(user_id))
+    await _admin_cleanup_tracked(m.chat.id, m.from_user.id)
+    sent = await m.answer("✅ یادداشت ادمین ذخیره شد.\n\n" + _fmt_user_summary(user_id), reply_markup=user_detail_kb(user_id))
+    await _track_admin_sent(m.from_user.id, sent, context="admin_user_summary", kind="menu")
 
 
 async def cb_user_test_toggle(c: types.CallbackQuery):
@@ -521,7 +803,7 @@ async def cb_user_test_toggle(c: types.CallbackQuery):
     db.toggle_user_test(user_id)
     user = db.get_user(user_id)
     db.log_admin_action(c.from_user.id, "toggle_test_user", user_id, f"is_test={user['is_test'] if 'is_test' in user.keys() else '-'}")
-    await _replace_callback_message(c, "✅ وضعیت کاربر تست تغییر کرد.\n\n" + _fmt_user_detail(user_id), reply_markup=user_detail_kb(user_id))
+    await _replace_callback_message(c, "✅ وضعیت کاربر تست تغییر کرد.\n\n" + _fmt_user_summary(user_id), reply_markup=user_detail_kb(user_id))
 
 
 async def cb_direct_message_start(c: types.CallbackQuery, state: FSMContext):
@@ -560,9 +842,12 @@ async def process_direct_message(m: types.Message, state: FSMContext):
         await bot.send_message(int(user_id), body, reply_markup=menus.main_reply_kb(user_id))
         db.log_admin_action(m.from_user.id, "send_direct_message", user_id, f"len={len(m.text.strip())}")
         await state.finish()
-        await m.answer("✅ پیام برای کاربر ارسال شد.", reply_markup=user_detail_kb(user_id))
+        await _admin_cleanup_tracked(m.chat.id, m.from_user.id)
+        sent = await m.answer("✅ پیام برای کاربر ارسال شد.", reply_markup=user_detail_kb(user_id))
+        await _track_admin_sent(m.from_user.id, sent, context="admin_user_summary", kind="menu")
     except Exception as exc:
-        await m.answer(f"❌ ارسال پیام ناموفق بود: {exc}", reply_markup=user_detail_kb(user_id))
+        sent = await m.answer(f"❌ ارسال پیام ناموفق بود: {exc}", reply_markup=user_detail_kb(user_id))
+        await _track_admin_sent(m.from_user.id, sent, context="admin_user_summary", kind="menu")
 
 
 
@@ -570,12 +855,11 @@ async def cb_resend_link(c: types.CallbackQuery):
     bot = Bot.get_current()
     if not is_admin(c.from_user.id):
         return await c.answer()
-    await c.answer()
     payload = c.data.replace("adm_resend_link_", "", 1)
     sub_id, user_id = payload.split("_", 1)
     item = subs.get_sub_detail(sub_id)
     if not item or str(item["owner"]) != str(user_id):
-        return await c.message.answer("این سرویس برای این کاربر پیدا نشد.", reply_markup=admin_back_kb())
+        return await c.answer("این سرویس برای این کاربر پیدا نشد.", show_alert=True)
     try:
         await bot.send_message(
             int(user_id),
@@ -585,21 +869,21 @@ async def cb_resend_link(c: types.CallbackQuery):
             f"لینک:\n{item['link']}",
             reply_markup=menus.main_reply_kb(user_id),
         )
-        await c.message.answer("✅ لینک سرویس دوباره برای کاربر ارسال شد.", reply_markup=user_services_kb(user_id))
+        db.log_admin_action(c.from_user.id, "resend_service_link", user_id, f"sub_id={sub_id}")
+        await c.answer("✅ لینک سرویس برای کاربر ارسال شد.", show_alert=False)
     except Exception:
-        await c.message.answer("❌ ارسال لینک به کاربر ناموفق بود.", reply_markup=user_services_kb(user_id))
+        await c.answer("❌ ارسال لینک به کاربر ناموفق بود.", show_alert=True)
 
 
 async def cb_resend_qr(c: types.CallbackQuery):
     bot = Bot.get_current()
     if not is_admin(c.from_user.id):
         return await c.answer()
-    await c.answer()
     payload = c.data.replace("adm_resend_qr_", "", 1)
     sub_id, user_id = payload.split("_", 1)
     item = subs.get_sub_detail(sub_id)
     if not item or str(item["owner"]) != str(user_id):
-        return await c.message.answer("این سرویس برای این کاربر پیدا نشد.", reply_markup=admin_back_kb())
+        return await c.answer("این سرویس برای این کاربر پیدا نشد.", show_alert=True)
 
     qr_path = make_qr(item["link"], user_id)
     try:
@@ -614,9 +898,10 @@ async def cb_resend_qr(c: types.CallbackQuery):
                 ),
                 reply_markup=menus.main_reply_kb(user_id),
             )
-        await c.message.answer("✅ QR سرویس دوباره برای کاربر ارسال شد.", reply_markup=user_services_kb(user_id))
+        db.log_admin_action(c.from_user.id, "resend_service_qr", user_id, f"sub_id={sub_id}")
+        await c.answer("✅ QR سرویس برای کاربر ارسال شد.", show_alert=False)
     except Exception:
-        await c.message.answer("❌ ارسال QR به کاربر ناموفق بود.", reply_markup=user_services_kb(user_id))
+        await c.answer("❌ ارسال QR به کاربر ناموفق بود.", show_alert=True)
     finally:
         cleanup_qr(qr_path)
 
@@ -637,12 +922,13 @@ async def process_search(m: types.Message, state: FSMContext):
         return await m.answer("لطفا آیدی یا یوزرنیم رو به‌صورت متن بفرستید.", reply_markup=cancel_kb())
     rows = db.search_users(m.text)
     await state.finish()
+    await _admin_cleanup_tracked(m.chat.id, m.from_user.id)
     if not rows:
-        return await m.answer("چیزی پیدا نشد.", reply_markup=admin_back_kb())
+        sent = await m.answer("چیزی پیدا نشد.", reply_markup=admin_back_kb())
+        await _track_admin_sent(m.from_user.id, sent, context="admin_search_empty", kind="menu")
+        return
     for r in rows[:10]:
-        await _send_long(m, _fmt_user_detail(r["id"]), reply_markup=user_detail_kb(r["id"]))
-        if subs.user_subs(r["id"], limit=1):
-            await m.answer("🔁 عملیات سریع روی سرویس‌های این کاربر:", reply_markup=user_services_kb(r["id"]))
+        await _send_long(m, _fmt_user_summary(r["id"]), reply_markup=user_detail_kb(r["id"]), owner_user_id=m.from_user.id, context="admin_user_search_result", kind="list")
 
 
 async def cb_addbal(c: types.CallbackQuery):
@@ -3108,7 +3394,13 @@ def register(dp):
 
     dp.register_callback_query_handler(cb_users, lambda c: c.data == "adm_users")
     dp.register_callback_query_handler(cb_user_profile_info, lambda c: c.data.startswith("adm_user_profile_"))
-    dp.register_callback_query_handler(cb_user_detail, lambda c: c.data.startswith("adm_user_") and not c.data.startswith(("adm_user_note_", "adm_user_test_", "adm_user_profile_")))
+    dp.register_callback_query_handler(cb_user_history, lambda c: c.data.startswith("adm_user_history_"))
+    dp.register_callback_query_handler(cb_user_purchase_detail, lambda c: c.data.startswith("adm_user_purchase_"))
+    dp.register_callback_query_handler(cb_user_service_detail, lambda c: c.data.startswith("adm_user_sub_detail_"))
+    dp.register_callback_query_handler(cb_user_finance, lambda c: c.data.startswith("adm_user_finance_"))
+    dp.register_callback_query_handler(cb_user_referral, lambda c: c.data.startswith("adm_user_referral_"))
+    dp.register_callback_query_handler(cb_user_tickets, lambda c: c.data.startswith("adm_user_tickets_"))
+    dp.register_callback_query_handler(cb_user_detail, lambda c: c.data.startswith("adm_user_") and not c.data.startswith(("adm_user_note_", "adm_user_test_", "adm_user_profile_", "adm_user_history_", "adm_user_purchase_", "adm_user_sub_detail_", "adm_user_finance_", "adm_user_referral_", "adm_user_tickets_")))
     dp.register_callback_query_handler(cb_user_note, lambda c: c.data.startswith("adm_user_note_"))
     dp.register_message_handler(process_user_note, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_user_note)
     dp.register_callback_query_handler(cb_user_test_toggle, lambda c: c.data.startswith("adm_user_test_"))
