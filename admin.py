@@ -56,8 +56,45 @@ class AdminStates(StatesGroup):
     waiting_broadcast_confirm = State()
 
 
-def cancel_kb():
-    return InlineKeyboardMarkup().add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
+def cancel_kb(back_callback="fsm_back", back_label="⬅️ برگشت"):
+    """
+    کیبورد مشترک فرم‌ها و ویزاردهای ادمین.
+    - برگشت: تلاش می‌کند به مرحله/بخش قبلی همان جریان برگردد.
+    - لغو: کل state جاری را می‌بندد.
+    """
+    kb = InlineKeyboardMarkup(row_width=1)
+    if back_callback:
+        kb.add(InlineKeyboardButton(back_label, callback_data=back_callback))
+    kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
+    return kb
+
+
+def _button_type_select_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    for btype, label in [
+        ("text", "📝 متنی"),
+        ("link", "🔗 لینک‌دار"),
+        ("guide", "📚 آموزشی"),
+        ("buy_plan", "🛒 خرید پلن"),
+        ("support", "🎫 پشتیبانی"),
+        ("submenu", "📂 زیرمنو"),
+    ]:
+        kb.insert(InlineKeyboardButton(label, callback_data=f"btn_wizard_type_{btype}"))
+    kb.add(InlineKeyboardButton("⚙️ فرم پیشرفته", callback_data="btn_create_advanced"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_buttons"))
+    return kb
+
+
+def _plan_wizard_step_text(step):
+    prompts = {
+        "title": "➕ ساخت سریع پلن\n\nمرحله ۱ از ۶\nعنوان پلن را بفرستید.\nمثال: 50GB یک‌ماهه",
+        "volume": "مرحله ۲ از ۶\nحجم پلن را بفرستید.\nمثال: 50GB\nاگر حجم نمی‌خواهید، - بفرستید.",
+        "duration": "مرحله ۳ از ۶\nمدت پلن را بفرستید.\nمثال: 30 روز",
+        "price": "مرحله ۴ از ۶\nقیمت فروش را فقط عددی بفرستید.\nمثال: 180000",
+        "low_stock": "مرحله ۵ از ۶\nحد هشدار موجودی را بفرستید.\nمثال: 5",
+        "description": "مرحله ۶ از ۶\nتوضیح کوتاه پلن را بفرستید.\nمثال: مناسب استفاده روزمره\nاگر توضیح نمی‌خواهید، - بفرستید.",
+    }
+    return prompts.get(step, prompts["title"])
 
 
 def admin_back_kb():
@@ -282,6 +319,151 @@ async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_mar
 
     sent = await c.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
     await _track_admin_sent(c.from_user.id, sent, context=context, kind=kind)
+
+
+async def cb_fsm_back(c: types.CallbackQuery, state: FSMContext):
+    """
+    برگشت هوشمند داخل فرم‌ها/ویزاردهای ادمین.
+    برخلاف لغو، تلاش می‌کند کاربر را به مرحله یا منوی قبلی همان بخش برگرداند.
+    """
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+
+    await c.answer()
+    current_state = await state.get_state()
+    data = await state.get_data()
+
+    # ویزارد ساخت سریع پلن: برگشت مرحله‌ای
+    if current_state and current_state.endswith("waiting_plan_form") and data.get("plan_action") == "create_wizard":
+        step = data.get("plan_step") or "title"
+        back_map = {
+            "volume": "title",
+            "duration": "volume",
+            "price": "duration",
+            "low_stock": "price",
+            "description": "low_stock",
+            "confirm": "description",
+        }
+        if step == "title":
+            await state.finish()
+            return await _replace_callback_message(c, "🏷 مدیریت پلن‌ها", reply_markup=plans_menu_kb())
+        prev_step = back_map.get(step, "title")
+        await state.update_data(plan_step=prev_step)
+        return await _replace_callback_message(c, _plan_wizard_step_text(prev_step), reply_markup=cancel_kb(), cleanup=False)
+
+    # ویرایش فرم کامل پلن
+    if current_state and current_state.endswith("waiting_plan_form") and data.get("plan_action") == "edit":
+        plan_id = data.get("plan_id")
+        await state.finish()
+        plan = db.get_plan(plan_id) if plan_id else None
+        if plan:
+            return await _replace_callback_message(c, _fmt_plan(plan), reply_markup=plan_detail_kb(plan_id))
+        return await _replace_callback_message(c, "🏷 مدیریت پلن‌ها", reply_markup=plans_menu_kb())
+
+    if current_state and current_state.endswith("waiting_plan_setting_value"):
+        plan_id = data.get("plan_setting_plan_id")
+        await state.finish()
+        if plan_id and db.get_plan(plan_id):
+            return await _replace_callback_message(c, _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_settings_kb(plan_id))
+        return await _replace_callback_message(c, "🏷 مدیریت پلن‌ها", reply_markup=plans_menu_kb())
+
+    # یادداشت و پیام مستقیم کاربر
+    if current_state and current_state.endswith("waiting_user_note"):
+        user_id = data.get("note_user_id")
+        await state.finish()
+        if user_id:
+            return await _replace_callback_message(c, _fmt_user_summary(user_id), reply_markup=user_detail_kb(user_id))
+
+    if current_state and current_state.endswith("waiting_direct_message"):
+        user_id = data.get("direct_user_id")
+        await state.finish()
+        if user_id:
+            return await _replace_callback_message(c, _fmt_user_summary(user_id), reply_markup=user_detail_kb(user_id))
+
+    # تغییر موجودی: اگر در مرحله مبلغ هستیم، به مرحله ورود کاربر برگردد.
+    if current_state and current_state.endswith("waiting_balance_amount"):
+        await state.set_state(AdminStates.waiting_balance_id.state)
+        data.pop("target_id", None)
+        await state.set_data(data)
+        return await _replace_callback_message(c, "آیدی کاربر رو بفرستید:", reply_markup=cancel_kb(), cleanup=False)
+
+    if current_state and current_state.endswith(("waiting_search", "waiting_balance_id", "waiting_ban_id", "waiting_unban_id")):
+        await state.finish()
+        return await _replace_callback_message(c, "👥 مدیریت کاربران", reply_markup=admin_users_section_kb())
+
+    # مدیریت لینک‌ها و افزودن لینک به پلن
+    if current_state and current_state.endswith("waiting_add_sub"):
+        plan_id = data.get("add_sub_plan_id")
+        await state.finish()
+        if plan_id and db.get_plan(plan_id):
+            return await _replace_callback_message(c, _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_detail_kb(plan_id))
+        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=links_menu_kb())
+
+    if current_state and current_state.endswith(("waiting_link_search", "waiting_link_delete_id")):
+        await state.finish()
+        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=links_menu_kb())
+
+    # تنظیمات عمومی
+    if current_state and current_state.endswith("waiting_setting_value"):
+        await state.finish()
+        return await _replace_callback_message(c, "⚙️ تنظیمات کل ربات", reply_markup=settings_menu_kb())
+
+    # مدیریت پیام‌ها
+    if current_state and current_state.endswith("waiting_message_edit"):
+        key = data.get("message_key")
+        await state.finish()
+        if key and messages.is_valid_key(key):
+            label = dict(messages.MESSAGE_KEYS).get(key, key)
+            return await _replace_callback_message(c, f"📝 مدیریت متن: {label}", reply_markup=message_action_kb(key))
+        return await _replace_callback_message(c, "📝 مدیریت پیام‌ها", reply_markup=messages_menu_kb())
+
+    # دکمه‌های سیستمی
+    if current_state and current_state.endswith(("waiting_system_button_title", "waiting_system_button_order", "waiting_system_button_location")):
+        key = data.get("sys_button_key")
+        await state.finish()
+        row = db.get_system_button(key) if key else None
+        if row:
+            return await _replace_callback_message(c, _fmt_system_button(row), reply_markup=system_button_detail_kb(key))
+        return await _replace_callback_message(c, "🧩 دکمه‌های فعلی ربات", reply_markup=system_buttons_list_kb())
+
+    # ویزارد ساخت دکمه اختصاصی
+    if current_state and current_state.endswith("waiting_custom_button_payload"):
+        await state.set_state(AdminStates.waiting_custom_button_title.state)
+        await state.update_data(button_title=None)
+        return await _replace_callback_message(c, "عنوان دکمه را بفرستید.\nمثال: 📚 آموزش آیفون", reply_markup=cancel_kb(), cleanup=False)
+
+    if current_state and current_state.endswith("waiting_custom_button_title"):
+        await state.finish()
+        return await _replace_callback_message(c, "➕ ساخت دکمه جدید\n\nاول نوع دکمه را انتخاب کنید:", reply_markup=_button_type_select_kb())
+
+    if current_state and current_state.endswith("waiting_custom_button_form"):
+        button_id = data.get("button_id")
+        await state.finish()
+        row = db.get_custom_button(button_id) if button_id else None
+        if row:
+            return await _replace_callback_message(c, _fmt_custom_button(row), reply_markup=custom_button_detail_kb(button_id))
+        return await _replace_callback_message(c, "🎛 مدیریت دکمه‌ها", reply_markup=custom_buttons_menu_kb())
+
+    if current_state and current_state.endswith(("waiting_button_order", "waiting_button_location")):
+        button_id = data.get("button_id")
+        await state.finish()
+        row = db.get_custom_button(button_id) if button_id else None
+        if row:
+            return await _replace_callback_message(c, _fmt_custom_button(row), reply_markup=custom_button_detail_kb(button_id))
+        return await _replace_callback_message(c, "🎛 مدیریت دکمه‌ها", reply_markup=custom_buttons_menu_kb())
+
+    # پیام همگانی و ری‌استور
+    if current_state and current_state.endswith("waiting_broadcast_content"):
+        await state.finish()
+        return await _replace_callback_message(c, "📣 پیام همگانی", reply_markup=broadcast_scope_menu_kb())
+
+    if current_state and current_state.endswith("waiting_restore_file"):
+        await state.finish()
+        return await _replace_callback_message(c, "💾 بک‌آپ و امنیت", reply_markup=backup_menu_kb())
+
+    # fallback امن
+    await state.finish()
+    return await _replace_callback_message(c, "🏠 پنل مدیریت", reply_markup=admin_menu_kb())
 
 
 def user_detail_kb(user_id):
@@ -1403,6 +1585,7 @@ async def cb_addsub(c: types.CallbackQuery, state: FSMContext):
         kb = InlineKeyboardMarkup(row_width=1)
         for plan in plans:
             kb.add(InlineKeyboardButton(f"#{plan['id']} {plan['title']} | {_fmt_money(plan['price'])}", callback_data=f"adm_addsub_plan_{plan['id']}"))
+        kb.add(InlineKeyboardButton("⬅️ برگشت به سرویس‌ها و پلن‌ها", callback_data="adm_section_services"))
         kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
         return await _replace_callback_message(
             c,
@@ -1783,8 +1966,9 @@ def _plan_wizard_preview(data):
 
 
 def _plan_wizard_confirm_kb():
-    kb = InlineKeyboardMarkup(row_width=2)
+    kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("✅ ثبت پلن", callback_data="plan_wizard_save"))
+    kb.add(InlineKeyboardButton("⬅️ برگشت به مرحله قبل", callback_data="fsm_back"))
     kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
     return kb
 
@@ -2708,20 +2892,8 @@ async def cb_button_create(c: types.CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
-    kb = InlineKeyboardMarkup(row_width=2)
-    for btype, label in [
-        ("text", "📝 متنی"),
-        ("link", "🔗 لینک‌دار"),
-        ("guide", "📚 آموزشی"),
-        ("buy_plan", "🛒 خرید پلن"),
-        ("support", "🎫 پشتیبانی"),
-        ("submenu", "📂 زیرمنو"),
-    ]:
-        kb.insert(InlineKeyboardButton(label, callback_data=f"btn_wizard_type_{btype}"))
-    kb.add(InlineKeyboardButton("⚙️ فرم پیشرفته", callback_data="btn_create_advanced"))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_buttons"))
     await state.update_data(button_action="create")
-    await _replace_callback_message(c, "➕ ساخت دکمه جدید\n\nاول نوع دکمه را انتخاب کنید:", reply_markup=kb)
+    await _replace_callback_message(c, "➕ ساخت دکمه جدید\n\nاول نوع دکمه را انتخاب کنید:", reply_markup=_button_type_select_kb())
 
 
 async def cb_button_create_advanced(c: types.CallbackQuery, state: FSMContext):
@@ -3391,6 +3563,7 @@ def register(dp):
     dp.register_callback_query_handler(cb_section_finance, lambda c: c.data == "adm_section_finance")
     dp.register_callback_query_handler(cb_section_personalize, lambda c: c.data == "adm_section_personalize")
     dp.register_callback_query_handler(cb_section_reports, lambda c: c.data == "adm_section_reports")
+    dp.register_callback_query_handler(cb_fsm_back, lambda c: c.data == "fsm_back", state="*")
 
     dp.register_callback_query_handler(cb_users, lambda c: c.data == "adm_users")
     dp.register_callback_query_handler(cb_user_profile_info, lambda c: c.data.startswith("adm_user_profile_"))
