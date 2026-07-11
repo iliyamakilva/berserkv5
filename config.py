@@ -29,6 +29,13 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _get_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Hidden command used instead of /admin.
@@ -59,6 +66,27 @@ MAX_REFERRALS_PER_DAY = max(0, _get_int("MAX_REFERRALS_PER_DAY", 10) or 0)
 BROADCAST_DELAY = max(0.0, _get_float("BROADCAST_DELAY", 0.08))
 BACKUP_INTERVAL_SECONDS = max(3600, _get_int("BACKUP_INTERVAL_SECONDS", 24 * 60 * 60) or 0)
 BACKUP_RETENTION_COUNT = max(1, _get_int("BACKUP_RETENTION_COUNT", 30) or 30)
+
+# Optional YouPanel integration. Credentials must be configured only as
+# environment variables; access tokens are acquired at runtime and never
+# persisted in SQLite or log output.
+YOUPANEL_BASE_URL = os.getenv("YOUPANEL_BASE_URL", "").strip().rstrip("/")
+YOUPANEL_USERNAME = os.getenv("YOUPANEL_USERNAME", "").strip()
+YOUPANEL_PASSWORD = os.getenv("YOUPANEL_PASSWORD", "")
+YOUPANEL_TIMEOUT_SECONDS = max(5, _get_int("YOUPANEL_TIMEOUT_SECONDS", 20) or 20)
+YOUPANEL_VERIFY_SSL = _get_bool("YOUPANEL_VERIFY_SSL", True)
+YOUPANEL_INBOUNDS_JSON = os.getenv(
+    "YOUPANEL_INBOUNDS_JSON",
+    '{"vless":["RTL-1","VLESS + WS","tcp","TUN"]}',
+).strip()
+YOUPANEL_TRIAL_ENABLED = _get_bool("YOUPANEL_TRIAL_ENABLED", True)
+YOUPANEL_TRIAL_SIZE_MB = max(1, _get_int("YOUPANEL_TRIAL_SIZE_MB", 200) or 200)
+YOUPANEL_TRIAL_DAYS = max(1, _get_int("YOUPANEL_TRIAL_DAYS", 1) or 1)
+YOUPANEL_TRIAL_MAX_DEVICES = max(1, _get_int("YOUPANEL_TRIAL_MAX_DEVICES", 1) or 1)
+
+
+def youpanel_configured() -> bool:
+    return bool(YOUPANEL_BASE_URL and YOUPANEL_USERNAME and YOUPANEL_PASSWORD)
 
 
 def validate() -> None:

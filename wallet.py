@@ -9,6 +9,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 import db
 import menus
 import settings
+import subs
 from affiliate import reward_ref
 from config import ADMIN_IDS
 from utils import cleanup_qr, make_qr, parse_int
@@ -198,13 +199,23 @@ async def cb_confirm(c: types.CallbackQuery):
     if target_qty and target_plan_id and not topup["purchase_completed_at"]:
         was_first_purchase = int(user["purchased"] or 0) == 0 if user else False
         try:
-            result = db.complete_purchase(
-                topup["user_id"],
-                int(target_qty),
-                int(target_unit_price) if target_unit_price else None,
-                note=f"auto_after_topup_id={topup_id}",
-                plan_id=int(target_plan_id),
-            )
+            plan = db.get_plan(int(target_plan_id))
+            if plan and db.plan_delivery_type(plan) == "youpanel":
+                result = await subs.provision_panel_purchase(
+                    topup["user_id"],
+                    int(target_qty),
+                    int(target_plan_id),
+                    int(target_unit_price) if target_unit_price else None,
+                    note=f"auto_after_topup_id={topup_id}",
+                )
+            else:
+                result = db.complete_purchase(
+                    topup["user_id"],
+                    int(target_qty),
+                    int(target_unit_price) if target_unit_price else None,
+                    note=f"auto_after_topup_id={topup_id}",
+                    plan_id=int(target_plan_id),
+                )
             db.mark_topup_purchase_completed(topup_id)
             new_balance = result["balance_after"]
             plan = db.get_plan(target_plan_id)

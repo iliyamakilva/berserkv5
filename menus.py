@@ -1,7 +1,7 @@
 import logging
 
 from aiogram import types
-from config import ADMIN_IDS
+from config import ADMIN_IDS, YOUPANEL_TRIAL_ENABLED, youpanel_configured
 
 logger = logging.getLogger(__name__)
 
@@ -10,6 +10,7 @@ BTN_BUY = "🛒 خرید سرویس"
 BTN_MY_SUBS = "📦 سرویس‌های من"
 BTN_WALLET = "💳 کیف پول"
 BTN_GUIDE = "📚 آموزش اتصال"
+BTN_TRIAL = "🧪 اکانت تست"
 BTN_REFERRAL = "👥 دعوت دوستان"
 BTN_TICKET = "🎫 پشتیبانی"
 BTN_ADMIN = "⚙️ مدیریت"
@@ -20,6 +21,7 @@ DEFAULT_SYSTEM_BUTTON_TITLES = {
     "my_subs": BTN_MY_SUBS,
     "wallet": BTN_WALLET,
     "guide": BTN_GUIDE,
+    "trial": BTN_TRIAL,
     "referral": BTN_REFERRAL,
     "ticket": BTN_TICKET,
     "admin": BTN_ADMIN,
@@ -65,6 +67,7 @@ def system_buttons_for_location(location="main", user_id=None):
         ("my_subs", BTN_MY_SUBS),
         ("wallet", BTN_WALLET),
         ("guide", BTN_GUIDE),
+        ("trial", BTN_TRIAL),
         ("referral", BTN_REFERRAL),
         ("ticket", BTN_TICKET),
     ]
@@ -75,6 +78,8 @@ def system_buttons_for_location(location="main", user_id=None):
         for row in rows:
             key = row["key"]
             if key == "admin" and not is_admin_user(user_id):
+                continue
+            if key == "trial" and (not YOUPANEL_TRIAL_ENABLED or not youpanel_configured()):
                 continue
             result.append((key, row["title"] or row["default_title"]))
         return result

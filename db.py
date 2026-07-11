@@ -10,7 +10,7 @@ from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 600
+SCHEMA_VERSION = 610
 
 _db_parent = Path(DB_PATH).expanduser().parent
 if str(_db_parent) not in ("", "."):
@@ -340,6 +340,20 @@ def init():
 
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS trial_claims(
+                user_id TEXT PRIMARY KEY,
+                panel_username TEXT UNIQUE,
+                sub_id INTEGER,
+                status TEXT DEFAULT 'pending',
+                error TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS plans(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -415,6 +429,26 @@ def init():
         _add_column_if_missing("messages", "published_at", "TEXT")
         _add_column_if_missing("plans", "pre_purchase_text", "TEXT DEFAULT ''")
         _add_column_if_missing("plans", "post_purchase_text", "TEXT DEFAULT ''")
+        _add_column_if_missing("plans", "delivery_type", "TEXT DEFAULT 'pool'")
+        _add_column_if_missing("plans", "panel_data_limit_bytes", "INTEGER DEFAULT 0")
+        _add_column_if_missing("plans", "panel_duration_days", "INTEGER DEFAULT 0")
+        _add_column_if_missing("plans", "panel_start_mode", "TEXT DEFAULT 'on_hold'")
+        _add_column_if_missing("plans", "panel_reset_strategy", "TEXT DEFAULT 'no_reset'")
+        _add_column_if_missing("plans", "panel_max_devices", "INTEGER")
+        _add_column_if_missing("subs", "source_type", "TEXT DEFAULT 'pool'")
+        _add_column_if_missing("subs", "panel_provider", "TEXT")
+        _add_column_if_missing("subs", "panel_username", "TEXT")
+        _add_column_if_missing("subs", "panel_status", "TEXT")
+        _add_column_if_missing("subs", "panel_data_limit", "INTEGER")
+        _add_column_if_missing("subs", "panel_used_traffic", "INTEGER DEFAULT 0")
+        _add_column_if_missing("subs", "panel_expires_at", "INTEGER")
+        _add_column_if_missing("subs", "panel_duration_seconds", "INTEGER")
+        _add_column_if_missing("subs", "is_trial", "INTEGER DEFAULT 0")
+        _add_column_if_missing("subs", "last_synced_at", "TEXT")
+        _add_column_if_missing("purchases", "provider", "TEXT DEFAULT 'pool'")
+        _add_column_if_missing("purchases", "provision_error", "TEXT")
+        _add_column_if_missing("purchases", "completed_at", "TEXT")
+        _add_column_if_missing("purchases", "refunded_at", "TEXT")
         _add_column_if_missing("bot_messages", "kind", "TEXT DEFAULT 'menu'")
         _add_column_if_missing("purchases", "is_test", "INTEGER DEFAULT 0")
         _add_column_if_missing("topups", "is_test", "INTEGER DEFAULT 0")
@@ -436,6 +470,9 @@ def init():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user_created ON ledger(user_id, created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_purchase_items_sub ON purchase_items(sub_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_source_owner ON subs(source_type, owner, used)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_panel_username ON subs(panel_username) WHERE panel_username IS NOT NULL AND TRIM(panel_username)<>''")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trial_claims_status ON trial_claims(status, updated_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_status ON tickets(user_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_messages_user ON bot_messages(user_id, created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON admin_logs(created_at)")
@@ -478,6 +515,9 @@ def init():
 
         cur.execute("UPDATE subs SET status='available' WHERE status IS NULL AND used=0")
         cur.execute("UPDATE subs SET status='delivered' WHERE status IS NULL AND used=1")
+        cur.execute("UPDATE subs SET source_type='pool' WHERE source_type IS NULL OR TRIM(source_type)=''")
+        cur.execute("UPDATE plans SET delivery_type='pool' WHERE delivery_type IS NULL OR TRIM(delivery_type)=''")
+        cur.execute("UPDATE purchases SET provider='pool' WHERE provider IS NULL OR TRIM(provider)=''")
         cur.execute("UPDATE purchases SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
         cur.execute("UPDATE topups SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
         cur.execute("UPDATE ledger SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
@@ -1178,6 +1218,8 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
         raise PurchaseError("plan_not_found", "پلن پیدا نشد.")
     if int(plan["is_active"] or 0) != 1:
         raise PurchaseError("plan_inactive", "این پلن در حال حاضر فعال نیست.")
+    if (plan["delivery_type"] if "delivery_type" in plan.keys() else "pool") != "pool":
+        raise PurchaseError("wrong_delivery_type", "این پلن باید از پنل به‌صورت خودکار ساخته شود.")
     max_per_order = max(1, min(4, int(plan["max_per_order"] or 4)))
     if quantity < 1 or quantity > max_per_order:
         raise PurchaseError("invalid_quantity", "تعداد انتخاب‌شده برای این پلن معتبر نیست.")
@@ -1197,7 +1239,7 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
             if balance_before < total:
                 raise PurchaseError("insufficient_balance", "موجودی کیف پول کافی نیست.")
 
-            cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND plan_id=?", (plan_id,))
+            cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND plan_id=? AND COALESCE(source_type,'pool')='pool'", (plan_id,))
             stock = int(cur.fetchone()["c"])
             if stock < quantity:
                 raise PurchaseError("insufficient_stock", "موجودی سرویس کافی نیست.")
@@ -1221,7 +1263,7 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
                 (user_id, -total, balance_before, balance_after, f"purchase_id={purchase_id}", is_test),
             )
 
-            cur.execute("SELECT * FROM subs WHERE used=0 AND plan_id=? ORDER BY id LIMIT ?", (plan_id, quantity))
+            cur.execute("SELECT * FROM subs WHERE used=0 AND plan_id=? AND COALESCE(source_type,'pool')='pool' ORDER BY id LIMIT ?", (plan_id, quantity))
             available = cur.fetchall()
             items = []
 
@@ -1703,6 +1745,7 @@ DEFAULT_SYSTEM_BUTTONS = [
     ("my_subs", "📦 سرویس‌های من", "main", 20),
     ("wallet", "💳 کیف پول", "main", 30),
     ("guide", "📚 آموزش اتصال", "main", 40),
+    ("trial", "🧪 اکانت تست", "main", 45),
     ("referral", "👥 دعوت دوستان", "main", 50),
     ("ticket", "🎫 پشتیبانی", "main", 60),
     ("admin", "⚙️ مدیریت", "main", 900),
@@ -1778,8 +1821,9 @@ def create_plan(data):
         """
         INSERT INTO plans(title, volume_label, duration_label, price, description, sort_order,
                           is_active, max_per_order, cost_price, tag, show_stock, low_stock_threshold,
-                          pre_purchase_text, post_purchase_text)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          pre_purchase_text, post_purchase_text, delivery_type, panel_data_limit_bytes,
+                          panel_duration_days, panel_start_mode, panel_reset_strategy, panel_max_devices)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             title,
@@ -1796,6 +1840,12 @@ def create_plan(data):
             int(data.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
             (data.get("pre_purchase_text") or "").strip(),
             (data.get("post_purchase_text") or "").strip(),
+            "youpanel" if (data.get("delivery_type") or "pool") == "youpanel" else "pool",
+            max(0, int(data.get("panel_data_limit_bytes") or 0)),
+            max(0, int(data.get("panel_duration_days") or 0)),
+            "active" if (data.get("panel_start_mode") or "on_hold") == "active" else "on_hold",
+            (data.get("panel_reset_strategy") or "no_reset").strip() or "no_reset",
+            int(data["panel_max_devices"]) if data.get("panel_max_devices") not in (None, "") else None,
         ),
     )
     conn.commit()
@@ -1818,7 +1868,9 @@ def update_plan(plan_id, data):
         UPDATE plans
         SET title=?, volume_label=?, duration_label=?, price=?, description=?, sort_order=?,
             is_active=?, max_per_order=?, cost_price=?, tag=?, show_stock=?, low_stock_threshold=?,
-            pre_purchase_text=?, post_purchase_text=?, updated_at=datetime('now')
+            pre_purchase_text=?, post_purchase_text=?, delivery_type=?, panel_data_limit_bytes=?,
+            panel_duration_days=?, panel_start_mode=?, panel_reset_strategy=?, panel_max_devices=?,
+            updated_at=datetime('now')
         WHERE id=?
         """,
         (
@@ -1836,6 +1888,12 @@ def update_plan(plan_id, data):
             int(merged.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
             (merged.get("pre_purchase_text") or "").strip(),
             (merged.get("post_purchase_text") or "").strip(),
+            "youpanel" if (merged.get("delivery_type") or "pool") == "youpanel" else "pool",
+            max(0, int(merged.get("panel_data_limit_bytes") or 0)),
+            max(0, int(merged.get("panel_duration_days") or 0)),
+            "active" if (merged.get("panel_start_mode") or "on_hold") == "active" else "on_hold",
+            (merged.get("panel_reset_strategy") or "no_reset").strip() or "no_reset",
+            int(merged["panel_max_devices"]) if merged.get("panel_max_devices") not in (None, "") else None,
             int(plan_id),
         ),
     )
@@ -1856,7 +1914,7 @@ def toggle_plan(plan_id):
 
 
 def plan_stock_count(plan_id):
-    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND plan_id=?", (int(plan_id),))
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND plan_id=? AND COALESCE(source_type,'pool')='pool'", (int(plan_id),))
     return int(cur.fetchone()["c"] or 0)
 
 
@@ -2022,6 +2080,366 @@ def mark_topup_purchase_completed(topup_id):
     cur.execute("UPDATE topups SET purchase_completed_at=datetime('now') WHERE id=?", (int(topup_id),))
     conn.commit()
     return cur.rowcount == 1
+
+
+# --- YouPanel purchases and trial claims ---
+
+
+def plan_delivery_type(plan_or_id) -> str:
+    plan = plan_or_id if hasattr(plan_or_id, "keys") else get_plan(plan_or_id)
+    if not plan:
+        return "pool"
+    value = plan["delivery_type"] if "delivery_type" in plan.keys() else "pool"
+    return "youpanel" if value == "youpanel" else "pool"
+
+
+def list_stale_panel_purchases(minutes=15):
+    minutes = max(1, int(minutes))
+    cur.execute(
+        """
+        SELECT * FROM purchases
+        WHERE provider='youpanel' AND status='provisioning'
+          AND created_at <= datetime('now', ?)
+        ORDER BY id
+        """,
+        (f"-{minutes} minutes",),
+    )
+    return cur.fetchall()
+
+
+def begin_panel_purchase(user_id, quantity, unit_price=None, note="", plan_id=None):
+    """Reserve wallet funds and create a provisioning purchase atomically."""
+    user_id = str(user_id)
+    quantity = int(quantity)
+    plan_id = int(plan_id) if plan_id is not None else default_plan_id()
+    if quantity < 1 or quantity > 4:
+        raise PurchaseError("invalid_quantity", "تعداد خرید معتبر نیست.")
+    plan = get_plan(plan_id)
+    if not plan or int(plan["is_active"] or 0) != 1:
+        raise PurchaseError("invalid_plan", "پلن فعال نیست یا پیدا نشد.")
+    if plan_delivery_type(plan) != "youpanel":
+        raise PurchaseError("wrong_delivery_type", "این پلن از استخر لینک تحویل می‌شود.")
+    if int(plan["panel_data_limit_bytes"] or 0) <= 0 or int(plan["panel_duration_days"] or 0) <= 0:
+        raise PurchaseError("invalid_panel_plan", "حجم یا مدت ساخت خودکار پلن تنظیم نشده است.")
+    unit_price = int(unit_price if unit_price is not None else plan["price"] or 0)
+    total = quantity * unit_price
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM users WHERE id=?", (user_id,))
+            user = cur.fetchone()
+            if not user:
+                raise PurchaseError("user_not_found", "کاربر پیدا نشد.")
+            if int(user["banned"] or 0):
+                raise PurchaseError("banned", "حساب شما مسدود است.")
+            balance_before = int(user["balance"] or 0)
+            if balance_before < total:
+                raise PurchaseError("insufficient_balance", "موجودی کیف پول کافی نیست.")
+            is_test = int(user["is_test"] or 0) if "is_test" in user.keys() else 0
+            cur.execute(
+                """
+                INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note, plan_id, is_test, provider)
+                VALUES (?, ?, ?, ?, 'provisioning', ?, ?, ?, 'youpanel')
+                """,
+                (user_id, quantity, total, unit_price, note or "", plan_id, is_test),
+            )
+            purchase_id = cur.lastrowid
+            balance_after = balance_before - total
+            cur.execute("UPDATE users SET balance=? WHERE id=?", (balance_after, user_id))
+            cur.execute(
+                """
+                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note, is_test)
+                VALUES (?, 'purchase', ?, ?, ?, ?, ?)
+                """,
+                (user_id, -total, balance_before, balance_after,
+                 f"purchase_id={purchase_id};provider=youpanel;status=provisioning", is_test),
+            )
+            conn.commit()
+            return {
+                "purchase_id": int(purchase_id), "user_id": user_id, "quantity": quantity,
+                "unit_price": unit_price, "amount": total, "balance_before": balance_before,
+                "balance_after": balance_after, "plan_id": plan_id, "is_test": is_test,
+            }
+        except PurchaseError:
+            conn.rollback()
+            raise
+        except Exception as exc:
+            conn.rollback()
+            raise PurchaseError("unexpected", "خطای داخلی هنگام شروع ساخت سرویس رخ داد.") from exc
+
+
+def finalize_panel_purchase(purchase_id, provisioned_items):
+    """Persist provisioned panel users and complete a reserved purchase."""
+    purchase_id = int(purchase_id)
+    items = list(provisioned_items or [])
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,))
+            purchase = cur.fetchone()
+            if not purchase:
+                raise PurchaseError("purchase_not_found", "خرید پیدا نشد.")
+            if purchase["status"] == "completed":
+                cur.execute("SELECT * FROM subs WHERE purchase_id=? ORDER BY id", (purchase_id,))
+                existing = [dict(row) for row in cur.fetchall()]
+                conn.commit()
+                return {"purchase": dict(purchase), "items": existing, "already_completed": True}
+            if purchase["status"] != "provisioning":
+                raise PurchaseError("invalid_purchase_state", "خرید در وضعیت ساخت خودکار نیست.")
+            if len(items) != int(purchase["quantity"]):
+                raise PurchaseError("item_count_mismatch", "تعداد سرویس‌های ساخته‌شده با سفارش یکسان نیست.")
+            saved = []
+            for item in items:
+                link = (item.get("subscription_url") or item.get("link") or "").strip()
+                panel_username = (item.get("username") or "").strip()
+                if not link or not panel_username:
+                    raise PurchaseError("invalid_panel_response", "پاسخ پنل لینک یا نام کاربری معتبر ندارد.")
+                account_name = (item.get("account_name") or generate_service_code()).strip()
+                cur.execute(
+                    """
+                    INSERT INTO subs(
+                        link, used, owner, assigned_at, price_paid, account_name, status,
+                        purchase_id, plan_id, source_type, panel_provider, panel_username,
+                        panel_status, panel_data_limit, panel_used_traffic, panel_expires_at,
+                        panel_duration_seconds, is_trial, last_synced_at
+                    ) VALUES (?,1,?,datetime('now'),?,?,'delivered',?,?,'youpanel','youpanel',?,?,?,?,?,?,0,datetime('now'))
+                    """,
+                    (
+                        link, purchase["user_id"], int(purchase["unit_price"]), account_name,
+                        purchase_id, purchase["plan_id"], panel_username, item.get("status") or "active",
+                        int(item.get("data_limit") or 0), int(item.get("used_traffic") or 0),
+                        item.get("expire"), item.get("on_hold_expire_duration"),
+                    ),
+                )
+                sub_id = cur.lastrowid
+                cur.execute(
+                    """
+                    INSERT INTO purchase_items(purchase_id, sub_id, user_id, account_name, link, price_paid, assigned_at, status, plan_id)
+                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), 'active', ?)
+                    """,
+                    (purchase_id, sub_id, purchase["user_id"], account_name, link, int(purchase["unit_price"]), purchase["plan_id"]),
+                )
+                cur.execute("SELECT * FROM subs WHERE id=?", (sub_id,))
+                saved.append(dict(cur.fetchone()))
+            cur.execute(
+                "UPDATE purchases SET status='completed', completed_at=datetime('now'), provision_error=NULL WHERE id=?",
+                (purchase_id,),
+            )
+            cur.execute("UPDATE users SET purchased=purchased+? WHERE id=?", (int(purchase["quantity"]), purchase["user_id"]))
+            if not int(purchase["is_test"] or 0):
+                _bump_daily_tx("sales", int(purchase["quantity"]))
+            conn.commit()
+            cur.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,))
+            return {"purchase": dict(cur.fetchone()), "items": saved, "already_completed": False}
+        except PurchaseError:
+            conn.rollback()
+            raise
+        except Exception as exc:
+            conn.rollback()
+            raise PurchaseError("unexpected", "ثبت نهایی سرویس‌های پنلی ناموفق بود.") from exc
+
+
+def refund_panel_purchase(purchase_id, error=""):
+    """Refund one failed provisioning purchase exactly once."""
+    purchase_id = int(purchase_id)
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM purchases WHERE id=?", (purchase_id,))
+            purchase = cur.fetchone()
+            if not purchase:
+                conn.rollback()
+                return False, "not_found", None
+            if purchase["status"] == "failed" and purchase["refunded_at"]:
+                conn.commit()
+                return True, "already_refunded", dict(purchase)
+            if purchase["status"] == "completed":
+                conn.rollback()
+                return False, "already_completed", dict(purchase)
+            cur.execute("SELECT * FROM users WHERE id=?", (purchase["user_id"],))
+            user = cur.fetchone()
+            if not user:
+                conn.rollback()
+                return False, "user_not_found", dict(purchase)
+            before = int(user["balance"] or 0)
+            after = before + int(purchase["amount"] or 0)
+            cur.execute("UPDATE users SET balance=? WHERE id=?", (after, purchase["user_id"]))
+            cur.execute(
+                """
+                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note, is_test)
+                VALUES (?, 'purchase_refund', ?, ?, ?, ?, ?)
+                """,
+                (purchase["user_id"], int(purchase["amount"] or 0), before, after,
+                 f"purchase_id={purchase_id};provider=youpanel;error={(error or '')[:300]}", int(purchase["is_test"] or 0)),
+            )
+            cur.execute(
+                "UPDATE purchases SET status='failed', provision_error=?, refunded_at=datetime('now') WHERE id=?",
+                ((error or "")[:1000], purchase_id),
+            )
+            conn.commit()
+            return True, "refunded", dict(purchase)
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def list_stale_trial_claims(minutes=15):
+    minutes = max(1, int(minutes))
+    with LOCK:
+        cur.execute(
+            """
+            SELECT * FROM trial_claims
+            WHERE status='pending' AND updated_at <= datetime('now', ?)
+            ORDER BY user_id
+            """,
+            (f"-{minutes} minutes",),
+        )
+        return cur.fetchall()
+
+
+def begin_trial_claim(user_id, panel_username):
+    user_id = str(user_id)
+    panel_username = (panel_username or "").strip()
+    if not panel_username:
+        return False, "invalid_username", None
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM trial_claims WHERE user_id=?", (user_id,))
+            row = cur.fetchone()
+            if row and row["status"] in {"pending", "completed"}:
+                conn.commit()
+                return False, "already_claimed", dict(row)
+            if row:
+                cur.execute(
+                    "UPDATE trial_claims SET panel_username=?, status='pending', error=NULL, updated_at=datetime('now') WHERE user_id=?",
+                    (panel_username, user_id),
+                )
+            else:
+                cur.execute("INSERT INTO trial_claims(user_id, panel_username, status) VALUES (?, ?, 'pending')", (user_id, panel_username))
+            conn.commit()
+            cur.execute("SELECT * FROM trial_claims WHERE user_id=?", (user_id,))
+            return True, "pending", dict(cur.fetchone())
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False, "username_conflict", None
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def complete_trial_claim(user_id, panel_item):
+    user_id = str(user_id)
+    link = (panel_item.get("subscription_url") or "").strip()
+    panel_username = (panel_item.get("username") or "").strip()
+    if not link or not panel_username:
+        raise ValueError("invalid panel trial response")
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM trial_claims WHERE user_id=?", (user_id,))
+            claim = cur.fetchone()
+            if not claim or claim["status"] != "pending":
+                raise ValueError("trial claim is not pending")
+            cur.execute(
+                """
+                INSERT INTO subs(
+                    link, used, owner, assigned_at, price_paid, account_name, status,
+                    purchase_id, plan_id, source_type, panel_provider, panel_username,
+                    panel_status, panel_data_limit, panel_used_traffic, panel_expires_at,
+                    panel_duration_seconds, is_trial, last_synced_at
+                ) VALUES (?,1,?,datetime('now'),0,?,'delivered',NULL,NULL,'youpanel','youpanel',?,?,?,?,?,?,1,datetime('now'))
+                """,
+                (
+                    link, user_id, "اکانت تست", panel_username, panel_item.get("status") or "on_hold",
+                    int(panel_item.get("data_limit") or 0), int(panel_item.get("used_traffic") or 0),
+                    panel_item.get("expire"), panel_item.get("on_hold_expire_duration"),
+                ),
+            )
+            sub_id = cur.lastrowid
+            cur.execute(
+                "UPDATE trial_claims SET sub_id=?, status='completed', error=NULL, updated_at=datetime('now') WHERE user_id=?",
+                (sub_id, user_id),
+            )
+            conn.commit()
+            cur.execute("SELECT * FROM subs WHERE id=?", (sub_id,))
+            return dict(cur.fetchone())
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def fail_trial_claim(user_id, error=""):
+    with LOCK:
+        cur.execute(
+            "UPDATE trial_claims SET status='failed', error=?, updated_at=datetime('now') WHERE user_id=?",
+            ((error or "")[:1000], str(user_id)),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def get_trial_claim(user_id):
+    with LOCK:
+        cur.execute("SELECT * FROM trial_claims WHERE user_id=?", (str(user_id),))
+        return cur.fetchone()
+
+
+def update_panel_sub(sub_id, panel_item):
+    link = panel_item.get("subscription_url")
+    with LOCK:
+        cur.execute(
+            """
+            UPDATE subs SET link=COALESCE(?,link), panel_status=COALESCE(?,panel_status),
+                panel_data_limit=COALESCE(?,panel_data_limit), panel_used_traffic=COALESCE(?,panel_used_traffic),
+                panel_expires_at=?, panel_duration_seconds=?, last_synced_at=datetime('now')
+            WHERE id=? AND source_type='youpanel'
+            """,
+            (link, panel_item.get("status"), panel_item.get("data_limit"), panel_item.get("used_traffic"),
+             panel_item.get("expire"), panel_item.get("on_hold_expire_duration"), int(sub_id)),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def update_panel_sub_usage(sub_id, used_traffic):
+    with LOCK:
+        cur.execute(
+            "UPDATE subs SET panel_used_traffic=?, last_synced_at=datetime('now') WHERE id=? AND source_type='youpanel'",
+            (max(0, int(used_traffic or 0)), int(sub_id)),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def mark_panel_sub_deleted(sub_id):
+    sub_id = int(sub_id)
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT owner,purchase_id,is_trial,used FROM subs WHERE id=? AND source_type='youpanel'", (sub_id,))
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return False
+            cur.execute(
+                "UPDATE subs SET used=0,status='deleted',panel_status='deleted',last_synced_at=datetime('now') WHERE id=? AND source_type='youpanel'",
+                (sub_id,),
+            )
+            cur.execute(
+                "UPDATE purchase_items SET status='deleted',reverted_at=datetime('now'),revert_reason='panel_user_deleted' WHERE sub_id=?",
+                (sub_id,),
+            )
+            if int(row["used"] or 0) == 1 and not int(row["is_trial"] or 0) and row["owner"]:
+                cur.execute(
+                    "UPDATE users SET purchased=CASE WHEN purchased>0 THEN purchased-1 ELSE 0 END WHERE id=?",
+                    (str(row["owner"]),),
+                )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
 
 
 # --- Admin user notes / testing / logs / reports ---

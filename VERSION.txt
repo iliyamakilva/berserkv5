@@ -1,41 +1,54 @@
 Berserk VPN Bot
-Version: v6.0.0 Code Audit & Clean
-Build Type: Full Source Review / Original 22 Files Preserved
-Schema Version: 600
-Date: 2026-07-11
+Version: v6.1.1 YouPanel Device Limits
+Build Type: Full Source / Original 22 Files Preserved
+Schema Version: 610
+Date: 2026-07-12
 
 هدف نسخه:
-- بازبینی جامع معماری، دیتابیس، خرید، کیف پول، رفرال، بک‌آپ، FSM و اکانت تست.
-- رفع خطاهای هم‌زمانی cursor و تراکنش‌های حساس.
-- جداسازی دقیق خریدها و تراکنش‌های تست از گزارش فروش واقعی.
-- جلوگیری از شارژ، پاداش یا تخصیص دوباره در اجرای هم‌زمان.
-- تقویت اعتبارسنجی و Restore بک‌آپ.
-- تمیزکاری کد، logging، type hint و queryهای کنترل‌شده.
-- حفظ کامل ساختار ۲۲ فایلی و سازگاری migration با v5.6.5.
+- تکمیل مدیریت محدودیت تعداد دستگاه برای پلن‌های YouPanel و اکانت تست.
+- حفظ کامل فروش استخری قبلی و افزودن فروش خودکار YouPanel در کنار آن.
+- ساخت خودکار سرویس با حجم، مدت و نوع شروع اعتبار اختصاصی هر پلن.
+- ساخت اکانت تست ۲۰۰ مگ یک‌روزه یا مقادیر قابل تنظیم، فقط یک‌بار برای هر Telegram ID.
+- مدیریت مصرف، Reset Usage، Revoke Subscription و حذف سرویس پنلی از داخل ادمین.
+- حفظ اتمیک بودن کیف پول و refund امن در شکست Provisioning.
+- نگهداری JWT فقط در حافظه و خواندن رمز پنل فقط از Environment.
 
 تغییرهای مهم:
-- Schema دیتابیس به 600 ارتقا یافت.
-- cursor سراسری با cursor محلی هر Thread جایگزین شد.
-- خرید، تأیید Topup و پاداش رفرال اتمیک شدند.
-- تاریخچه کاربر هنگام تغییر وضعیت تست دوباره طبقه‌بندی می‌شود.
-- رسید تکراری برای Audit نگهداری و علامت‌گذاری می‌شود.
-- موجودی منفی رد می‌شود.
-- پلن نامعتبر دیگر به پلن پیش‌فرض fallback نمی‌کند.
-- Backup/Restore دارای staging، integrity check، schema check و safety backup است.
-- کنترل ورود لینک تکراری و بازگردانی امن به استخر تقویت شد.
-- خطاهای بی‌صدای مهم با logging جایگزین شدند.
+- Schema دیتابیس از 600 به 610 ارتقا یافت.
+- plans: delivery_type و تنظیمات پنلی مستقل.
+- subs: اطلاعات provider، panel username/status/usage/expiry و trial.
+- purchases: provider، provision_error، completed_at و refunded_at.
+- جدول trial_claims اضافه شد.
+- مسیر خرید بر اساس pool یا youpanel dispatch می‌شود.
+- سفارش پنلی در وضعیت provisioning رزرو و پس از دریافت همه لینک‌ها completed می‌شود.
+- شکست ساخت باعث حذف best-effort حساب نیمه‌ساخته و refund کیف پول می‌شود.
+- سفارش نیمه‌کاره بعد از Restart بازیابی و refund می‌شود.
+- دکمه سیستمی اکانت تست اضافه شد.
+- عملیات پنلی Usage/Reset/Revoke/Delete به جزئیات سرویس ادمین اضافه شد.
+- افزودن لینک دستی به پلن خودکار مسدود شد.
+- انتخاب سقف دستگاه به ویزارد ساخت سریع پلن افزوده شد.
+- سقف دستگاه در جزئیات و پیش‌نمایش پلن نمایش داده می‌شود.
+- YOUPANEL_TRIAL_MAX_DEVICES برای محدودیت دستگاه اکانت تست اضافه شد.
+
+APIهای پشتیبانی‌شده:
+- POST /api/admin/token
+- POST /api/user
+- DELETE /api/user/{username}
+- GET /api/user/{username}/usage
+- POST /api/user/{username}/reset
+- POST /api/user/{username}/revoke_sub
+- GET /api/admin
 
 تست‌ها:
-- ruff / pyflakes / py_compile
-- Bandit بدون یافته امنیتی
-- DB init و migration از v5.6.5
-- خرید هم‌زمان و جلوگیری از فروش دوباره لینک
-- تأیید هم‌زمان پرداخت
-- رفرال هم‌زمان
-- اکانت تست و بازطبقه‌بندی تاریخچه
-- FSM storage
-- Backup/Restore و رد Schema جدیدتر
-- تست قالب‌ها، تاریخ شمسی و پنل ادمین
+- py_compile تمام فایل‌های Python
+- DB init و migration 600→610
+- خرید استخری
+- خرید پنلی موفق، چندتایی، failure و refund
+- recovery سفارش provisioning
+- Trial one-per-user و retry پس از failure
+- Mock API Login/Create/Usage/Reset/Revoke/Delete
+- جلوگیری از لینک دستی برای پلن YouPanel
+- ZIP integrity و حفظ دقیق ۲۲ فایل
 
 محدودیت:
-تست زنده با توکن واقعی تلگرام انجام نشده است. ابتدا روی محیط تست Deploy شود.
+تست destructive زنده با پنل واقعی، توکن واقعی تلگرام و پرداخت واقعی انجام نشده است. ابتدا روی پلن و کاربر آزمایشی Deploy و بررسی شود.
