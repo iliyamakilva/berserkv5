@@ -1,25 +1,27 @@
+"""Referral reward orchestration."""
+
+import db
 import settings
-from anti_fraud import flag_for_review, is_referral_suspicious
-from db import add_balance, bump_daily, get_user, mark_rewarded
+from anti_fraud import flag_for_review
+from config import MAX_REFERRALS_PER_DAY, MAX_TOTAL_REFERRALS
 
 
 def reward_ref(user_id):
-    row = get_user(user_id)
-    if not row:
-        return "skipped", "user_not_found"
+    """Reward the referrer exactly once, using one atomic database transaction.
 
-    ref, rewarded = row["ref"], row["rewarded"]
-    if not ref:
-        return "skipped", "no_referrer"
-    if rewarded:
-        return "skipped", "already_rewarded"
+    Return values remain compatible with the old callers:
+    ("rewarded", referrer_id), ("blocked", human_message), or
+    ("skipped", reason).
+    """
+    status, reason, referrer_id = db.reward_referral_atomic(
+        user_id,
+        settings.ref_reward(),
+        max_total=MAX_TOTAL_REFERRALS,
+        max_per_day=MAX_REFERRALS_PER_DAY,
+    )
 
-    suspicious, reason = is_referral_suspicious(ref, user_id)
-    if suspicious:
-        return "blocked", flag_for_review(reason, ref, user_id)
-
-    reward_amount = settings.ref_reward()
-    add_balance(ref, reward_amount, action="referral_reward", note=f"referred_id={user_id}")
-    mark_rewarded(user_id)
-    bump_daily("referral_rewards", reward_amount)
-    return "rewarded", ref
+    if status == "rewarded":
+        return "rewarded", referrer_id
+    if status == "blocked":
+        return "blocked", flag_for_review(reason, referrer_id or "-", user_id)
+    return "skipped", reason

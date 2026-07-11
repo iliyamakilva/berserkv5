@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime
 
 from aiogram import Bot, types
@@ -16,7 +17,9 @@ import messages
 import settings
 import subs
 from config import ADMIN_COMMAND, ADMIN_IDS, BROADCAST_DELAY, OWNER_IDS
-from utils import cleanup_qr, make_qr, format_dual_datetime
+from utils import cleanup_qr, format_dual_datetime, make_qr, parse_int
+
+logger = logging.getLogger(__name__)
 
 
 def is_admin(user_id) -> bool:
@@ -231,13 +234,13 @@ async def _admin_cleanup_tracked(chat_id, user_id, keep_message_id=None, kinds=A
             try:
                 bot = Bot.get_current()
                 await bot.edit_message_reply_markup(int(row["chat_id"]), message_id, reply_markup=None)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("could not remove inline keyboard for tracked message %s: %s", message_id, exc)
         finally:
             try:
                 db.clear_tracked_bot_message(row["chat_id"], message_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("could not clear tracked message %s: %s", message_id, exc)
 
 
 async def _track_admin_sent(user_id, sent, context="admin", kind="menu"):
@@ -250,8 +253,8 @@ async def _track_admin_sent(user_id, sent, context="admin", kind="menu"):
             db.track_bot_message(msg.chat.id, user_id, msg.message_id, context, kind=kind)
         except TypeError:
             db.track_bot_message(msg.chat.id, user_id, msg.message_id, context)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("could not track admin message: %s", exc)
 
 
 async def _send_long(message, text, reply_markup=None, owner_user_id=None, context="admin_long", kind="list", cleanup=False):
@@ -277,8 +280,8 @@ async def _send_long(message, text, reply_markup=None, owner_user_id=None, conte
 async def _safe_remove_inline_keyboard(message):
     try:
         await message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("could not remove inline keyboard: %s", exc)
 
 
 async def _safe_delete_message(message):
@@ -305,8 +308,8 @@ async def _replace_callback_message(c: types.CallbackQuery, text: str, reply_mar
                 db.track_bot_message(c.message.chat.id, c.from_user.id, c.message.message_id, context, kind=kind)
             except TypeError:
                 db.track_bot_message(c.message.chat.id, c.from_user.id, c.message.message_id, context)
-            except Exception:
-                pass
+            except Exception as track_exc:
+                logger.debug("could not track edited admin message: %s", track_exc)
             return
     except Exception as exc:
         if "message is not modified" in str(exc).lower():
@@ -397,11 +400,11 @@ async def cb_fsm_back(c: types.CallbackQuery, state: FSMContext):
         await state.finish()
         if plan_id and db.get_plan(plan_id):
             return await _replace_callback_message(c, _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_detail_kb(plan_id))
-        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=links_menu_kb())
+        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=link_manager_kb())
 
     if current_state and current_state.endswith(("waiting_link_search", "waiting_link_delete_id")):
         await state.finish()
-        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=links_menu_kb())
+        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=link_manager_kb())
 
     # تنظیمات عمومی
     if current_state and current_state.endswith("waiting_setting_value"):
@@ -564,8 +567,7 @@ def _fmt_user_summary(user_id):
     admin_note = user["admin_note"] if "admin_note" in user.keys() and user["admin_note"] else ""
     purchase_count = db.purchase_count_by_user(user_id)
     delivered_count = db.delivered_sub_count_by_user(user_id)
-    topups = db.list_user_topups(user_id, limit=50)
-    approved_topups = [t for t in topups if (t["status"] or "") == "approved"]
+    approved_topup_count = db.user_approved_topup_count(user_id)
     ticket_counts = db.user_ticket_counts(user_id)
 
     return (
@@ -578,7 +580,7 @@ def _fmt_user_summary(user_id):
         f"موجودی کیف پول: {_fmt_money(user['balance'])}\n\n"
         f"خریدهای ثبت‌شده: {purchase_count}\n"
         f"سرویس‌های تحویل‌شده: {delivered_count}\n"
-        f"شارژهای موفق: {len(approved_topups)}\n"
+        f"شارژهای موفق: {approved_topup_count}\n"
         f"تیکت‌ها: {ticket_counts['total']} | باز: {ticket_counts['open']}\n"
         f"معرف: {user['ref'] or '-'}\n\n"
         f"عضویت: {_dual(user['joined_at'])}\n"
@@ -696,19 +698,19 @@ def _fmt_user_finance(user_id):
     lines.append(f"شارژهای در انتظار/بررسی: {pending_count}\n")
     lines.append("📒 خط زمان مالی اخیر")
     if ledger:
-        for i, l in enumerate(ledger, start=1):
-            amount = int(l["amount"] or 0)
+        for i, entry in enumerate(ledger, start=1):
+            amount = int(entry["amount"] or 0)
             sign = "+" if amount > 0 else ""
             action_label = {
                 "purchase": "خرید سرویس",
                 "balance_adjustment": "تغییر دستی موجودی",
                 "topup": "شارژ کیف پول",
                 "referral_reward": "پاداش رفرال",
-            }.get(l["action"], l["action"])
+            }.get(entry["action"], entry["action"])
             lines.append(f"{i}️⃣ {action_label} | {sign}{_fmt_money(amount)}")
-            lines.append(f"قبل: {_fmt_money(l['balance_before'])} | بعد: {_fmt_money(l['balance_after'])} | {_dual(l['created_at'])}")
-            if l["note"]:
-                lines.append(f"یادداشت: {_short(l['note'], 80)}")
+            lines.append(f"قبل: {_fmt_money(entry['balance_before'])} | بعد: {_fmt_money(entry['balance_after'])} | {_dual(entry['created_at'])}")
+            if entry["note"]:
+                lines.append(f"یادداشت: {_short(entry['note'], 80)}")
     else:
         lines.append("تراکنشی ثبت نشده.")
     return "\n".join(lines)
@@ -722,14 +724,18 @@ def _fmt_user_referral(user_id):
     lines = ["👥 رفرال کاربر\n"]
     lines.append(f"کاربر: {_display_username(user)} | ID: {user_id}")
     lines.append(f"معرف این کاربر: {user['ref'] or '-'}")
-    lines.append(f"تعداد زیرمجموعه‌ها: {db.referral_count(user_id)}")
-    lines.append(f"زیرمجموعه‌های خریدکرده/پاداش‌داده‌شده: {db.rewarded_referral_count(user_id)}")
+    real_referrals = db.referral_count(user_id)
+    all_referrals = db.referral_count(user_id, include_test=True)
+    test_referrals = max(0, all_referrals - real_referrals)
+    lines.append(f"تعداد زیرمجموعه‌های واقعی: {real_referrals} | تست: {test_referrals}")
+    lines.append(f"زیرمجموعه‌های واقعی پاداش‌داده‌شده: {db.rewarded_referral_count(user_id)}")
     lines.append(f"مجموع پاداش دریافتی: {_fmt_money(db.referral_reward_total(user_id))}\n")
     if referred:
         lines.append("آخرین زیرمجموعه‌ها:")
         for i, row in enumerate(referred, start=1):
             mark = "✅ خرید کرده" if row["rewarded"] else "⏳ بدون خرید"
-            lines.append(f"{i}. {row['id']} | {_display_username(row)} | {mark} | خرید: {row['purchased']} | عضویت: {_dual(row['joined_at'])}")
+            test_mark = "🧪 " if int(row["is_test"] or 0) else ""
+            lines.append(f"{i}. {test_mark}{row['id']} | {_display_username(row)} | {mark} | خرید: {row['purchased']} | عضویت: {_dual(row['joined_at'])}")
     else:
         lines.append("زیرمجموعه‌ای ثبت نشده.")
     return "\n".join(lines)
@@ -821,7 +827,7 @@ async def cb_users(c: types.CallbackQuery):
         return await c.answer()
 
     await c.answer()
-    rows = db.list_users(limit=15)
+    rows = db.list_users_with_stats(limit=15)
 
     if not rows:
         return await _replace_callback_message(c, "هیچ کاربری ثبت نشده.", reply_markup=admin_back_kb())
@@ -832,7 +838,7 @@ async def cb_users(c: types.CallbackQuery):
     for index, r in enumerate(rows, start=1):
         flag = "⛔" if r["banned"] else "✅"
         username = _display_username(r)
-        delivered = db.delivered_sub_count_by_user(r["id"])
+        delivered = int(r["delivered_count"] or 0)
         test_mark = " | 🧪 تست" if "is_test" in r.keys() and int(r["is_test"] or 0) else ""
         lines.append(
             f"{index}. {flag} {r['id']} | {username}{test_mark} | خرید: {r['purchased']} | سرویس: {delivered} | موجودی: {_fmt_money(r['balance'])} | عضویت: {_dual(r['joined_at'])}"
@@ -985,7 +991,15 @@ async def cb_user_test_toggle(c: types.CallbackQuery):
     db.toggle_user_test(user_id)
     user = db.get_user(user_id)
     db.log_admin_action(c.from_user.id, "toggle_test_user", user_id, f"is_test={user['is_test'] if 'is_test' in user.keys() else '-'}")
-    await _replace_callback_message(c, "✅ وضعیت کاربر تست تغییر کرد.\n\n" + _fmt_user_summary(user_id), reply_markup=user_detail_kb(user_id))
+    test_state = "تست" if int(user["is_test"] or 0) else "عادی"
+    await _replace_callback_message(
+        c,
+        f"✅ نوع کاربر به «{test_state}» تغییر کرد.\n"
+        "خریدها، شارژها و تراکنش‌های همین کاربر نیز با وضعیت جدید در گزارش‌ها طبقه‌بندی شدند.\n"
+        "سرویس‌های تحویل‌شده خودکار به استخر برنمی‌گردند و پاداش رفرال قبلاً پرداخت‌شده نیز خودکار معکوس نمی‌شود.\n\n"
+        + _fmt_user_summary(user_id),
+        reply_markup=user_detail_kb(user_id),
+    )
 
 
 async def cb_direct_message_start(c: types.CallbackQuery, state: FSMContext):
@@ -1141,14 +1155,24 @@ async def process_balance_amount(m: types.Message, state: FSMContext):
     if m.content_type != "text":
         return await m.answer("لطفا فقط عدد بفرستید.", reply_markup=cancel_kb())
     data = await state.get_data()
+    amount = parse_int(m.text, allow_negative=True)
+    if amount is None or amount == 0:
+        return await m.answer("لطفاً یک عدد غیرصفر بفرستید.", reply_markup=cancel_kb())
     try:
-        amount = int(m.text.strip().replace(",", ""))
-    except ValueError:
-        return await m.answer("لطفا فقط عدد بفرستید.", reply_markup=cancel_kb())
-    db.add_balance(data["target_id"], amount, action="admin_adjustment", note=f"admin_id={m.from_user.id}")
-    db.log_admin_action(m.from_user.id, "balance_adjustment", data["target_id"], f"amount={amount}")
+        new_balance = db.add_balance(
+            data["target_id"],
+            amount,
+            action="admin_adjustment",
+            note=f"admin_id={m.from_user.id}",
+        )
+    except ValueError as exc:
+        return await m.answer(f"❌ {exc}", reply_markup=cancel_kb())
+    db.log_admin_action(m.from_user.id, "balance_adjustment", data["target_id"], f"amount={amount}; balance={new_balance}")
     await state.finish()
-    await m.answer(f"✅ موجودی کاربر {data['target_id']} به‌روزرسانی شد.", reply_markup=admin_back_kb())
+    await m.answer(
+        f"✅ موجودی کاربر {data['target_id']} به‌روزرسانی شد.\nموجودی جدید: {_fmt_money(new_balance)}",
+        reply_markup=admin_back_kb(),
+    )
 
 
 async def cb_ban(c: types.CallbackQuery):
@@ -1541,10 +1565,12 @@ async def process_link_delete_id(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return
 
-    if m.content_type != "text" or not m.text.strip().isdigit():
+    if m.content_type != "text":
         return await m.answer("لطفاً فقط Link ID عددی را بفرستید.", reply_markup=cancel_kb())
 
-    link_id = int(m.text.strip())
+    link_id = parse_int(m.text)
+    if link_id is None:
+        return await m.answer("لطفاً فقط Link ID عددی را بفرستید.", reply_markup=cancel_kb())
     row = subs.get_link_detail(link_id)
 
     if not row:
@@ -1671,22 +1697,30 @@ async def cb_stats(c: types.CallbackQuery):
         "",
         "👥 کاربران",
         f"کل کاربران: {db.count_users()}",
-        f"فعال (۷ روز اخیر): {db.active_users_count(7)}",
+        f"کاربران واقعی: {db.count_real_users()}",
+        f"کاربران تست: {db.count_test_users()}",
+        f"کاربران واقعی فعال (۷ روز اخیر): {db.active_users_count(7)}",
         "",
         "💰 درآمد و مالی",
-        f"مجموع شارژهای تایید‌شده: {db.sum_approved_topups():,} تومان",
-        f"مجموع موجودی فعلی همه کیف‌پول‌ها: {db.sum_all_balances():,} تومان",
-        f"مجموع پاداش رفرال پرداختی: {db.total_referral_rewards():,} تومان",
+        f"مجموع شارژهای تأییدشده واقعی: {db.sum_approved_topups():,} تومان",
+        f"موجودی کیف‌پول کاربران واقعی: {db.sum_all_balances():,} تومان",
+        f"مجموع پاداش رفرال واقعی: {db.total_referral_rewards():,} تومان",
         f"شارژهای در انتظار بررسی: {db.count_pending_topups()}",
         "",
         "📦 سرویس",
-        f"فروخته‌شده: {subs.sold_count()}",
+        f"تحویل کل: {subs.sold_count()}",
+        f"تحویل واقعی: {db.delivered_sub_counts_by_test_status()['real']}",
+        f"تحویل تست: {db.delivered_sub_counts_by_test_status()['test']}",
         f"موجودی فعلی: {subs.stock_count()}",
         "",
         "🏷 موجودی پلن‌ها:",
     ]
     for plan in db.list_plans(limit=20):
-        lines.append(f"• #{plan['id']} {plan['title']}: موجودی {subs.stock_count(plan['id'])} | فروش {subs.sold_count(plan['id'])} | قیمت {int(plan['price']):,}")
+        sales = db.plan_sales_by_test_status(plan["id"])
+        lines.append(
+            f"• #{plan['id']} {plan['title']}: موجودی {subs.stock_count(plan['id'])} | "
+            f"تحویل واقعی {sales['real']} | تست {sales['test']} | قیمت {int(plan['price']):,}"
+        )
     lines += [
         "📢 مخاطب‌های پیام همگانی",
         f"همه کاربران غیر بن‌شده: {db.count_broadcast_targets('all')}",
@@ -1717,16 +1751,21 @@ async def cb_sales_report(c: types.CallbackQuery):
         f"فروش ۷ روز اخیر: {_fmt_money(db.period_sales_total(7))}",
         f"فروش ۳۰ روز اخیر: {_fmt_money(db.period_sales_total(30))}",
         f"تعداد خرید ۷ روز اخیر: {db.period_purchase_count(7)}",
-        f"پرداخت‌های تأییدشده ۷ روز اخیر: {_fmt_money(db.approved_topups_total_for_days(7))}",
-        f"موجودی کل کیف پول کاربران: {_fmt_money(db.sum_all_balances())}",
+        f"پرداخت‌های واقعی تأییدشده ۷ روز اخیر: {_fmt_money(db.approved_topups_total_for_days(7))}",
+        f"موجودی کیف پول کاربران واقعی: {_fmt_money(db.sum_all_balances())}",
+        f"گردش خرید تست ۳۰ روز اخیر: {_fmt_money(db.test_sales_total(30))}",
         "",
         "📦 موجودی پلن‌ها:",
     ]
     for plan in db.list_plans(limit=30):
         stock = subs.stock_count(plan["id"])
-        sold = subs.sold_count(plan["id"])
+        sales = db.plan_sales_by_test_status(plan["id"])
         warn = " ⚠️" if stock <= int(plan["low_stock_threshold"] or 0) else ""
-        lines.append(f"• #{plan['id']} {plan['title']}: موجودی {stock} | فروش {sold} | قیمت {_fmt_money(plan['price'])}{warn}")
+        lines.append(
+            f"• #{plan['id']} {plan['title']}: موجودی {stock} | "
+            f"فروش واقعی {sales['real']} | تست {sales['test']} | "
+            f"قیمت {_fmt_money(plan['price'])}{warn}"
+        )
     await _replace_callback_message(c, "\n".join(lines), reply_markup=admin_reports_section_kb())
 
 
@@ -2719,11 +2758,14 @@ async def cb_system_button_order(c: types.CallbackQuery, state: FSMContext):
 async def process_system_button_order(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return
-    if m.content_type != "text" or not m.text.strip().lstrip("-").isdigit():
+    if m.content_type != "text":
+        return await m.answer("لطفاً فقط عدد بفرستید.", reply_markup=cancel_kb())
+    order = parse_int(m.text, allow_negative=True)
+    if order is None:
         return await m.answer("لطفاً فقط عدد بفرستید.", reply_markup=cancel_kb())
     data = await state.get_data()
     key = data["system_button_key"]
-    db.update_system_button(key, sort_order=int(m.text.strip()))
+    db.update_system_button(key, sort_order=order)
     await state.finish()
     row = db.get_system_button(key)
     await m.answer("✅ ترتیب دکمه به‌روزرسانی شد.\n\n" + _fmt_system_button(row), reply_markup=system_button_detail_kb(key))
@@ -3095,7 +3137,10 @@ async def cb_button_order(c: types.CallbackQuery, state: FSMContext):
 async def process_button_order(m: types.Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return
-    if m.content_type != "text" or not m.text.strip().lstrip("-").isdigit():
+    if m.content_type != "text":
+        return await m.answer("لطفاً فقط عدد بفرستید.", reply_markup=cancel_kb())
+    order = parse_int(m.text, allow_negative=True)
+    if order is None:
         return await m.answer("لطفاً فقط عدد بفرستید.", reply_markup=cancel_kb())
     data = await state.get_data()
     row = db.get_custom_button(data["button_id"])
@@ -3103,7 +3148,7 @@ async def process_button_order(m: types.Message, state: FSMContext):
         await state.finish()
         return await m.answer("دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
     current = db.custom_button_effective_data(row)
-    current["sort_order"] = int(m.text.strip())
+    current["sort_order"] = order
     db.save_custom_button_draft(row["id"], current)
     await state.finish()
     row = db.get_custom_button(row["id"])
@@ -3418,8 +3463,8 @@ async def cb_broadcast_confirm(c: types.CallbackQuery, state: FSMContext):
         if index % 25 == 0 or index == total:
             try:
                 await progress.edit_text(f"📢 در حال ارسال...\nپیشرفت: {index}/{total}\nموفق: {success}\nناموفق: {failed}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("could not update broadcast progress: %s", exc)
         await asyncio.sleep(BROADCAST_DELAY)
 
     preview = _broadcast_preview_text(data)
@@ -3475,7 +3520,8 @@ async def process_restore_file(m: types.Message, state: FSMContext):
         return await m.answer("لطفا فایل دیتابیس رو به‌صورت Document بفرستید.", reply_markup=cancel_kb())
 
     await m.answer("⏳ در حال دانلود و بررسی فایل...")
-    tmp_path = f"/tmp/restore_upload_{m.document.file_unique_id}.db"
+    with tempfile.NamedTemporaryFile(prefix="berserk_restore_", suffix=".db", delete=False) as temp_file:
+        tmp_path = temp_file.name
     await m.document.download(destination_file=tmp_path)
 
     info = backup.inspect_sqlite_file(tmp_path)

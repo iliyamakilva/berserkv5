@@ -1,4 +1,5 @@
-import random
+import logging
+import secrets
 import sqlite3
 import string
 import threading
@@ -7,14 +8,83 @@ from pathlib import Path
 
 from config import DB_PATH
 
+logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 600
+
 _db_parent = Path(DB_PATH).expanduser().parent
 if str(_db_parent) not in ("", "."):
     _db_parent.mkdir(parents=True, exist_ok=True)
 
 LOCK = threading.RLock()
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
 conn.row_factory = sqlite3.Row
-cur = conn.cursor()
+conn.execute("PRAGMA busy_timeout=30000")
+conn.execute("PRAGMA foreign_keys=ON")
+try:
+    conn.execute("PRAGMA journal_mode=WAL")
+except sqlite3.DatabaseError:
+    # Read-only/legacy environments may not allow switching journal mode.
+    pass
+conn.execute("PRAGMA synchronous=NORMAL")
+
+
+class _ThreadLocalCursor:
+    """Expose the old ``db.cur`` API without sharing one cursor across threads.
+
+    SQLite connections can be shared with ``check_same_thread=False``, but a
+    cursor cannot be used recursively or by two threads at once.  Several bot
+    helpers intentionally expose ``db.cur`` for backwards compatibility, so a
+    thread-local cursor plus the shared re-entrant lock is the least disruptive
+    safe migration.
+    """
+
+    def __init__(self, connection):
+        self._connection = connection
+        self._local = threading.local()
+
+    def _get(self):
+        cursor = getattr(self._local, "cursor", None)
+        if cursor is None:
+            cursor = self._connection.cursor()
+            self._local.cursor = cursor
+        return cursor
+
+    def execute(self, *args, **kwargs):
+        with LOCK:
+            self._get().execute(*args, **kwargs)
+        return self
+
+    def executemany(self, *args, **kwargs):
+        with LOCK:
+            self._get().executemany(*args, **kwargs)
+        return self
+
+    def executescript(self, *args, **kwargs):
+        with LOCK:
+            self._get().executescript(*args, **kwargs)
+        return self
+
+    def fetchone(self):
+        with LOCK:
+            return self._get().fetchone()
+
+    def fetchall(self):
+        with LOCK:
+            return self._get().fetchall()
+
+    @property
+    def lastrowid(self):
+        with LOCK:
+            return self._get().lastrowid
+
+    @property
+    def rowcount(self):
+        with LOCK:
+            return self._get().rowcount
+
+
+cur = _ThreadLocalCursor(conn)
 
 
 class PurchaseError(Exception):
@@ -35,15 +105,19 @@ def _add_column_if_missing(table: str, column: str, definition: str):
 
 
 def _bump_daily_tx(field, amount=1):
-    valid = {"new_users", "sales", "referral_rewards"}
-    if field not in valid:
+    statements = {
+        "new_users": "UPDATE daily_stats SET new_users=new_users+? WHERE day=?",
+        "sales": "UPDATE daily_stats SET sales=sales+? WHERE day=?",
+        "referral_rewards": (
+            "UPDATE daily_stats SET referral_rewards=referral_rewards+? WHERE day=?"
+        ),
+    }
+    statement = statements.get(field)
+    if statement is None:
         raise ValueError(f"unknown stat field: {field}")
     today = date.today().isoformat()
     cur.execute("INSERT OR IGNORE INTO daily_stats(day) VALUES (?)", (today,))
-    cur.execute(
-        f"UPDATE daily_stats SET {field} = {field} + ? WHERE day=?",
-        (int(amount), today),
-    )
+    cur.execute(statement, (int(amount), today))
 
 
 def init():
@@ -342,23 +416,61 @@ def init():
         _add_column_if_missing("plans", "pre_purchase_text", "TEXT DEFAULT ''")
         _add_column_if_missing("plans", "post_purchase_text", "TEXT DEFAULT ''")
         _add_column_if_missing("bot_messages", "kind", "TEXT DEFAULT 'menu'")
-        cur.execute("""
-            SELECT file_unique_id, COUNT(*) AS c
-            FROM receipts
-            GROUP BY file_unique_id
-            HAVING c > 1
-            LIMIT 1
-        """)
-        if cur.fetchone() is None:
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_unique_file ON receipts(file_unique_id)")
-        else:
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_file ON receipts(file_unique_id)")
+        _add_column_if_missing("purchases", "is_test", "INTEGER DEFAULT 0")
+        _add_column_if_missing("topups", "is_test", "INTEGER DEFAULT 0")
+        _add_column_if_missing("ledger", "is_test", "INTEGER DEFAULT 0")
+        # Duplicate Telegram file IDs must remain recordable so each suspicious
+        # topup keeps its own audit row. Detection is done by counting prior
+        # uses, therefore this index must never be UNIQUE.
+        cur.execute("DROP INDEX IF EXISTS idx_receipts_unique_file")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_receipts_file ON receipts(file_unique_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_custom_buttons_location ON custom_buttons(location, sort_order)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_backup_logs_created ON backup_logs(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_plan_used ON subs(plan_id, used)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_owner_used ON subs(owner, used)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_purchase ON subs(purchase_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_purchases_user_created ON purchases(user_id, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_purchases_status_created ON purchases(status, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_topups_user_status ON topups(user_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_topups_status_reviewed ON topups(status, reviewed_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user_created ON ledger(user_id, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_purchase_items_sub ON purchase_items(sub_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_status ON tickets(user_id, status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bot_messages_user ON bot_messages(user_id, created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON admin_logs(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_joined ON users(joined_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)")
+
+        cur.execute("SELECT link, COUNT(*) AS c FROM subs GROUP BY link HAVING c > 1 LIMIT 1")
+        if cur.fetchone() is None:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_unique_link ON subs(link)")
+        else:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_subs_link ON subs(link)")
+
+        # Legacy databases may already contain duplicate links and therefore
+        # cannot receive a UNIQUE index. These triggers still block every new
+        # duplicate without deleting historical/sold records.
+        cur.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_subs_no_duplicate_insert
+            BEFORE INSERT ON subs
+            WHEN EXISTS (SELECT 1 FROM subs WHERE link=NEW.link)
+            BEGIN
+                SELECT RAISE(ABORT, 'duplicate sub link');
+            END
+            """
+        )
+        cur.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_subs_no_duplicate_update
+            BEFORE UPDATE OF link ON subs
+            WHEN NEW.link<>OLD.link AND EXISTS (SELECT 1 FROM subs WHERE link=NEW.link)
+            BEGIN
+                SELECT RAISE(ABORT, 'duplicate sub link');
+            END
+            """
+        )
 
         _ensure_default_plan()
         _ensure_system_buttons()
@@ -366,13 +478,22 @@ def init():
 
         cur.execute("UPDATE subs SET status='available' WHERE status IS NULL AND used=0")
         cur.execute("UPDATE subs SET status='delivered' WHERE status IS NULL AND used=1")
+        cur.execute("UPDATE purchases SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
+        cur.execute("UPDATE topups SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
+        cur.execute("UPDATE ledger SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
+        cur.execute(
+            "INSERT INTO settings(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+        cur.execute("DELETE FROM bot_messages WHERE created_at < datetime('now', '-30 days')")
         _backfill_missing_account_names()
         conn.commit()
 
 
 def _random_token(length=6):
     alphabet = string.ascii_uppercase + string.digits
-    return "".join(random.choice(alphabet) for _ in range(length))
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def generate_service_code():
@@ -419,17 +540,25 @@ def get_or_create_user(user_id, username=None, ref=None, display_name=None):
 
 
 def touch_active(user_id, username=None, display_name=None):
+    user_id = str(user_id)
     with LOCK:
-        updates = ["last_active=datetime('now')"]
-        params = []
-        if username is not None:
-            updates.append("username=?")
-            params.append(username or "")
-        if display_name is not None:
-            updates.append("display_name=?")
-            params.append(display_name or "")
-        params.append(str(user_id))
-        cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=?", params)
+        if username is not None and display_name is not None:
+            cur.execute(
+                "UPDATE users SET last_active=datetime('now'), username=?, display_name=? WHERE id=?",
+                (username or "", display_name or "", user_id),
+            )
+        elif username is not None:
+            cur.execute(
+                "UPDATE users SET last_active=datetime('now'), username=? WHERE id=?",
+                (username or "", user_id),
+            )
+        elif display_name is not None:
+            cur.execute(
+                "UPDATE users SET last_active=datetime('now'), display_name=? WHERE id=?",
+                (display_name or "", user_id),
+            )
+        else:
+            cur.execute("UPDATE users SET last_active=datetime('now') WHERE id=?", (user_id,))
         conn.commit()
 
 
@@ -443,13 +572,16 @@ def add_balance(user_id, amount, action="balance_adjustment", note=""):
             row = get_user(user_id)
         before = int(row["balance"] or 0)
         after = before + amount
+        if after < 0:
+            raise ValueError("موجودی کیف پول نمی‌تواند منفی شود.")
+        is_test = int(row["is_test"] or 0) if "is_test" in row.keys() else 0
         cur.execute("UPDATE users SET balance=? WHERE id=?", (after, user_id))
         cur.execute(
             """
-            INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note, is_test)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, action, amount, before, after, note or ""),
+            (user_id, action, amount, before, after, note or "", is_test),
         )
         conn.commit()
         return after
@@ -481,11 +613,11 @@ def search_users(query, limit=10):
     cur.execute(
         """
         SELECT * FROM users
-        WHERE id LIKE ? OR username LIKE ?
+        WHERE id LIKE ? OR username LIKE ? OR display_name LIKE ?
         ORDER BY joined_at ASC
         LIMIT ?
         """,
-        (q, q, int(limit)),
+        (q, q, q, int(limit)),
     )
     return cur.fetchall()
 
@@ -498,59 +630,97 @@ def list_users(offset=0, limit=10):
     return cur.fetchall()
 
 
+def list_users_with_stats(offset=0, limit=10):
+    cur.execute(
+        """
+        SELECT u.*,
+               (SELECT COUNT(*) FROM subs s WHERE s.owner=u.id AND s.used=1) AS delivered_count,
+               (SELECT COUNT(*) FROM topups t WHERE t.user_id=u.id AND t.status='approved') AS approved_topup_count,
+               (SELECT COUNT(*) FROM tickets tk WHERE tk.user_id=u.id) AS ticket_count
+        FROM users u
+        ORDER BY u.joined_at ASC, u.id ASC
+        LIMIT ? OFFSET ?
+        """,
+        (int(limit), int(offset)),
+    )
+    return cur.fetchall()
+
+
 def count_users():
     cur.execute("SELECT COUNT(*) AS c FROM users")
-    return cur.fetchone()["c"]
+    return int(cur.fetchone()["c"] or 0)
 
 
-def active_users_count(days=7):
-    cur.execute(
-        "SELECT COUNT(*) AS c FROM users WHERE last_active >= datetime('now', ?)",
-        (f"-{int(days)} days",),
-    )
-    return cur.fetchone()["c"]
+def active_users_count(days=7, include_test=False):
+    sql = "SELECT COUNT(*) AS c FROM users WHERE last_active >= datetime('now', ?)"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql, (f"-{int(days)} days",))
+    return int(cur.fetchone()["c"] or 0)
 
 
-def sum_all_balances():
-    cur.execute("SELECT SUM(balance) AS s FROM users")
-    return cur.fetchone()["s"] or 0
+def count_test_users():
+    cur.execute("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_test,0)=1")
+    return int(cur.fetchone()["c"] or 0)
 
 
-_BROADCAST_WHERE = {
-    "all": "u.banned=0",
-    "buyers": "u.banned=0 AND u.purchased > 0",
-    "no_buy": "u.banned=0 AND u.purchased = 0",
-    "has_sub": "u.banned=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1)",
-    "no_sub": "u.banned=0 AND NOT EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1)",
-    "active7": "u.banned=0 AND u.last_active >= datetime('now', '-7 days')",
-    "inactive7": "u.banned=0 AND (u.last_active < datetime('now', '-7 days') OR u.last_active IS NULL)",
-    "positive_balance": "u.banned=0 AND u.balance > 0",
-    "low_balance": "u.banned=0 AND u.balance > 0 AND u.balance < COALESCE((SELECT CAST(value AS INTEGER) FROM settings WHERE key='plan_price'), 100000)",
-    "referred": "u.banned=0 AND u.ref IS NOT NULL AND TRIM(u.ref) <> ''",
-    "referrers": "u.banned=0 AND EXISTS (SELECT 1 FROM users child WHERE child.ref=u.id)",
+def count_real_users():
+    cur.execute("SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_test,0)=0")
+    return int(cur.fetchone()["c"] or 0)
+
+
+def sum_all_balances(include_test=False):
+    sql = "SELECT COALESCE(SUM(balance),0) AS s FROM users"
+    if not include_test:
+        sql += " WHERE COALESCE(is_test,0)=0"
+    cur.execute(sql)
+    return int(cur.fetchone()["s"] or 0)
+
+
+_BROADCAST_COUNT_SQL = {
+    "all": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0",
+    "buyers": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.purchased > 0",
+    "no_buy": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.purchased = 0",
+    "has_sub": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1)",
+    "no_sub": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND NOT EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1)",
+    "active7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.last_active >= datetime('now', '-7 days')",
+    "inactive7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND (u.last_active < datetime('now', '-7 days') OR u.last_active IS NULL)",
+    "positive_balance": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.balance > 0",
+    "low_balance": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.balance > 0 AND u.balance < COALESCE((SELECT MIN(price) FROM plans WHERE is_active=1), 100000)",
+    "referred": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.ref IS NOT NULL AND TRIM(u.ref) <> ''",
+    "referrers": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND EXISTS (SELECT 1 FROM users child WHERE child.ref=u.id)",
+}
+
+_BROADCAST_LIST_SQL = {
+    "all": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 ORDER BY u.joined_at DESC",
+    "buyers": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.purchased > 0 ORDER BY u.joined_at DESC",
+    "no_buy": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.purchased = 0 ORDER BY u.joined_at DESC",
+    "has_sub": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1) ORDER BY u.joined_at DESC",
+    "no_sub": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND NOT EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1) ORDER BY u.joined_at DESC",
+    "active7": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.last_active >= datetime('now', '-7 days') ORDER BY u.joined_at DESC",
+    "inactive7": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND (u.last_active < datetime('now', '-7 days') OR u.last_active IS NULL) ORDER BY u.joined_at DESC",
+    "positive_balance": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.balance > 0 ORDER BY u.joined_at DESC",
+    "low_balance": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.balance > 0 AND u.balance < COALESCE((SELECT MIN(price) FROM plans WHERE is_active=1), 100000) ORDER BY u.joined_at DESC",
+    "referred": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.ref IS NOT NULL AND TRIM(u.ref) <> '' ORDER BY u.joined_at DESC",
+    "referrers": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND EXISTS (SELECT 1 FROM users child WHERE child.ref=u.id) ORDER BY u.joined_at DESC",
 }
 
 
-def _broadcast_where(scope):
-    if scope not in _BROADCAST_WHERE:
+def _broadcast_scope(scope):
+    if scope not in _BROADCAST_COUNT_SQL:
         raise ValueError(f"unknown broadcast scope: {scope}")
-    return _BROADCAST_WHERE[scope]
+    return scope
 
 
 def count_broadcast_targets(scope):
-    where = _broadcast_where(scope)
-    cur.execute(f"SELECT COUNT(*) AS c FROM users u WHERE {where}")
+    scope = _broadcast_scope(scope)
+    cur.execute(_BROADCAST_COUNT_SQL[scope])
     return cur.fetchone()["c"]
 
 
 def list_broadcast_targets(scope, limit=None):
-    where = _broadcast_where(scope)
-    sql = f"""
-        SELECT u.id, u.username, u.purchased, u.balance, u.last_active
-        FROM users u
-        WHERE {where}
-        ORDER BY u.joined_at DESC
-    """
+    scope = _broadcast_scope(scope)
+    sql = _BROADCAST_LIST_SQL[scope]
     params = []
     if limit is not None:
         sql += " LIMIT ?"
@@ -576,9 +746,12 @@ def list_broadcast_logs(limit=10):
     return cur.fetchall()
 
 
-def referral_count(user_id):
-    cur.execute("SELECT COUNT(*) AS c FROM users WHERE ref=?", (str(user_id),))
-    return cur.fetchone()["c"]
+def referral_count(user_id, include_test=False):
+    sql = "SELECT COUNT(*) AS c FROM users WHERE ref=?"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql, (str(user_id),))
+    return int(cur.fetchone()["c"] or 0)
 
 
 def referrals_rewarded_today(ref_id):
@@ -586,7 +759,7 @@ def referrals_rewarded_today(ref_id):
         """
         SELECT COUNT(*) AS c
         FROM users
-        WHERE ref=? AND rewarded=1 AND date(rewarded_at)=date('now')
+        WHERE ref=? AND rewarded=1 AND COALESCE(is_test,0)=0 AND date(rewarded_at)=date('now')
         """,
         (str(ref_id),),
     )
@@ -596,7 +769,7 @@ def referrals_rewarded_today(ref_id):
 def referred_users(user_id, limit=20):
     cur.execute(
         """
-        SELECT id, username, purchased, rewarded, joined_at
+        SELECT id, username, display_name, purchased, rewarded, joined_at, is_test
         FROM users
         WHERE ref=?
         ORDER BY joined_at ASC
@@ -607,9 +780,12 @@ def referred_users(user_id, limit=20):
     return cur.fetchall()
 
 
-def rewarded_referral_count(user_id):
-    cur.execute("SELECT COUNT(*) AS c FROM users WHERE ref=? AND rewarded=1", (str(user_id),))
-    return cur.fetchone()["c"]
+def rewarded_referral_count(user_id, include_test=False):
+    sql = "SELECT COUNT(*) AS c FROM users WHERE ref=? AND rewarded=1"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql, (str(user_id),))
+    return int(cur.fetchone()["c"] or 0)
 
 
 def referral_reward_total(user_id):
@@ -624,9 +800,12 @@ def referral_reward_total(user_id):
     return cur.fetchone()["s"] or 0
 
 
-def total_referral_rewards():
-    cur.execute("SELECT SUM(referral_rewards) AS s FROM daily_stats")
-    return cur.fetchone()["s"] or 0
+def total_referral_rewards(include_test=False):
+    sql = "SELECT COALESCE(SUM(amount),0) AS s FROM ledger WHERE action='referral_reward'"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql)
+    return int(cur.fetchone()["s"] or 0)
 
 
 def bump_daily(field, amount=1):
@@ -636,7 +815,50 @@ def bump_daily(field, amount=1):
 
 
 def recent_daily_stats(days=7):
-    cur.execute("SELECT * FROM daily_stats ORDER BY day DESC LIMIT ?", (int(days),))
+    """Return report rows derived from source tables, not stale counters.
+
+    ``daily_stats`` is retained for backwards compatibility, but test-account
+    reclassification can make stored counters inaccurate.  Building the small
+    seven/thirty-day report from authoritative tables keeps the admin dashboard
+    consistent immediately after a user is marked as test or real.
+    """
+    days = max(1, min(int(days), 366))
+    cur.execute(
+        """
+        WITH RECURSIVE dates(day, n) AS (
+            SELECT date('now'), 1
+            UNION ALL
+            SELECT date(day, '-1 day'), n + 1 FROM dates WHERE n < ?
+        ),
+        users_by_day AS (
+            SELECT date(joined_at) AS day, COUNT(*) AS value
+            FROM users
+            GROUP BY date(joined_at)
+        ),
+        sales_by_day AS (
+            SELECT date(created_at) AS day, COUNT(*) AS value
+            FROM purchases
+            WHERE status='completed' AND COALESCE(is_test,0)=0
+            GROUP BY date(created_at)
+        ),
+        rewards_by_day AS (
+            SELECT date(created_at) AS day, COALESCE(SUM(amount),0) AS value
+            FROM ledger
+            WHERE action='referral_reward' AND COALESCE(is_test,0)=0
+            GROUP BY date(created_at)
+        )
+        SELECT d.day,
+               COALESCE(u.value,0) AS new_users,
+               COALESCE(s.value,0) AS sales,
+               COALESCE(r.value,0) AS referral_rewards
+        FROM dates d
+        LEFT JOIN users_by_day u ON u.day=d.day
+        LEFT JOIN sales_by_day s ON s.day=d.day
+        LEFT JOIN rewards_by_day r ON r.day=d.day
+        ORDER BY d.day DESC
+        """,
+        (days,),
+    )
     return cur.fetchall()
 
 
@@ -669,10 +891,13 @@ def set_setting(key, value):
 
 
 def create_topup(user_id, amount, target_quantity=None, target_plan_id=None, target_total=None, target_unit_price=None):
+    user = get_user(user_id)
+    is_test = int(user["is_test"] or 0) if user and "is_test" in user.keys() else 0
     cur.execute(
         """
-        INSERT INTO topups(user_id, amount, target_quantity, target_plan_id, target_total, target_unit_price)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO topups(
+            user_id, amount, target_quantity, target_plan_id, target_total, target_unit_price, is_test
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(user_id),
@@ -681,6 +906,7 @@ def create_topup(user_id, amount, target_quantity=None, target_plan_id=None, tar
             int(target_plan_id) if target_plan_id is not None else None,
             int(target_total) if target_total is not None else None,
             int(target_unit_price) if target_unit_price is not None else None,
+            is_test,
         ),
     )
     conn.commit()
@@ -723,9 +949,20 @@ def count_pending_topups():
     return cur.fetchone()["c"]
 
 
-def sum_approved_topups():
-    cur.execute("SELECT SUM(amount) AS s FROM topups WHERE status='approved'")
-    return cur.fetchone()["s"] or 0
+def sum_approved_topups(include_test=False):
+    sql = "SELECT COALESCE(SUM(amount),0) AS s FROM topups WHERE status='approved'"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql)
+    return int(cur.fetchone()["s"] or 0)
+
+
+def user_approved_topup_count(user_id):
+    cur.execute(
+        "SELECT COUNT(*) AS c FROM topups WHERE user_id=? AND status='approved'",
+        (str(user_id),),
+    )
+    return int(cur.fetchone()["c"] or 0)
 
 
 def list_user_topups(user_id, limit=10):
@@ -758,6 +995,58 @@ def record_receipt(file_unique_id, user_id, topup_id):
     except sqlite3.IntegrityError:
         conn.rollback()
         return False
+
+
+def submit_topup_receipt_atomic(topup_id, user_id, file_unique_id):
+    """Attach a receipt and move a topup to pending_review exactly once.
+
+    Returns (ok, reason, topup, previous_uses). Duplicate image IDs are
+    intentionally allowed to reach manual review, but are not inserted twice.
+    """
+    topup_id = int(topup_id)
+    user_id = str(user_id)
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM topups WHERE id=?", (topup_id,))
+            topup = cur.fetchone()
+            if not topup:
+                conn.rollback()
+                return False, "not_found", None, 0
+            if str(topup["user_id"]) != user_id:
+                conn.rollback()
+                return False, "owner_mismatch", topup, 0
+            if topup["status"] != "awaiting_receipt":
+                conn.rollback()
+                return False, "invalid_status", topup, 0
+
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM receipts WHERE file_unique_id=?",
+                (file_unique_id,),
+            )
+            previous_uses = int(cur.fetchone()["c"] or 0)
+            try:
+                cur.execute(
+                    "INSERT INTO receipts(file_unique_id, user_id, topup_id) VALUES (?, ?, ?)",
+                    (file_unique_id, user_id, topup_id),
+                )
+            except sqlite3.IntegrityError:
+                previous_uses = max(1, previous_uses)
+
+            cur.execute(
+                "UPDATE topups SET status='pending_review' "
+                "WHERE id=? AND status='awaiting_receipt'",
+                (topup_id,),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "invalid_status", topup, previous_uses
+            conn.commit()
+            cur.execute("SELECT * FROM topups WHERE id=?", (topup_id,))
+            return True, "submitted", cur.fetchone(), previous_uses
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def is_low_stock_alerted():
@@ -878,15 +1167,20 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
     user_id = str(user_id)
     quantity = int(quantity)
     plan_id = int(plan_id) if plan_id is not None else default_plan_id()
-    plan = get_plan(plan_id) or get_plan(default_plan_id())
+    plan = get_plan(plan_id)
     if unit_price is None:
         unit_price = int(plan["price"] if plan else 0)
     else:
         unit_price = int(unit_price)
     total = quantity * unit_price
 
-    if quantity < 1 or quantity > 4:
-        raise PurchaseError("invalid_quantity", "تعداد انتخاب‌شده معتبر نیست.")
+    if not plan:
+        raise PurchaseError("plan_not_found", "پلن پیدا نشد.")
+    if int(plan["is_active"] or 0) != 1:
+        raise PurchaseError("plan_inactive", "این پلن در حال حاضر فعال نیست.")
+    max_per_order = max(1, min(4, int(plan["max_per_order"] or 4)))
+    if quantity < 1 or quantity > max_per_order:
+        raise PurchaseError("invalid_quantity", "تعداد انتخاب‌شده برای این پلن معتبر نیست.")
 
     with LOCK:
         try:
@@ -898,6 +1192,7 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
             if int(user["banned"] or 0):
                 raise PurchaseError("banned", "حساب شما مسدود است.")
 
+            is_test = int(user["is_test"] or 0) if "is_test" in user.keys() else 0
             balance_before = int(user["balance"] or 0)
             if balance_before < total:
                 raise PurchaseError("insufficient_balance", "موجودی کیف پول کافی نیست.")
@@ -909,10 +1204,10 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
 
             cur.execute(
                 """
-                INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note, plan_id)
-                VALUES (?, ?, ?, ?, 'completed', ?, ?)
+                INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note, plan_id, is_test)
+                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
                 """,
-                (user_id, quantity, total, unit_price, note or "", plan_id),
+                (user_id, quantity, total, unit_price, note or "", plan_id, is_test),
             )
             purchase_id = cur.lastrowid
 
@@ -920,10 +1215,10 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
             cur.execute("UPDATE users SET balance=?, purchased=purchased+? WHERE id=?", (balance_after, quantity, user_id))
             cur.execute(
                 """
-                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note)
-                VALUES (?, 'purchase', ?, ?, ?, ?)
+                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note, is_test)
+                VALUES (?, 'purchase', ?, ?, ?, ?, ?)
                 """,
-                (user_id, -total, balance_before, balance_after, f"purchase_id={purchase_id}"),
+                (user_id, -total, balance_before, balance_after, f"purchase_id={purchase_id}", is_test),
             )
 
             cur.execute("SELECT * FROM subs WHERE used=0 AND plan_id=? ORDER BY id LIMIT ?", (plan_id, quantity))
@@ -976,7 +1271,8 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
                 )
                 items.append(dict(assigned))
 
-            _bump_daily_tx("sales", quantity)
+            if not is_test:
+                _bump_daily_tx("sales", quantity)
             conn.commit()
             return {
                 "purchase_id": purchase_id,
@@ -985,6 +1281,7 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
                 "amount": total,
                 "balance_before": balance_before,
                 "balance_after": balance_after,
+                "is_test": is_test,
                 "items": items,
             }
         except PurchaseError:
@@ -1038,7 +1335,25 @@ def purchase_count_by_user(user_id):
 
 def delivered_sub_count_by_user(user_id):
     cur.execute("SELECT COUNT(*) AS c FROM subs WHERE owner=? AND used=1", (str(user_id),))
-    return cur.fetchone()["c"]
+    return int(cur.fetchone()["c"] or 0)
+
+
+def delivered_sub_counts_by_test_status():
+    cur.execute(
+        """
+        SELECT
+            SUM(CASE WHEN COALESCE(u.is_test,0)=0 THEN 1 ELSE 0 END) AS real_count,
+            SUM(CASE WHEN COALESCE(u.is_test,0)=1 THEN 1 ELSE 0 END) AS test_count
+        FROM subs s
+        LEFT JOIN users u ON u.id=s.owner
+        WHERE s.used=1
+        """
+    )
+    row = cur.fetchone()
+    return {
+        "real": int(row["real_count"] or 0),
+        "test": int(row["test_count"] or 0),
+    }
 
 
 
@@ -1063,6 +1378,7 @@ def approve_topup_atomic(topup_id, admin_id=None):
 
             user_id = str(topup["user_id"])
             amount = int(topup["amount"])
+            is_test = int(topup["is_test"] or 0) if "is_test" in topup.keys() else 0
             cur.execute("SELECT * FROM users WHERE id=?", (user_id,))
             user = cur.fetchone()
             if not user:
@@ -1074,10 +1390,10 @@ def approve_topup_atomic(topup_id, admin_id=None):
             cur.execute("UPDATE users SET balance=? WHERE id=?", (after, user_id))
             cur.execute(
                 """
-                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note)
-                VALUES (?, 'topup_approved', ?, ?, ?, ?)
+                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note, is_test)
+                VALUES (?, 'topup_approved', ?, ?, ?, ?, ?)
                 """,
-                (user_id, amount, before, after, f"topup_id={topup_id};admin_id={admin_id or '-'}"),
+                (user_id, amount, before, after, f"topup_id={topup_id};admin_id={admin_id or '-'}", is_test),
             )
             cur.execute(
                 "UPDATE topups SET status='approved', reviewed_at=datetime('now') WHERE id=? AND status='pending_review'",
@@ -1549,6 +1865,25 @@ def plan_sold_count(plan_id):
     return int(cur.fetchone()["c"] or 0)
 
 
+def plan_sales_by_test_status(plan_id):
+    cur.execute(
+        """
+        SELECT
+            SUM(CASE WHEN COALESCE(p.is_test,0)=0 THEN 1 ELSE 0 END) AS real_count,
+            SUM(CASE WHEN COALESCE(p.is_test,0)=1 THEN 1 ELSE 0 END) AS test_count
+        FROM purchase_items pi
+        JOIN purchases p ON p.id=pi.purchase_id
+        WHERE pi.plan_id=? AND COALESCE(pi.status,'active')='active'
+        """,
+        (int(plan_id),),
+    )
+    row = cur.fetchone()
+    return {
+        "real": int(row["real_count"] or 0),
+        "test": int(row["test_count"] or 0),
+    }
+
+
 # --- System buttons ---
 
 
@@ -1633,25 +1968,29 @@ def find_system_button_by_title(title):
 # --- Bot message cleanup ---
 
 
+TRACKED_MESSAGE_KINDS = {"menu", "temp", "preview", "list", "important", "delivery", "receipt", "backup"}
+
+
 def track_bot_message(chat_id, user_id, message_id, context="", kind="menu"):
-    try:
+    kind = (kind or "menu").strip().lower()
+    if kind not in TRACKED_MESSAGE_KINDS:
+        kind = "temp"
+    with LOCK:
         cur.execute(
             """
             INSERT OR REPLACE INTO bot_messages(chat_id, user_id, message_id, context, kind)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (str(chat_id), str(user_id), int(message_id), context or "", kind or "menu"),
+            (str(chat_id), str(user_id), int(message_id), (context or "")[:100], kind),
         )
         conn.commit()
-    except Exception:
-        pass
 
 
 def list_tracked_bot_messages(chat_id, user_id, limit=30, kinds=None):
     if kinds:
         placeholders = ",".join(["?"] * len(kinds))
         cur.execute(
-            f"SELECT * FROM bot_messages WHERE chat_id=? AND user_id=? AND kind IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
+            f"SELECT * FROM bot_messages WHERE chat_id=? AND user_id=? AND kind IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",  # nosec B608
             [str(chat_id), str(user_id), *list(kinds), int(limit)],
         )
     else:
@@ -1667,8 +2006,15 @@ def clear_tracked_bot_message(chat_id, message_id):
     conn.commit()
 
 
-def clear_tracked_bot_messages(chat_id, user_id):
-    cur.execute("DELETE FROM bot_messages WHERE chat_id=? AND user_id=?", (str(chat_id), str(user_id)))
+def clear_tracked_bot_messages(chat_id, user_id, kinds=None):
+    if kinds:
+        placeholders = ",".join(["?"] * len(kinds))
+        cur.execute(
+            f"DELETE FROM bot_messages WHERE chat_id=? AND user_id=? AND kind IN ({placeholders})",  # nosec B608
+            [str(chat_id), str(user_id), *list(kinds)],
+        )
+    else:
+        cur.execute("DELETE FROM bot_messages WHERE chat_id=? AND user_id=?", (str(chat_id), str(user_id)))
     conn.commit()
 
 
@@ -1689,19 +2035,41 @@ def set_user_admin_note(user_id, note):
     return cur.rowcount == 1
 
 
+def _set_user_test_state(user_id, flag: bool):
+    """Classify a user and all of their financial history consistently.
+
+    Inventory remains consumed until an admin explicitly returns a delivered
+    test service to the pool. Referral rewards that were already paid to a
+    different account are intentionally not reversed automatically.
+    """
+    user_id = str(user_id)
+    value = 1 if flag else 0
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("UPDATE users SET is_test=? WHERE id=?", (value, user_id))
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            cur.execute("UPDATE purchases SET is_test=? WHERE user_id=?", (value, user_id))
+            cur.execute("UPDATE topups SET is_test=? WHERE user_id=?", (value, user_id))
+            cur.execute("UPDATE ledger SET is_test=? WHERE user_id=?", (value, user_id))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def toggle_user_test(user_id):
-    cur.execute(
-        "UPDATE users SET is_test=CASE WHEN COALESCE(is_test,0)=1 THEN 0 ELSE 1 END WHERE id=?",
-        (str(user_id),),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    user = get_user(user_id)
+    if not user:
+        return False
+    return _set_user_test_state(user_id, not bool(int(user["is_test"] or 0)))
 
 
 def set_user_test(user_id, flag: bool):
-    cur.execute("UPDATE users SET is_test=? WHERE id=?", (1 if flag else 0, str(user_id)))
-    conn.commit()
-    return cur.rowcount == 1
+    return _set_user_test_state(user_id, bool(flag))
 
 
 def log_admin_action(admin_id, action_type, target_user_id=None, details=""):
@@ -1724,28 +2092,52 @@ def list_admin_logs(limit=20):
     return cur.fetchall()
 
 
-def today_sales_total():
-    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND date(created_at)=date('now')")
+def today_sales_total(include_test=False):
+    sql = "SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND date(created_at)=date('now')"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql)
     return int(cur.fetchone()["s"] or 0)
 
 
-def yesterday_sales_total():
-    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND date(created_at)=date('now','-1 day')")
+def yesterday_sales_total(include_test=False):
+    sql = "SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND date(created_at)=date('now','-1 day')"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql)
     return int(cur.fetchone()["s"] or 0)
 
 
-def period_sales_total(days=7):
-    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND created_at >= datetime('now', ?)", (f"-{int(days)} days",))
+def period_sales_total(days=7, include_test=False):
+    sql = "SELECT COALESCE(SUM(amount),0) AS s FROM purchases WHERE status='completed' AND created_at >= datetime('now', ?)"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql, (f"-{int(days)} days",))
     return int(cur.fetchone()["s"] or 0)
 
 
-def period_purchase_count(days=7):
-    cur.execute("SELECT COUNT(*) AS c FROM purchases WHERE status='completed' AND created_at >= datetime('now', ?)", (f"-{int(days)} days",))
+def period_purchase_count(days=7, include_test=False):
+    sql = "SELECT COUNT(*) AS c FROM purchases WHERE status='completed' AND created_at >= datetime('now', ?)"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql, (f"-{int(days)} days",))
     return int(cur.fetchone()["c"] or 0)
 
 
-def approved_topups_total_for_days(days=1):
-    cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM topups WHERE status='approved' AND reviewed_at >= datetime('now', ?)", (f"-{int(days)} days",))
+def approved_topups_total_for_days(days=1, include_test=False):
+    sql = "SELECT COALESCE(SUM(amount),0) AS s FROM topups WHERE status='approved' AND reviewed_at >= datetime('now', ?)"
+    if not include_test:
+        sql += " AND COALESCE(is_test,0)=0"
+    cur.execute(sql, (f"-{int(days)} days",))
+    return int(cur.fetchone()["s"] or 0)
+
+
+def test_sales_total(days=30):
+    cur.execute(
+        "SELECT COALESCE(SUM(amount),0) AS s FROM purchases "
+        "WHERE status='completed' AND COALESCE(is_test,0)=1 AND created_at >= datetime('now', ?)",
+        (f"-{int(days)} days",),
+    )
     return int(cur.fetchone()["s"] or 0)
 
 
@@ -1760,6 +2152,128 @@ def set_plan_low_stock_alerted(plan_id, flag: bool):
 def reset_plan_low_stock_alerts():
     cur.execute("DELETE FROM settings WHERE key LIKE 'plan_low_stock_alerted_%'")
     conn.commit()
+
+
+def reward_referral_atomic(referred_id, reward_amount, max_total=0, max_per_day=0):
+    """Pay a referral reward exactly once and exclude test accounts.
+
+    Returns: (status, reason, referrer_id).
+    """
+    referred_id = str(referred_id)
+    reward_amount = int(reward_amount)
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM users WHERE id=?", (referred_id,))
+            referred = cur.fetchone()
+            if not referred:
+                conn.rollback()
+                return "skipped", "user_not_found", None
+            referrer_id = str(referred["ref"] or "").strip()
+            if not referrer_id:
+                conn.rollback()
+                return "skipped", "no_referrer", None
+            if int(referred["rewarded"] or 0):
+                conn.rollback()
+                return "skipped", "already_rewarded", referrer_id
+            if referrer_id == referred_id:
+                conn.rollback()
+                return "blocked", "self_referral", referrer_id
+            if int(referred["banned"] or 0):
+                conn.rollback()
+                return "blocked", "referred_banned", referrer_id
+            if int(referred["is_test"] or 0):
+                conn.rollback()
+                return "skipped", "test_referred_user", referrer_id
+
+            cur.execute("SELECT * FROM users WHERE id=?", (referrer_id,))
+            referrer = cur.fetchone()
+            if not referrer:
+                conn.rollback()
+                return "blocked", "referrer_not_found", referrer_id
+            if int(referrer["banned"] or 0):
+                conn.rollback()
+                return "blocked", "referrer_banned", referrer_id
+            if int(referrer["is_test"] or 0):
+                conn.rollback()
+                return "skipped", "test_referrer", referrer_id
+
+            if int(max_total or 0) > 0:
+                cur.execute("SELECT COUNT(*) AS c FROM users WHERE ref=? AND rewarded=1 AND COALESCE(is_test,0)=0", (referrer_id,))
+                if int(cur.fetchone()["c"] or 0) >= int(max_total):
+                    conn.rollback()
+                    return "blocked", "referral_cap_exceeded", referrer_id
+            if int(max_per_day or 0) > 0:
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM users WHERE ref=? AND rewarded=1 AND COALESCE(is_test,0)=0 AND date(rewarded_at)=date('now')",
+                    (referrer_id,),
+                )
+                if int(cur.fetchone()["c"] or 0) >= int(max_per_day):
+                    conn.rollback()
+                    return "blocked", "daily_referral_limit", referrer_id
+
+            before = int(referrer["balance"] or 0)
+            after = before + reward_amount
+            cur.execute("UPDATE users SET balance=? WHERE id=?", (after, referrer_id))
+            cur.execute(
+                """
+                INSERT INTO ledger(user_id, action, amount, balance_before, balance_after, note, is_test)
+                VALUES (?, 'referral_reward', ?, ?, ?, ?, 0)
+                """,
+                (referrer_id, reward_amount, before, after, f"referred_id={referred_id}"),
+            )
+            cur.execute(
+                "UPDATE users SET rewarded=1, rewarded_at=datetime('now') WHERE id=? AND rewarded=0",
+                (referred_id,),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return "skipped", "already_rewarded", referrer_id
+            _bump_daily_tx("referral_rewards", reward_amount)
+            conn.commit()
+            return "rewarded", None, referrer_id
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def reject_topup_atomic(topup_id, admin_id=None):
+    topup_id = int(topup_id)
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT * FROM topups WHERE id=?", (topup_id,))
+            topup = cur.fetchone()
+            if not topup:
+                conn.rollback()
+                return False, "not_found", None
+            if topup["status"] != "pending_review":
+                conn.rollback()
+                return False, "already_reviewed", topup
+            cur.execute(
+                "UPDATE topups SET status='rejected', reviewed_at=datetime('now') "
+                "WHERE id=? AND status='pending_review'",
+                (topup_id,),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False, "already_reviewed", topup
+            conn.commit()
+            cur.execute("SELECT * FROM topups WHERE id=?", (topup_id,))
+            return True, "rejected", cur.fetchone()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def database_health():
+    with LOCK:
+        try:
+            cur.execute("PRAGMA quick_check")
+            row = cur.fetchone()
+            return bool(row and str(row[0]).lower() == "ok")
+        except sqlite3.DatabaseError:
+            return False
 
 
 # --- Backup logs / schema metadata ---

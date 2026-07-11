@@ -1,5 +1,9 @@
+import logging
+
 from aiogram import types
 from config import ADMIN_IDS
+
+logger = logging.getLogger(__name__)
 
 # عنوان‌های پیش‌فرض فقط برای fallback هستند. عنوان واقعی دکمه‌های سیستمی از db.system_buttons خوانده می‌شود.
 BTN_BUY = "🛒 خرید سرویس"
@@ -36,6 +40,7 @@ def system_button_title(key: str) -> str:
         import db
         return db.system_button_title(key)
     except Exception:
+        logger.debug("Could not read system button title for %s", key, exc_info=True)
         return DEFAULT_SYSTEM_BUTTON_TITLES.get(key, key)
 
 
@@ -50,6 +55,7 @@ def matches_system_button(text: str, key: str) -> bool:
         row = db.get_system_button(key)
         return bool(row and int(row["is_active"] or 0) == 1 and text == (row["title"] or row["default_title"]))
     except Exception:
+        logger.debug("Could not match system button %s", key, exc_info=True)
         return False
 
 
@@ -73,6 +79,7 @@ def system_buttons_for_location(location="main", user_id=None):
             result.append((key, row["title"] or row["default_title"]))
         return result
     except Exception:
+        logger.debug("Could not load system buttons for %s", location, exc_info=True)
         if location != "main":
             return []
         result = fallback[:]
@@ -90,6 +97,7 @@ def _custom_buttons_for_location(location="main", user_id=None):
         import db
         rows = db.list_active_custom_buttons(location)
     except Exception:
+        logger.debug("Could not load custom buttons for %s", location, exc_info=True)
         return []
 
     result = []

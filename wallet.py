@@ -1,11 +1,6 @@
-"""
-جریان شارژ کیف پول.
+"""Wallet top-up, receipt review, and targeted checkout flow."""
 
-Patch mode:
-- امضای process_receipt با aiogram v2 سازگار است.
-- بعد از ارسال رسید، منوی پایین تلگرام دوباره برمی‌گردد.
-- تایید/رد رسید هم برای کاربر منوی اصلی را برمی‌گرداند.
-"""
+import logging
 
 from aiogram import Bot, types
 from aiogram.dispatcher import FSMContext
@@ -16,7 +11,9 @@ import menus
 import settings
 from affiliate import reward_ref
 from config import ADMIN_IDS
-from utils import cleanup_qr, make_qr
+from utils import cleanup_qr, make_qr, parse_int
+
+logger = logging.getLogger(__name__)
 
 
 class TopupStates(StatesGroup):
@@ -55,15 +52,13 @@ async def process_amount(m: types.Message, state: FSMContext):
             reply_markup=cancel_kb(),
         )
 
-    text = m.text.strip().replace(",", "")
+    amount = parse_int(m.text)
 
-    if not text.isdigit():
+    if amount is None:
         return await m.answer(
             "لطفاً فقط عدد بفرستید. مثال: 100000",
             reply_markup=cancel_kb(),
         )
-
-    amount = int(text)
     min_amount = settings.min_topup()
 
     if amount < min_amount:
@@ -77,10 +72,9 @@ async def process_amount(m: types.Message, state: FSMContext):
 
     await m.answer(
         f"💳 لطفاً مبلغ {amount:,} تومان رو به شماره کارت زیر واریز کنید:\n"
-        f"`{settings.card_number()}`\n"
+        f"{settings.card_number()}\n"
         f"به نام: {settings.card_holder()}\n\n"
         "بعد از واریز، عکس رسید پرداخت رو همینجا بفرستید.",
-        parse_mode="Markdown",
         reply_markup=cancel_kb(),
     )
     await TopupStates.waiting_receipt.set()
@@ -127,24 +121,33 @@ async def process_receipt(m: types.Message, state: FSMContext):
 
     photo = m.photo[-1]
 
-    previous_uses = db.find_receipt(photo.file_unique_id)
-    is_duplicate = len(previous_uses) > 0
+    ok, reason, submitted_topup, previous_uses = db.submit_topup_receipt_atomic(
+        topup_id,
+        m.from_user.id,
+        photo.file_unique_id,
+    )
+    if not ok:
+        await state.finish()
+        return await m.answer(
+            "این درخواست قبلاً ارسال یا بررسی شده است. لطفاً از کیف پول دوباره شروع کنید.",
+            reply_markup=menus.main_reply_kb(m.from_user.id),
+        )
 
-    receipt_recorded = db.record_receipt(photo.file_unique_id, m.from_user.id, topup_id)
-    if not receipt_recorded:
-        is_duplicate = True
-    db.set_topup_status(topup_id, "pending_review")
+    topup = submitted_topup
+    is_duplicate = previous_uses > 0
     await state.finish()
 
+    test_marker = "\n🧪 این درخواست متعلق به کاربر تست است." if int(topup["is_test"] or 0) else ""
     caption = (
         f"💳 درخواست شارژ جدید #{topup_id}\n"
         f"👤 کاربر: {m.from_user.full_name} (@{m.from_user.username or '---'}) | ID: {m.from_user.id}\n"
         f"💰 مبلغ: {topup['amount']:,} تومان"
+        f"{test_marker}"
     )
 
     if is_duplicate:
         caption = (
-            f"⚠️ هشدار: این عکس قبلاً {len(previous_uses)} بار به‌عنوان رسید فرستاده شده!\n"
+            f"⚠️ هشدار: این عکس قبلاً {previous_uses} بار به‌عنوان رسید فرستاده شده!\n"
             "احتمال تقلب - قبل از تایید حتماً دستی بررسی کنید.\n\n"
             + caption
         )
@@ -159,7 +162,7 @@ async def process_receipt(m: types.Message, state: FSMContext):
         try:
             await bot.send_photo(admin_id, photo.file_id, caption=caption, reply_markup=kb)
         except Exception:
-            pass
+            logger.exception("Could not send topup %s receipt to admin %s", topup_id, admin_id)
 
     await m.answer(
         "✅ رسید شما برای بررسی ارسال شد.\n"
@@ -203,6 +206,7 @@ async def cb_confirm(c: types.CallbackQuery):
                 plan_id=int(target_plan_id),
             )
             db.mark_topup_purchase_completed(topup_id)
+            new_balance = result["balance_after"]
             plan = db.get_plan(target_plan_id)
             auto_purchase_msg = (
                 f"\n\n🛒 خرید شما خودکار تکمیل شد.\n"
@@ -214,13 +218,36 @@ async def cb_confirm(c: types.CallbackQuery):
             )
 
             if was_first_purchase:
-                reward_ref(topup["user_id"])
+                referral_status, referral_detail = reward_ref(topup["user_id"])
+                if referral_status == "rewarded":
+                    try:
+                        await bot.send_message(
+                            int(referral_detail),
+                            "💰 یکی از زیرمجموعه‌های شما اولین خرید واقعی خود را انجام داد. "
+                            "پاداش رفرال به کیف پول شما اضافه شد.",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not notify referrer %s after auto purchase",
+                            referral_detail,
+                            exc_info=True,
+                        )
+                elif referral_status == "blocked":
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(admin_id, referral_detail)
+                        except Exception:
+                            logger.warning(
+                                "Could not send referral fraud warning to admin %s",
+                                admin_id,
+                                exc_info=True,
+                            )
 
             for index, item in enumerate(result["items"], start=1):
                 qr_path = make_qr(item["link"], topup["user_id"])
                 try:
                     with open(qr_path, "rb") as f:
-                        await bot.send_photo(
+                        sent_service = await bot.send_photo(
                             int(topup["user_id"]),
                             f,
                             caption=(
@@ -228,6 +255,13 @@ async def cb_confirm(c: types.CallbackQuery):
                                 f"شناسه سرویس: {item['account_name']}\n\n"
                                 f"لینک سرویس:\n{item['link']}"
                             ),
+                        )
+                        db.track_bot_message(
+                            sent_service.chat.id,
+                            topup["user_id"],
+                            sent_service.message_id,
+                            "auto_purchase_delivery",
+                            kind="delivery",
                         )
                 finally:
                     cleanup_qr(qr_path)
@@ -247,7 +281,7 @@ async def cb_confirm(c: types.CallbackQuery):
             reply_markup=menus.main_reply_kb(topup["user_id"]),
         )
     except Exception:
-        pass
+        logger.warning("Could not notify user %s about approved topup", topup["user_id"], exc_info=True)
 
     await _edit_safely(c, f"✅ درخواست #{topup_id} تایید شد.{auto_purchase_msg}")
 
@@ -259,15 +293,12 @@ async def cb_reject(c: types.CallbackQuery):
 
     await c.answer()
     topup_id = int(c.data.split("_")[-1])
-    topup = db.get_topup(topup_id)
-
-    if not topup:
-        return await _edit_safely(c, "این درخواست پیدا نشد.")
-
-    if topup["status"] != "pending_review":
+    ok, reason, topup = db.reject_topup_atomic(topup_id, admin_id=c.from_user.id)
+    if not ok:
+        if reason == "not_found":
+            return await _edit_safely(c, "این درخواست پیدا نشد.")
         return await _edit_safely(c, "این درخواست قبلاً بررسی شده.")
 
-    db.set_topup_status(topup_id, "rejected")
     db.log_admin_action(c.from_user.id, "reject_topup", topup["user_id"], f"topup_id={topup_id}; amount={topup['amount']}")
 
     try:
@@ -278,7 +309,7 @@ async def cb_reject(c: types.CallbackQuery):
             reply_markup=menus.main_reply_kb(topup["user_id"]),
         )
     except Exception:
-        pass
+        logger.warning("Could not notify user %s about rejected topup", topup["user_id"], exc_info=True)
 
     await _edit_safely(c, f"❌ درخواست #{topup_id} رد شد.")
 

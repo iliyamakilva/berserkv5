@@ -1,18 +1,26 @@
+"""Small shared utilities with no dependency on the bot dispatcher."""
+
+from __future__ import annotations
+
 import os
 import tempfile
-from datetime import datetime, date
+from datetime import date, datetime
 
 import qrcode
 
 
 _PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+_TO_ASCII_DIGITS = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789",
+)
 
 
 def make_qr(link: str, user_id) -> str:
     fd, path = tempfile.mkstemp(prefix=f"sub_{user_id}_", suffix=".png")
     os.close(fd)
-    img = qrcode.make(link)
-    img.save(path)
+    image = qrcode.make(link)
+    image.save(path)
     return path
 
 
@@ -27,8 +35,28 @@ def to_persian_digits(value) -> str:
     return str(value).translate(_PERSIAN_DIGITS)
 
 
+def normalize_digits(value) -> str:
+    """Convert Persian/Arabic digits to ASCII and trim surrounding whitespace."""
+    return str(value or "").translate(_TO_ASCII_DIGITS).strip()
+
+
+def parse_int(value, *, allow_negative: bool = False, default=None):
+    """Parse a human-entered integer with commas and Persian/Arabic digits."""
+    raw = normalize_digits(value).replace(",", "").replace("٬", "").replace(" ", "")
+    if allow_negative and raw.startswith("-"):
+        digits = raw[1:]
+        if digits.isdigit():
+            return -int(digits)
+    elif raw.isdigit():
+        return int(raw)
+    return default
+
+
 def gregorian_to_jalali(gy: int, gm: int, gd: int):
-    """Convert Gregorian date to Jalali date without extra dependencies."""
+    """Convert a Gregorian date to Jalali without an external dependency."""
+    if not (1 <= gm <= 12 and 1 <= gd <= 31):
+        raise ValueError("invalid Gregorian date")
+
     g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
     if gy > 1600:
         jy = 979
@@ -69,18 +97,28 @@ def _parse_datetime(value):
         return value
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
+
     raw = str(value).strip()
     if not raw or raw == "-":
         return None
-    # SQLite datetime('now') is usually YYYY-MM-DD HH:MM:SS.
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+
+    formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d",
+    )
+    for fmt in formats:
+        candidate = raw[:19] if "%S" in fmt else raw[:10]
         try:
-            return datetime.strptime(raw[:19] if "%S" in fmt else raw[:10], fmt)
+            return datetime.strptime(candidate, fmt)
         except ValueError:
-            pass
+            continue
+
     try:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -89,14 +127,14 @@ def jalali_date(value, persian_digits: bool = True) -> str:
     if not dt:
         return "-"
     jy, jm, jd = gregorian_to_jalali(dt.year, dt.month, dt.day)
-    out = f"{jy:04d}/{jm:02d}/{jd:02d}"
-    return to_persian_digits(out) if persian_digits else out
+    output = f"{jy:04d}/{jm:02d}/{jd:02d}"
+    return to_persian_digits(output) if persian_digits else output
 
 
 def format_dual_datetime(value, show_time: bool = True) -> str:
-    """Return Gregorian + Jalali date for admin/user messages."""
+    """Return Gregorian and Jalali representations with a consistent format."""
     dt = _parse_datetime(value)
     if not dt:
         return "-"
-    greg = dt.strftime("%Y-%m-%d %H:%M") if show_time else dt.strftime("%Y-%m-%d")
-    return f"{greg} | شمسی: {jalali_date(dt)}"
+    gregorian = dt.strftime("%Y-%m-%d %H:%M") if show_time else dt.strftime("%Y-%m-%d")
+    return f"{gregorian} | شمسی: {jalali_date(dt)}"

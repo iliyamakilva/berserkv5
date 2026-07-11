@@ -1,3 +1,7 @@
+"""Runtime-editable settings stored in SQLite."""
+
+from __future__ import annotations
+
 from db import get_setting, get_setting_int, set_setting
 
 DEFAULTS = {
@@ -16,56 +20,55 @@ DEFAULTS = {
 }
 
 
-def ensure_defaults():
+def ensure_defaults() -> None:
     for key, value in DEFAULTS.items():
         if get_setting(key) is None:
             set_setting(key, value)
 
 
-def plan_title():
+def plan_title() -> str:
     return get_setting("plan_title", DEFAULTS["plan_title"])
 
 
-def plan_duration_label():
+def plan_duration_label() -> str:
     return get_setting("plan_duration_label", DEFAULTS["plan_duration_label"])
 
 
-def plan_price():
+def plan_price() -> int:
     return get_setting_int("plan_price", int(DEFAULTS["plan_price"]))
 
 
-def ref_reward():
+def ref_reward() -> int:
     return get_setting_int("ref_reward", int(DEFAULTS["ref_reward"]))
 
 
-def card_number():
+def card_number() -> str:
     return get_setting("card_number", DEFAULTS["card_number"])
 
 
-def card_holder():
+def card_holder() -> str:
     return get_setting("card_holder", DEFAULTS["card_holder"])
 
 
-def min_topup():
+def min_topup() -> int:
     return get_setting_int("min_topup", int(DEFAULTS["min_topup"]))
 
 
-def low_stock_threshold():
+def low_stock_threshold() -> int:
     return get_setting_int("low_stock_threshold", int(DEFAULTS["low_stock_threshold"]))
 
 
-
-def bot_enabled():
+def bot_enabled() -> bool:
     return get_setting_int("bot_enabled", int(DEFAULTS["bot_enabled"])) == 1
 
 
-def bot_disabled_message():
+def bot_disabled_message() -> str:
     return get_setting("bot_disabled_message", DEFAULTS["bot_disabled_message"])
 
 
-def sales_enabled():
+def sales_enabled() -> bool:
     return get_setting_int("sales_enabled", int(DEFAULTS["sales_enabled"])) == 1
 
 
-def sales_closed_message():
+def sales_closed_message() -> str:
     return get_setting("sales_closed_message", DEFAULTS["sales_closed_message"])

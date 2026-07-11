@@ -18,7 +18,7 @@ import wallet
 from affiliate import reward_ref
 from config import ADMIN_COMMAND, ADMIN_IDS, BOT_TOKEN, validate
 from fsm_storage import SQLiteStorage
-from utils import cleanup_qr, make_qr, format_dual_datetime
+from utils import cleanup_qr, format_dual_datetime, make_qr
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +40,8 @@ db.init()
 settings.ensure_defaults()
 
 dp = Dispatcher(bot, storage=SQLiteStorage())
+
+DISPOSABLE_MESSAGE_KINDS = ("menu", "temp", "preview", "list")
 
 
 def wallet_menu_kb(include_bulk=False):
@@ -81,10 +83,15 @@ def buy_quantity_kb(max_qty: int, plan_id=None):
 
 
 async def send_main_menu(target, user_id: int):
-    await target.answer(
+    await _start_clean_section(target, user_id, "main")
+    return await _send_answer(
+        target,
+        user_id,
         "⚡ Berserk VPN Ready\n\n"
         "از منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
         reply_markup=menus.main_reply_kb(user_id),
+        context="main",
+        kind="menu",
     )
 
 async def _safe_delete_callback_message(c: types.CallbackQuery):
@@ -94,33 +101,43 @@ async def _safe_delete_callback_message(c: types.CallbackQuery):
     except Exception:
         try:
             await c.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("could not remove callback keyboard: %s", exc)
         return False
 
 
-async def _track_sent(user_id, sent, context=""):
+async def _track_sent(user_id, sent, context="", kind="menu"):
     if sent is None:
         return
     if not isinstance(sent, (list, tuple)):
         sent = [sent]
     for msg in sent:
         try:
-            db.track_bot_message(msg.chat.id, user_id, msg.message_id, context)
+            db.track_bot_message(
+                msg.chat.id,
+                user_id,
+                msg.message_id,
+                context=context,
+                kind=kind,
+            )
         except Exception:
-            pass
+            logger.debug("Could not track bot message", exc_info=True)
 
 
-async def _cleanup_user_messages(chat_id, user_id):
-    rows = db.list_tracked_bot_messages(chat_id, user_id, limit=40)
+async def _cleanup_user_messages(chat_id, user_id, kinds=DISPOSABLE_MESSAGE_KINDS):
+    rows = db.list_tracked_bot_messages(chat_id, user_id, limit=60, kinds=kinds)
     for row in rows:
         try:
             await bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
         except Exception:
             try:
-                await bot.edit_message_reply_markup(int(row["chat_id"]), int(row["message_id"]), reply_markup=None)
+                await bot.edit_message_reply_markup(
+                    int(row["chat_id"]),
+                    int(row["message_id"]),
+                    reply_markup=None,
+                )
             except Exception:
-                pass
+                logger.debug("Could not delete tracked message", exc_info=True)
         finally:
             db.clear_tracked_bot_message(row["chat_id"], row["message_id"])
 
@@ -136,16 +153,28 @@ async def _start_clean_section(target, user_id, context=""):
     await _cleanup_user_messages(chat_id, user_id)
 
 
-async def _send_template(target, user_id, key, body_text, reply_markup=None, context=""):
+async def _send_template(
+    target, user_id, key, body_text, reply_markup=None, context="", kind="menu"
+):
     sent = await messages.send(target, key, body_text, reply_markup=reply_markup)
-    await _track_sent(user_id, sent, context or key)
+    await _track_sent(user_id, sent, context or key, kind=kind)
     return sent
 
 
-async def _send_answer(target, user_id, text, reply_markup=None, context=""):
-    sent = await target.answer(text, reply_markup=reply_markup)
-    await _track_sent(user_id, sent, context)
-    return sent
+async def _send_answer(
+    target, user_id, text, reply_markup=None, context="", kind="menu"
+):
+    chunks = messages.split_text(text)
+    sent_messages = []
+    for index, chunk in enumerate(chunks):
+        sent_messages.append(
+            await target.answer(
+                chunk,
+                reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            )
+        )
+    await _track_sent(user_id, sent_messages, context, kind=kind)
+    return sent_messages
 
 
 async def render_buy(target, user_id: int, username: str = "", plan_id=None):
@@ -176,9 +205,15 @@ async def render_buy(target, user_id: int, username: str = "", plan_id=None):
             lines.append(f"{idx}. {plan['title']}{extra}{duration}{tag}\nقیمت: {int(plan['price']):,} تومان{stock_text}\n")
         return await _send_template(target, user_id, "menu_buy", "\n".join(lines), reply_markup=plans_kb(), context="buy")
 
-    plan = db.get_plan(plan_id) if plan_id is not None else (active_plans[0] if active_plans else db.get_plan())
-    if not plan:
-        return await _send_answer(target, user_id, "❌ پلنی برای فروش تنظیم نشده است.", reply_markup=menus.main_reply_kb(user_id), context="buy")
+    plan = db.get_plan(plan_id) if plan_id is not None else (active_plans[0] if active_plans else None)
+    if not plan or int(plan["is_active"] or 0) != 1:
+        return await _send_answer(
+            target,
+            user_id,
+            "❌ در حال حاضر پلن فعالی برای فروش تنظیم نشده است.",
+            reply_markup=menus.main_reply_kb(user_id),
+            context="buy",
+        )
 
     plan_id = int(plan["id"])
     price = int(plan["price"])
@@ -248,8 +283,8 @@ async def check_low_stock_alert(plan_id=None):
                     f"حد هشدار: {threshold} لینک\n"
                     "لطفاً برای این پلن لینک جدید وارد کنید.",
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("could not send low-stock alert to admin %s: %s", admin_id, exc)
         db.set_plan_low_stock_alerted(plan["id"], True)
 
 
@@ -261,11 +296,19 @@ def _is_admin_user(user_id) -> bool:
 
 
 async def _send_bot_disabled(target, user_id):
-    return await target.answer(settings.bot_disabled_message(), reply_markup=menus.main_reply_kb(user_id))
+    await _start_clean_section(target, user_id, "bot_disabled")
+    return await _send_answer(
+        target, user_id, settings.bot_disabled_message(),
+        reply_markup=menus.main_reply_kb(user_id), context="bot_disabled", kind="menu"
+    )
 
 
 async def _send_sales_closed(target, user_id):
-    return await target.answer(settings.sales_closed_message(), reply_markup=menus.main_reply_kb(user_id))
+    await _start_clean_section(target, user_id, "sales_closed")
+    return await _send_answer(
+        target, user_id, settings.sales_closed_message(),
+        reply_markup=menus.main_reply_kb(user_id), context="sales_closed", kind="menu"
+    )
 
 
 @dp.message_handler(lambda m: not _is_admin_user(m.from_user.id) and not settings.bot_enabled(), content_types=types.ContentTypes.ANY, state="*")
@@ -294,11 +337,15 @@ async def start(m: types.Message):
     if row["banned"]:
         return await m.answer("⛔ حساب شما مسدود شده.\nبرای پیگیری با پشتیبانی تماس بگیرید.")
 
-    await messages.send(
+    await _start_clean_section(m, m.from_user.id, "welcome")
+    await _send_template(
         m,
+        m.from_user.id,
         "welcome",
         "⚡ Berserk VPN Ready\n\nمنوی اصلی پایین صفحه همیشه در دسترس شماست.",
         reply_markup=menus.main_reply_kb(m.from_user.id),
+        context="welcome",
+        kind="menu",
     )
 
 
@@ -329,13 +376,17 @@ async def text_referral(m: types.Message):
 
 @dp.message_handler(lambda m: menus.matches_system_button(m.text, "ticket"))
 async def text_ticket(m: types.Message):
-    await messages.send(
+    await _start_clean_section(m, m.from_user.id, "support")
+    await _send_template(
         m,
+        m.from_user.id,
         "support_intro",
         "برای ارسال پیام به پشتیبانی، روی دکمه زیر بزنید:",
         reply_markup=types.InlineKeyboardMarkup().add(
             types.InlineKeyboardButton("🎫 ارسال پیام پشتیبانی", callback_data="ticket_start")
         ),
+        context="support",
+        kind="menu",
     )
 
 
@@ -343,16 +394,34 @@ async def text_ticket(m: types.Message):
 async def text_admin(m: types.Message):
     if not admin.is_admin(m.from_user.id):
         return
-    await m.answer("⚙️ پنل مدیریت Berserk VPN", reply_markup=admin.admin_menu_kb())
+    await _start_clean_section(m, m.from_user.id, "admin")
+    await _send_answer(
+        m,
+        m.from_user.id,
+        "⚙️ پنل مدیریت Berserk VPN",
+        reply_markup=admin.admin_menu_kb(),
+        context="admin",
+        kind="menu",
+    )
 
 
 @dp.message_handler(commands=["cancel"], state="*")
 async def cmd_cancel(m: types.Message, state: FSMContext):
     current = await state.get_state()
-    if current is None:
-        return await m.answer("چیزی برای لغو کردن نیست.", reply_markup=menus.main_reply_kb(m.from_user.id))
-    await state.finish()
-    await m.answer("❌ لغو شد.", reply_markup=menus.main_reply_kb(m.from_user.id))
+    if current is not None:
+        await state.finish()
+        text = "❌ لغو شد."
+    else:
+        text = "چیزی برای لغو کردن نیست."
+    await _start_clean_section(m, m.from_user.id, "cancelled")
+    return await _send_answer(
+        m,
+        m.from_user.id,
+        text,
+        reply_markup=menus.main_reply_kb(m.from_user.id),
+        context="cancelled",
+        kind="menu",
+    )
 
 
 @dp.callback_query_handler(lambda c: c.data == "cancel_fsm", state="*")
@@ -363,28 +432,28 @@ async def cb_cancel_fsm(c: types.CallbackQuery, state: FSMContext):
     if current is not None:
         await state.finish()
 
-    # پیام inline قبلی حذف می‌شود تا دکمه‌های قدیمی قابل اسپم نباشند.
+    await _cleanup_user_messages(c.message.chat.id, c.from_user.id)
     await _safe_delete_callback_message(c)
 
-    await bot.send_message(
+    sent = await bot.send_message(
         c.message.chat.id,
         "❌ لغو شد.",
         reply_markup=menus.main_reply_kb(c.from_user.id),
     )
+    await _track_sent(c.from_user.id, sent, "cancelled", kind="menu")
 
 
 @dp.callback_query_handler(lambda c: c.data == "back_main")
 async def back_main(c: types.CallbackQuery):
     await c.answer()
-
-    # پیام inline قبلی حذف می‌شود تا دکمه‌های قدیمی قابل اسپم نباشند.
+    await _cleanup_user_messages(c.message.chat.id, c.from_user.id)
     await _safe_delete_callback_message(c)
-
-    await bot.send_message(
+    sent = await bot.send_message(
         c.message.chat.id,
         "⚡ Berserk VPN Ready\n\nاز منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
         reply_markup=menus.main_reply_kb(c.from_user.id),
     )
+    await _track_sent(c.from_user.id, sent, "main", kind="menu")
 
 
 @dp.callback_query_handler(lambda c: c.data == "buy")
@@ -434,6 +503,18 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
     if not plan or int(plan["is_active"] or 0) != 1:
         return await c.message.answer("این پلن فعال نیست یا پیدا نشد.", reply_markup=menus.main_reply_kb(c.from_user.id))
 
+    max_per_order = max(1, min(4, int(plan["max_per_order"] or 4)))
+    if qty > max_per_order:
+        return await c.message.answer(
+            "تعداد انتخاب‌شده برای این پلن مجاز نیست.",
+            reply_markup=menus.main_reply_kb(c.from_user.id),
+        )
+    if subs.stock_count(plan_id) < qty:
+        return await c.message.answer(
+            "موجودی این پلن برای تعداد انتخاب‌شده کافی نیست.",
+            reply_markup=menus.main_reply_kb(c.from_user.id),
+        )
+
     was_first_purchase = int(user["purchased"] or 0) == 0
     price = int(plan["price"])
     total = qty * price
@@ -457,13 +538,13 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
             f"قیمت کل: {total:,} تومان\n"
             f"موجودی فعلی کیف پول: {balance:,} تومان\n"
             f"مبلغ قابل پرداخت برای تکمیل خرید: {missing:,} تومان\n\n"
-            f"شماره کارت:\n`{settings.card_number()}`\n"
+            f"شماره کارت:\n{settings.card_number()}\n"
             f"به نام: {settings.card_holder()}\n\n"
             "بعد از واریز، عکس رسید پرداخت را همینجا ارسال کنید.\n"
             "بعد از تأیید ادمین، ربات تلاش می‌کند همین خرید را خودکار تکمیل کند."
         )
-        sent = await c.message.answer(text, parse_mode="Markdown", reply_markup=wallet.cancel_kb())
-        await _track_sent(c.from_user.id, sent, "targeted_topup")
+        sent = await c.message.answer(text, reply_markup=wallet.cancel_kb())
+        await _track_sent(c.from_user.id, sent, "targeted_topup", kind="important")
         return
 
     try:
@@ -489,12 +570,13 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
             for admin_id in ADMIN_IDS:
                 try:
                     await bot.send_message(admin_id, detail)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("could not send referral-fraud alert to admin %s: %s", admin_id, exc)
 
     await check_low_stock_alert(plan_id)
 
     post_purchase_text = (plan["post_purchase_text"] if "post_purchase_text" in plan.keys() else "") or ""
+    test_notice = "\n🧪 این خرید آزمایشی است و در گزارش فروش واقعی محاسبه نمی‌شود." if result.get("is_test") else ""
     success_text = (
         f"✅ خرید موفق!\n"
         f"شماره خرید: #{result['purchase_id']}\n"
@@ -502,6 +584,7 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
         f"تعداد تحویل‌شده: {len(result['items'])} عدد\n"
         f"مبلغ کسرشده: {result['amount']:,} تومان\n"
         f"موجودی جدید: {result['balance_after']:,} تومان"
+        f"{test_notice}"
     )
     if post_purchase_text.strip():
         success_text += "\n\n" + post_purchase_text.strip()
@@ -509,7 +592,7 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
         success_text,
         reply_markup=menus.main_reply_kb(c.from_user.id),
     )
-    await _track_sent(c.from_user.id, sent, "purchase_result")
+    await _track_sent(c.from_user.id, sent, "purchase_result", kind="important")
 
     for index, item in enumerate(result["items"], start=1):
         qr_path = make_qr(item["link"], user_id)
@@ -523,7 +606,7 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
                         f"لینک سرویس:\n{item['link']}"
                     ),
                 )
-                await _track_sent(c.from_user.id, sent_photo, "purchase_link")
+                await _track_sent(c.from_user.id, sent_photo, "purchase_link", kind="delivery")
         finally:
             cleanup_qr(qr_path)
 
@@ -537,10 +620,11 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
                 f"شماره خرید: #{result['purchase_id']}\n"
                 f"پلن: {plan['title']}\n"
                 f"تعداد: {len(result['items'])}\n"
-                f"مبلغ: {result['amount']:,} تومان",
+                f"مبلغ: {result['amount']:,} تومان"
+                + ("\n🧪 خرید کاربر تست" if result.get("is_test") else ""),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("could not send purchase notification to admin %s: %s", admin_id, exc)
 
 @dp.callback_query_handler(lambda c: c.data == "confirm_buy")
 async def confirm_buy(c: types.CallbackQuery):
@@ -569,8 +653,8 @@ async def buy_bulk(c: types.CallbackQuery):
         try:
             sent = await bot.send_message(admin_id, text)
             db.record_ticket_message(admin_id, sent.message_id, ticket_id, user_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("could not create bulk-purchase admin ticket message for %s: %s", admin_id, exc)
 
     await c.message.answer(
         "✅ درخواست خرید عمده برای مدیریت ارسال شد.\n"
@@ -667,6 +751,7 @@ async def show_guide_menu(target, user_id: int, username: str = ""):
 
 
 async def show_guide_page(target, key: str, user_id: int):
+    await _start_clean_section(target, user_id, key)
     await _send_template(
         target,
         user_id,
@@ -716,9 +801,13 @@ def _custom_button_allowed(row, user_id):
 
 
 async def render_custom_button(target, row, user_id: int, username: str = ""):
+    await _start_clean_section(target, user_id, "custom_button")
     db.touch_active(str(user_id), username)
     if not _custom_button_allowed(row, user_id):
-        return await target.answer("این دکمه برای حساب شما فعال نیست.", reply_markup=menus.main_reply_kb(user_id))
+        return await _send_answer(
+            target, user_id, "این دکمه برای حساب شما فعال نیست.",
+            reply_markup=menus.main_reply_kb(user_id), context="custom_button", kind="menu"
+        )
 
     button_type = row["button_type"] or "text"
     payload = row["payload"] or ""
@@ -726,38 +815,55 @@ async def render_custom_button(target, row, user_id: int, username: str = ""):
 
     if button_type == "link":
         if not payload.startswith(("http://", "https://", "tg://")):
-            return await target.answer("لینک این دکمه معتبر نیست. لطفاً به پشتیبانی اطلاع دهید.", reply_markup=menus.main_reply_kb(user_id))
+            return await _send_answer(
+                target, user_id, "لینک این دکمه معتبر نیست. لطفاً به پشتیبانی اطلاع دهید.",
+                reply_markup=menus.main_reply_kb(user_id), context="custom_button", kind="menu"
+            )
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(types.InlineKeyboardButton(title, url=payload))
         kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
-        return await target.answer(f"برای باز کردن «{title}» روی دکمه زیر بزنید:", reply_markup=kb)
+        return await _send_answer(
+            target, user_id, f"برای باز کردن «{title}» روی دکمه زیر بزنید:",
+            reply_markup=kb, context="custom_button", kind="menu"
+        )
 
     if button_type == "support":
-        return await messages.send(
+        return await _send_template(
             target,
+            user_id,
             "support_intro",
             payload or "برای ارسال پیام به پشتیبانی، روی دکمه زیر بزنید:",
             reply_markup=types.InlineKeyboardMarkup().add(
                 types.InlineKeyboardButton("🎫 ارسال پیام پشتیبانی", callback_data="ticket_start")
             ),
+            context="custom_button_support",
+            kind="menu",
         )
 
     if button_type == "buy_plan":
-        plan_id = None
-        if str(payload).strip().isdigit():
-            plan_id = int(str(payload).strip())
+        plan_id = int(payload) if str(payload).strip().isdigit() else None
         return await render_buy(target, user_id, username, plan_id=plan_id)
 
     if button_type == "file":
         if payload:
             try:
-                return await target.answer_document(payload, caption=title, reply_markup=menus.main_reply_kb(user_id))
+                sent = await target.answer_document(
+                    payload, caption=title, reply_markup=menus.main_reply_kb(user_id)
+                )
+                await _track_sent(user_id, sent, "custom_button_file", kind="important")
+                return sent
             except Exception:
-                pass
-        return await target.answer("فایل این دکمه در دسترس نیست.", reply_markup=menus.main_reply_kb(user_id))
+                logger.warning("Custom button file_id is unavailable", exc_info=True)
+        return await _send_answer(
+            target, user_id, "فایل این دکمه در دسترس نیست.",
+            reply_markup=menus.main_reply_kb(user_id), context="custom_button", kind="menu"
+        )
 
-    # text / faq / guide / submenu در نسخه ربات به صورت پیام امن نمایش داده می‌شوند.
-    await target.answer(payload or title, reply_markup=menus.main_reply_kb(user_id))
+    # text / faq / guide / submenu are rendered as safe text in the bot UI.
+    return await _send_answer(
+        target, user_id, payload or title,
+        reply_markup=menus.main_reply_kb(user_id), context="custom_button", kind="menu"
+    )
 
 
 @dp.message_handler(lambda m: db.get_active_custom_button_by_title(m.text or "") is not None)
@@ -766,6 +872,7 @@ async def text_custom_button(m: types.Message):
     await render_custom_button(m, row, m.from_user.id, m.from_user.username or "")
 
 async def show_wallet(target, user_id: int, username: str = ""):
+    await _start_clean_section(target, user_id, "wallet")
     user_id_str = str(user_id)
     db.touch_active(user_id_str, username, getattr(target.from_user, "full_name", None) if hasattr(target, "from_user") else None)
     user = db.get_user(user_id_str)
@@ -776,11 +883,14 @@ async def show_wallet(target, user_id: int, username: str = ""):
     bal = user["balance"] if user else 0
     purchased = user["purchased"] if user else 0
 
-    await messages.send(
+    await _send_template(
         target,
+        user_id,
         "menu_wallet",
         f"💳 موجودی: {bal:,} تومان\n📦 تعداد خرید: {purchased}",
         reply_markup=wallet_menu_kb(),
+        context="wallet",
+        kind="menu",
     )
 
 
@@ -791,20 +901,24 @@ async def wallet_menu(c: types.CallbackQuery):
 
 
 async def show_referral(target, user_id: int, username: str = ""):
+    await _start_clean_section(target, user_id, "referral")
     user_id_str = str(user_id)
     bot_user = (await bot.get_me()).username
     link = f"https://t.me/{bot_user}?start={user_id_str}"
     count = db.referral_count(user_id_str)
     reward = settings.ref_reward()
 
-    await messages.send(
+    await _send_template(
         target,
+        user_id,
         "menu_referral",
         f"👥 لینک دعوت اختصاصی شما:\n{link}\n\n"
         f"تعداد زیرمجموعه: {count} نفر\n"
         f"پاداش هر اولین خرید واقعی زیرمجموعه: {reward:,} تومان\n\n"
         "پاداش فقط بعد از اولین خرید واقعی زیرمجموعه پرداخت می‌شود.",
         reply_markup=menus.main_reply_kb(user_id),
+        context="referral",
+        kind="menu",
     )
 
 
@@ -834,34 +948,41 @@ async def global_error_handler(update: types.Update, exception: Exception):
                 "⚠️ مشکلی پیش اومد. لطفاً دوباره تلاش کنید یا /cancel رو بزنید.",
                 reply_markup=menus.main_reply_kb(update.callback_query.from_user.id),
             )
-    except Exception:
-        pass
+    except Exception as notify_exc:
+        logger.debug("could not notify user about handler error: %s", notify_exc)
 
     tb = traceback.format_exc()[-1500:]
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(admin_id, f"🚨 خطای پیش‌بینی‌نشده:\n{tb}")
-        except Exception:
-            pass
+        except Exception as admin_notify_exc:
+            logger.error("could not deliver error report to admin %s: %s", admin_id, admin_notify_exc)
     return True
 
 
 @dp.message_handler(content_types=types.ContentTypes.ANY, state="*")
 async def fallback_message(m: types.Message, state: FSMContext):
-    await m.answer(
+    await _start_clean_section(m, m.from_user.id, "fallback")
+    await _send_answer(
+        m,
+        m.from_user.id,
         "متوجه نشدم. از منوی پایین تلگرام استفاده کنید یا /start رو بزنید.",
         reply_markup=menus.main_reply_kb(m.from_user.id),
+        context="fallback",
+        kind="menu",
     )
 
 
 @dp.callback_query_handler(lambda c: True, state="*")
 async def fallback_callback(c: types.CallbackQuery):
-    await c.answer("این دکمه دیگه معتبر نیست.", show_alert=True)
+    await c.answer("این دکمه دیگر معتبر نیست.")
 
 
 async def on_startup(dispatcher):
-    asyncio.create_task(backup.daily_backup_loop(bot, ADMIN_IDS))
-    logger.info("Berserk VPN bot started, daily backup loop scheduled.")
+    if not db.database_health():
+        raise RuntimeError("SQLite quick_check failed during startup")
+    asyncio.create_task(backup.daily_backup_loop(bot, ADMIN_IDS), name="daily-backup")
+    logger.info("Berserk VPN bot started; database health OK; daily backup scheduled.")
 
 
 if __name__ == "__main__":
