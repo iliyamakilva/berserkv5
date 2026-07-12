@@ -1,3 +1,4 @@
+import json
 import logging
 import secrets
 import sqlite3
@@ -10,7 +11,7 @@ from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 610
+SCHEMA_VERSION = 620
 
 _db_parent = Path(DB_PATH).expanduser().parent
 if str(_db_parent) not in ("", "."):
@@ -343,10 +344,42 @@ def init():
             CREATE TABLE IF NOT EXISTS trial_claims(
                 user_id TEXT PRIMARY KEY,
                 panel_username TEXT UNIQUE,
+                provider_key TEXT DEFAULT 'youpanel',
                 sub_id INTEGER,
                 status TEXT DEFAULT 'pending',
                 error TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plan_categories(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                emoji TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                sort_order INTEGER DEFAULT 100,
+                is_active INTEGER DEFAULT 1,
+                audience TEXT DEFAULT 'all',
+                starts_at TEXT,
+                ends_at TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_menu_items(
+                key TEXT PRIMARY KEY,
+                default_title TEXT NOT NULL,
+                title TEXT,
+                callback_data TEXT NOT NULL,
+                sort_order INTEGER DEFAULT 100,
+                is_active INTEGER DEFAULT 1,
                 updated_at TEXT DEFAULT (datetime('now'))
             )
             """
@@ -435,6 +468,10 @@ def init():
         _add_column_if_missing("plans", "panel_start_mode", "TEXT DEFAULT 'on_hold'")
         _add_column_if_missing("plans", "panel_reset_strategy", "TEXT DEFAULT 'no_reset'")
         _add_column_if_missing("plans", "panel_max_devices", "INTEGER")
+        _add_column_if_missing("plans", "category_id", "INTEGER")
+        _add_column_if_missing("plans", "purchase_mode", "TEXT DEFAULT 'quantity'")
+        _add_column_if_missing("plans", "provider_key", "TEXT DEFAULT 'pool'")
+        _add_column_if_missing("plans", "provider_options_json", "TEXT DEFAULT '{}'")
         _add_column_if_missing("subs", "source_type", "TEXT DEFAULT 'pool'")
         _add_column_if_missing("subs", "panel_provider", "TEXT")
         _add_column_if_missing("subs", "panel_username", "TEXT")
@@ -446,6 +483,7 @@ def init():
         _add_column_if_missing("subs", "is_trial", "INTEGER DEFAULT 0")
         _add_column_if_missing("subs", "last_synced_at", "TEXT")
         _add_column_if_missing("purchases", "provider", "TEXT DEFAULT 'pool'")
+        _add_column_if_missing("trial_claims", "provider_key", "TEXT DEFAULT 'youpanel'")
         _add_column_if_missing("purchases", "provision_error", "TEXT")
         _add_column_if_missing("purchases", "completed_at", "TEXT")
         _add_column_if_missing("purchases", "refunded_at", "TEXT")
@@ -478,6 +516,10 @@ def init():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON admin_logs(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_joined ON users(joined_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_plan_categories_active_order ON plan_categories(is_active, sort_order)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_plans_category_active_order ON plans(category_id, is_active, sort_order)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_plans_provider ON plans(provider_key, is_active)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_menu_order ON admin_menu_items(is_active, sort_order)")
 
         cur.execute("SELECT link, COUNT(*) AS c FROM subs GROUP BY link HAVING c > 1 LIMIT 1")
         if cur.fetchone() is None:
@@ -510,14 +552,22 @@ def init():
         )
 
         _ensure_default_plan()
+        _ensure_default_categories()
         _ensure_system_buttons()
+        _ensure_admin_menu_items()
+        _migrate_catalog_assignments()
+        cur.execute("UPDATE system_buttons SET location='buy', updated_at=datetime('now') WHERE key='trial' AND location='main'")
         cur.execute("UPDATE subs SET plan_id=? WHERE plan_id IS NULL", (default_plan_id(),))
 
         cur.execute("UPDATE subs SET status='available' WHERE status IS NULL AND used=0")
         cur.execute("UPDATE subs SET status='delivered' WHERE status IS NULL AND used=1")
         cur.execute("UPDATE subs SET source_type='pool' WHERE source_type IS NULL OR TRIM(source_type)=''")
         cur.execute("UPDATE plans SET delivery_type='pool' WHERE delivery_type IS NULL OR TRIM(delivery_type)=''")
+        cur.execute("UPDATE plans SET provider_key=CASE WHEN COALESCE(delivery_type,'pool')='youpanel' THEN 'youpanel' ELSE 'pool' END WHERE provider_key IS NULL OR TRIM(provider_key)='' OR provider_key='pool'")
+        cur.execute("UPDATE plans SET purchase_mode='quantity' WHERE purchase_mode IS NULL OR purchase_mode NOT IN ('direct','quantity','wholesale','disabled')")
+        cur.execute("UPDATE plans SET provider_options_json='{}' WHERE provider_options_json IS NULL OR TRIM(provider_options_json)=''")
         cur.execute("UPDATE purchases SET provider='pool' WHERE provider IS NULL OR TRIM(provider)=''")
+        cur.execute("UPDATE trial_claims SET provider_key='youpanel' WHERE provider_key IS NULL OR TRIM(provider_key)=''")
         cur.execute("UPDATE purchases SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
         cur.execute("UPDATE topups SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
         cur.execute("UPDATE ledger SET is_test=1 WHERE user_id IN (SELECT id FROM users WHERE COALESCE(is_test,0)=1)")
@@ -1218,10 +1268,13 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
         raise PurchaseError("plan_not_found", "پلن پیدا نشد.")
     if int(plan["is_active"] or 0) != 1:
         raise PurchaseError("plan_inactive", "این پلن در حال حاضر فعال نیست.")
-    if (plan["delivery_type"] if "delivery_type" in plan.keys() else "pool") != "pool":
-        raise PurchaseError("wrong_delivery_type", "این پلن باید از پنل به‌صورت خودکار ساخته شود.")
-    max_per_order = max(1, min(4, int(plan["max_per_order"] or 4)))
-    if quantity < 1 or quantity > max_per_order:
+    if plan_provider_key(plan) != "pool":
+        raise PurchaseError("wrong_delivery_type", "این پلن توسط تأمین‌کننده به‌صورت خودکار ساخته می‌شود.")
+    mode = plan_purchase_mode(plan)
+    if mode in {"disabled", "wholesale"}:
+        raise PurchaseError("purchase_mode", "خرید مستقیم این پلن فعال نیست.")
+    max_per_order = max(1, min(100, int(plan["max_per_order"] or 4)))
+    if quantity < 1 or quantity > max_per_order or (mode == "direct" and quantity != 1):
         raise PurchaseError("invalid_quantity", "تعداد انتخاب‌شده برای این پلن معتبر نیست.")
 
     with LOCK:
@@ -1246,8 +1299,8 @@ def complete_purchase(user_id, quantity, unit_price=None, note="", plan_id=None)
 
             cur.execute(
                 """
-                INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note, plan_id, is_test)
-                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
+                INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note, plan_id, is_test, provider)
+                VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, 'pool')
                 """,
                 (user_id, quantity, total, unit_price, note or "", plan_id, is_test),
             )
@@ -1520,7 +1573,7 @@ def clear_message_draft(key):
 
 ALLOWED_CUSTOM_BUTTON_TYPES = {"text", "link", "submenu", "file", "support", "buy_plan", "faq", "guide"}
 ALLOWED_CUSTOM_BUTTON_LOCATIONS = {"main", "buy", "my_services", "wallet", "support", "guide", "account"}
-ALLOWED_CUSTOM_BUTTON_AUDIENCES = {"all", "buyers", "no_buy", "has_service", "no_service", "admins"}
+ALLOWED_CUSTOM_BUTTON_AUDIENCES = {"all", "buyers", "no_buy", "has_service", "no_service", "normal", "test", "admins"}
 
 
 def _normalize_custom_button_payload(data):
@@ -1664,6 +1717,42 @@ def list_custom_buttons(location=None, include_drafts=True, limit=50):
     return cur.fetchall()
 
 
+def move_custom_button(button_id, direction):
+    """Stage an up/down move for a custom button inside its effective location."""
+    if direction not in {"up", "down"}:
+        return False
+    row = get_custom_button(button_id)
+    if not row:
+        return False
+    current = custom_button_effective_data(row)
+    location = current.get("location") or "main"
+    rows = list_custom_buttons(location=location, include_drafts=True, limit=500)
+    effective = []
+    for candidate in rows:
+        data = custom_button_effective_data(candidate)
+        if (data.get("location") or "main") == location:
+            effective.append((candidate, data))
+    effective.sort(key=lambda item: (int(item[1].get("sort_order") or 100), int(item[0]["id"])))
+    index = next((i for i, item in enumerate(effective) if int(item[0]["id"]) == int(button_id)), None)
+    if index is None:
+        return False
+    other_index = index - 1 if direction == "up" else index + 1
+    if other_index < 0 or other_index >= len(effective):
+        return False
+    other_row, other_data = effective[other_index]
+    this_order = int(current.get("sort_order") or 100)
+    other_order = int(other_data.get("sort_order") or 100)
+    if this_order == other_order:
+        # Give the pair deterministic neighboring values before swapping.
+        this_order = index * 10 + 10
+        other_order = other_index * 10 + 10
+    current["sort_order"], other_data["sort_order"] = other_order, this_order
+    # Draft helpers validate and persist the complete effective payload for both buttons.
+    save_custom_button_draft(button_id, current)
+    save_custom_button_draft(other_row["id"], other_data)
+    return True
+
+
 def list_active_custom_buttons(location="main"):
     cur.execute(
         """
@@ -1738,14 +1827,310 @@ def custom_button_effective_data(row, prefer_draft=True):
 
 
 
-# --- Plans ---
+# --- Catalog, categories, providers and menus ---
+
+DEFAULT_ADMIN_MENU_ITEMS = [
+    ("users", "👥 کاربران", "adm_section_users", 10),
+    ("catalog", "📦 کاتالوگ و فروش", "adm_section_services", 20),
+    ("finance", "💰 سفارش‌ها و پرداخت‌ها", "adm_section_finance", 30),
+    ("tickets", "🎫 پشتیبانی", "adm_tickets", 40),
+    ("content", "🎨 محتوا و ظاهر", "adm_section_personalize", 50),
+    ("reports", "📊 گزارش‌ها", "adm_section_reports", 60),
+    ("backup", "💾 سیستم و بک‌آپ", "adm_backup_menu", 70),
+    ("settings", "⚙️ تنظیمات", "adm_settings", 80),
+]
+
+
+def _ensure_default_categories():
+    cur.execute("SELECT COUNT(*) AS c FROM plan_categories")
+    if int(cur.fetchone()["c"] or 0) == 0:
+        cur.execute(
+            "INSERT INTO plan_categories(title, emoji, description, sort_order, is_active) VALUES ('سرویس‌ها', '📦', 'پلن‌های قابل خرید', 100, 1)"
+        )
+
+
+def _category_for_legacy_plan(title, tag=""):
+    text = f"{title or ''} {tag or ''}".casefold()
+    if "vip" in text or "ویژه" in text:
+        wanted = ("VIP", "💎", "سرویس‌های ویژه و پریمیوم", 10)
+    elif "اقتصادی" in text or "economic" in text or "economy" in text:
+        wanted = ("اقتصادی", "🌱", "پلن‌های مقرون‌به‌صرفه", 20)
+    else:
+        wanted = ("سرویس‌ها", "📦", "پلن‌های قابل خرید", 100)
+    cur.execute("SELECT id FROM plan_categories WHERE lower(title)=lower(?) ORDER BY id LIMIT 1", (wanted[0],))
+    row = cur.fetchone()
+    if row:
+        return int(row["id"])
+    cur.execute(
+        "INSERT INTO plan_categories(title, emoji, description, sort_order, is_active) VALUES (?,?,?,?,1)",
+        wanted,
+    )
+    return int(cur.lastrowid)
+
+
+def _migrate_catalog_assignments():
+    cur.execute("SELECT id,title,tag,category_id,delivery_type,provider_key FROM plans ORDER BY id")
+    for row in cur.fetchall():
+        category_id = row["category_id"]
+        if not category_id:
+            category_id = _category_for_legacy_plan(row["title"], row["tag"])
+        provider = (row["provider_key"] or "").strip().lower()
+        legacy_delivery = (row["delivery_type"] or "pool").strip().lower()
+        # Adding provider_key to a legacy DB gives old rows the SQL default "pool".
+        # Preserve YouPanel rows by honoring the former delivery_type during migration.
+        if not provider or (provider == "pool" and legacy_delivery == "youpanel"):
+            provider = "youpanel" if legacy_delivery == "youpanel" else "pool"
+        cur.execute(
+            "UPDATE plans SET category_id=?, provider_key=?, delivery_type=CASE WHEN ?='youpanel' THEN 'youpanel' ELSE 'pool' END WHERE id=?",
+            (int(category_id), provider, provider, int(row["id"])),
+        )
+
+
+def _ensure_admin_menu_items():
+    for key, title, callback_data, sort_order in DEFAULT_ADMIN_MENU_ITEMS:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO admin_menu_items(key, default_title, title, callback_data, sort_order, is_active)
+            VALUES (?,?,?,?,?,1)
+            """,
+            (key, title, title, callback_data, int(sort_order)),
+        )
+
+
+def list_admin_menu_items(active_only=False):
+    sql = "SELECT * FROM admin_menu_items"
+    if active_only:
+        sql += " WHERE is_active=1"
+    sql += " ORDER BY sort_order, key"
+    cur.execute(sql)
+    return cur.fetchall()
+
+
+def get_admin_menu_item(key):
+    cur.execute("SELECT * FROM admin_menu_items WHERE key=?", ((key or "").strip(),))
+    return cur.fetchone()
+
+
+def update_admin_menu_item(key, *, title=None, is_active=None, direction=None):
+    row = get_admin_menu_item(key)
+    if not row:
+        return False
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if direction in {"up", "down"}:
+                operator = "<" if direction == "up" else ">"
+                order_by = "DESC" if direction == "up" else "ASC"
+                cur.execute(
+                    f"SELECT * FROM admin_menu_items WHERE sort_order {operator} ? ORDER BY sort_order {order_by}, key {order_by} LIMIT 1",  # nosec B608
+                    (int(row["sort_order"] or 100),),
+                )
+                other = cur.fetchone()
+                if other:
+                    cur.execute("UPDATE admin_menu_items SET sort_order=? WHERE key=?", (int(other["sort_order"]), key))
+                    cur.execute("UPDATE admin_menu_items SET sort_order=? WHERE key=?", (int(row["sort_order"]), other["key"]))
+            if title is not None:
+                cur.execute("UPDATE admin_menu_items SET title=?,updated_at=datetime('now') WHERE key=?", ((title or row["default_title"]).strip(), key))
+            if is_active is not None:
+                cur.execute("UPDATE admin_menu_items SET is_active=?,updated_at=datetime('now') WHERE key=?", (1 if is_active else 0, key))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def reset_admin_menu_items():
+    for key, title, callback_data, sort_order in DEFAULT_ADMIN_MENU_ITEMS:
+        cur.execute(
+            "UPDATE admin_menu_items SET title=?,callback_data=?,sort_order=?,is_active=1,updated_at=datetime('now') WHERE key=?",
+            (title, callback_data, int(sort_order), key),
+        )
+    conn.commit()
+
+
+def create_plan_category(data):
+    title = (data.get("title") or "").strip()
+    if not title:
+        raise ValueError("عنوان دسته الزامی است")
+    audience = (data.get("audience") or "all").strip().lower()
+    if audience not in ALLOWED_CUSTOM_BUTTON_AUDIENCES:
+        raise ValueError("گروه هدف دسته معتبر نیست")
+    cur.execute(
+        """
+        INSERT INTO plan_categories(title,emoji,description,sort_order,is_active,audience,starts_at,ends_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (
+            title,
+            (data.get("emoji") or "").strip()[:16],
+            (data.get("description") or "").strip(),
+            int(data.get("sort_order") or 100),
+            1 if int(data.get("is_active", 1) or 0) else 0,
+            audience,
+            data.get("starts_at") or None,
+            data.get("ends_at") or None,
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def get_plan_category(category_id):
+    cur.execute("SELECT * FROM plan_categories WHERE id=?", (int(category_id),))
+    return cur.fetchone()
+
+
+def list_plan_categories(active_only=False, include_empty=True, limit=50):
+    sql = """
+        SELECT c.*, COUNT(p.id) AS plan_count,
+               SUM(CASE WHEN p.is_active=1 AND COALESCE(p.purchase_mode,'quantity')!='disabled' THEN 1 ELSE 0 END) AS active_plan_count
+        FROM plan_categories c
+        LEFT JOIN plans p ON p.category_id=c.id
+    """
+    params = []
+    conditions = []
+    if active_only:
+        conditions.append("c.is_active=1")
+        conditions.append("(c.starts_at IS NULL OR c.starts_at='' OR c.starts_at<=datetime('now'))")
+        conditions.append("(c.ends_at IS NULL OR c.ends_at='' OR c.ends_at>=datetime('now'))")
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " GROUP BY c.id"
+    if not include_empty:
+        sql += " HAVING active_plan_count > 0"
+    sql += " ORDER BY c.sort_order,c.id LIMIT ?"
+    params.append(int(limit))
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def update_plan_category(category_id, data):
+    row = get_plan_category(category_id)
+    if not row:
+        return False
+    merged = {k: row[k] for k in row.keys()}
+    merged.update(data or {})
+    title = (merged.get("title") or "").strip()
+    if not title:
+        raise ValueError("عنوان دسته الزامی است")
+    audience = (merged.get("audience") or "all").strip().lower()
+    if audience not in ALLOWED_CUSTOM_BUTTON_AUDIENCES:
+        raise ValueError("گروه هدف دسته معتبر نیست")
+    cur.execute(
+        """
+        UPDATE plan_categories SET title=?,emoji=?,description=?,sort_order=?,is_active=?,audience=?,starts_at=?,ends_at=?,updated_at=datetime('now')
+        WHERE id=?
+        """,
+        (
+            title,
+            (merged.get("emoji") or "").strip()[:16],
+            (merged.get("description") or "").strip(),
+            int(merged.get("sort_order") or 100),
+            1 if int(merged.get("is_active") or 0) else 0,
+            audience,
+            merged.get("starts_at") or None,
+            merged.get("ends_at") or None,
+            int(category_id),
+        ),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def toggle_plan_category(category_id):
+    cur.execute("UPDATE plan_categories SET is_active=CASE WHEN is_active=1 THEN 0 ELSE 1 END,updated_at=datetime('now') WHERE id=?", (int(category_id),))
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def delete_plan_category(category_id):
+    category_id = int(category_id)
+    cur.execute("SELECT COUNT(*) AS c FROM plans WHERE category_id=?", (category_id,))
+    if int(cur.fetchone()["c"] or 0) > 0:
+        return False, "not_empty"
+    cur.execute("DELETE FROM plan_categories WHERE id=?", (category_id,))
+    conn.commit()
+    return (cur.rowcount == 1, "deleted" if cur.rowcount == 1 else "not_found")
+
+
+def move_record(table, key_field, key_value, direction, where_sql="", where_params=()):
+    """Move one ordered record inside a validated scope.
+
+    The whole scope is normalized to 10, 20, ... before persisting. This keeps
+    up/down deterministic even when legacy rows share the same sort_order.
+    """
+    if direction not in {"up", "down"}:
+        return False
+    allowed = {
+        "plans": {"key": "id", "where": {"", "category_id=?"}},
+        "plan_categories": {"key": "id", "where": {""}},
+        "system_buttons": {"key": "key", "where": {"", "location=?"}},
+        "custom_buttons": {"key": "id", "where": {"", "location=?"}},
+    }
+    spec = allowed.get(table)
+    if not spec or key_field != spec["key"] or where_sql not in spec["where"]:
+        raise ValueError("unsupported order scope")
+
+    sql = f"SELECT {key_field}, sort_order FROM {table}"  # nosec B608
+    params = list(where_params)
+    if where_sql:
+        sql += " WHERE " + where_sql
+    sql += f" ORDER BY sort_order, {key_field}"  # nosec B608
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    index = next((i for i, row in enumerate(rows) if str(row[key_field]) == str(key_value)), None)
+    if index is None:
+        return False
+    other_index = index - 1 if direction == "up" else index + 1
+    if other_index < 0 or other_index >= len(rows):
+        return False
+    ordered = list(rows)
+    ordered[index], ordered[other_index] = ordered[other_index], ordered[index]
+
+    with LOCK:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            update_sql = f"UPDATE {table} SET sort_order=? WHERE {key_field}=?"  # nosec B608
+            for position, row in enumerate(ordered, start=1):
+                cur.execute(update_sql, (position * 10, row[key_field]))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def plan_provider_key(plan_or_id) -> str:
+    plan = get_plan(plan_or_id) if not hasattr(plan_or_id, "keys") else plan_or_id
+    if not plan:
+        return "pool"
+    if "provider_key" in plan.keys() and (plan["provider_key"] or "").strip():
+        return (plan["provider_key"] or "pool").strip().lower()
+    return "youpanel" if (plan["delivery_type"] if "delivery_type" in plan.keys() else "pool") == "youpanel" else "pool"
+
+
+def plan_purchase_mode(plan_or_id) -> str:
+    plan = get_plan(plan_or_id) if not hasattr(plan_or_id, "keys") else plan_or_id
+    value = (plan["purchase_mode"] if plan and "purchase_mode" in plan.keys() else "quantity") or "quantity"
+    return value if value in {"direct", "quantity", "wholesale", "disabled"} else "quantity"
+
+
+def plan_provider_options(plan_or_id):
+    plan = get_plan(plan_or_id) if not hasattr(plan_or_id, "keys") else plan_or_id
+    raw = (plan["provider_options_json"] if plan and "provider_options_json" in plan.keys() else "{}") or "{}"
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        value = {}
+    return value if isinstance(value, dict) else {}
 
 DEFAULT_SYSTEM_BUTTONS = [
     ("buy", "🛒 خرید سرویس", "main", 10),
     ("my_subs", "📦 سرویس‌های من", "main", 20),
     ("wallet", "💳 کیف پول", "main", 30),
     ("guide", "📚 آموزش اتصال", "main", 40),
-    ("trial", "🧪 اکانت تست", "main", 45),
+    ("trial", "🧪 اکانت تست", "buy", 45),
     ("referral", "👥 دعوت دوستان", "main", 50),
     ("ticket", "🎫 پشتیبانی", "main", 60),
     ("admin", "⚙️ مدیریت", "main", 900),
@@ -1789,11 +2174,19 @@ def get_plan(plan_id=None):
     return cur.fetchone()
 
 
-def list_plans(active_only=False, limit=50):
+def list_plans(active_only=False, limit=50, category_id=None, include_disabled=False):
     sql = "SELECT * FROM plans"
     params = []
+    where = []
     if active_only:
-        sql += " WHERE is_active=1"
+        where.append("is_active=1")
+    if category_id is not None:
+        where.append("category_id=?")
+        params.append(int(category_id))
+    if not include_disabled:
+        where.append("COALESCE(purchase_mode,'quantity')!='disabled'")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY sort_order, id LIMIT ?"
     params.append(int(limit))
     cur.execute(sql, params)
@@ -1812,40 +2205,50 @@ def create_plan(data):
     price = int(str(data.get("price") or 0).replace(",", ""))
     if price <= 0:
         raise ValueError("قیمت پلن باید عدد مثبت باشد")
-    max_per_order = int(data.get("max_per_order") or 4)
-    if max_per_order < 1:
-        max_per_order = 1
-    if max_per_order > 4:
-        max_per_order = 4
+    max_per_order = max(1, min(100, int(data.get("max_per_order") or 4)))
+    purchase_mode = (data.get("purchase_mode") or "quantity").strip().lower()
+    if purchase_mode not in {"direct", "quantity", "wholesale", "disabled"}:
+        purchase_mode = "quantity"
+    provider_key = (data.get("provider_key") or data.get("delivery_type") or "pool").strip().lower()
+    if provider_key in {"panel", "provider", "auto"}:
+        provider_key = "youpanel"
+    category_id = data.get("category_id")
+    if not category_id:
+        categories = list_plan_categories(active_only=False, limit=1)
+        category_id = int(categories[0]["id"]) if categories else _category_for_legacy_plan(title, data.get("tag"))
+    options = data.get("provider_options")
+    if options is None:
+        raw_options = data.get("provider_options_json") or "{}"
+        try:
+            options = json.loads(raw_options) if isinstance(raw_options, str) else dict(raw_options)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            options = {}
+    if not isinstance(options, dict):
+        options = {}
     cur.execute(
         """
         INSERT INTO plans(title, volume_label, duration_label, price, description, sort_order,
                           is_active, max_per_order, cost_price, tag, show_stock, low_stock_threshold,
                           pre_purchase_text, post_purchase_text, delivery_type, panel_data_limit_bytes,
-                          panel_duration_days, panel_start_mode, panel_reset_strategy, panel_max_devices)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          panel_duration_days, panel_start_mode, panel_reset_strategy, panel_max_devices,
+                          category_id, purchase_mode, provider_key, provider_options_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            title,
-            (data.get("volume_label") or "").strip(),
-            (data.get("duration_label") or "").strip(),
-            price,
-            (data.get("description") or "").strip(),
-            int(data.get("sort_order") or 100),
-            1 if int(data.get("is_active", 1) or 0) else 0,
-            max_per_order,
-            int(str(data.get("cost_price") or 0).replace(",", "")),
-            (data.get("tag") or "").strip(),
+            title, (data.get("volume_label") or "").strip(), (data.get("duration_label") or "").strip(), price,
+            (data.get("description") or "").strip(), int(data.get("sort_order") or 100),
+            1 if int(data.get("is_active", 1) or 0) else 0, max_per_order,
+            int(str(data.get("cost_price") or 0).replace(",", "")), (data.get("tag") or "").strip(),
             1 if int(data.get("show_stock", 1) or 0) else 0,
             int(data.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
-            (data.get("pre_purchase_text") or "").strip(),
-            (data.get("post_purchase_text") or "").strip(),
-            "youpanel" if (data.get("delivery_type") or "pool") == "youpanel" else "pool",
-            max(0, int(data.get("panel_data_limit_bytes") or 0)),
-            max(0, int(data.get("panel_duration_days") or 0)),
+            (data.get("pre_purchase_text") or "").strip(), (data.get("post_purchase_text") or "").strip(),
+            "youpanel" if provider_key == "youpanel" else "pool",
+            max(0, int(data.get("panel_data_limit_bytes") or 0)), max(0, int(data.get("panel_duration_days") or 0)),
             "active" if (data.get("panel_start_mode") or "on_hold") == "active" else "on_hold",
             (data.get("panel_reset_strategy") or "no_reset").strip() or "no_reset",
             int(data["panel_max_devices"]) if data.get("panel_max_devices") not in (None, "") else None,
+            int(category_id), purchase_mode, provider_key,
+            json.dumps(options, ensure_ascii=False, separators=(",", ":")),
         ),
     )
     conn.commit()
@@ -1862,7 +2265,22 @@ def update_plan(plan_id, data):
     price = int(str(merged.get("price") or 0).replace(",", ""))
     if not title or price <= 0:
         raise ValueError("عنوان و قیمت معتبر الزامی است")
-    max_per_order = max(1, min(4, int(merged.get("max_per_order") or 4)))
+    max_per_order = max(1, min(100, int(merged.get("max_per_order") or 4)))
+    purchase_mode = (merged.get("purchase_mode") or "quantity").strip().lower()
+    if purchase_mode not in {"direct", "quantity", "wholesale", "disabled"}:
+        purchase_mode = "quantity"
+    provider_key = (merged.get("provider_key") or merged.get("delivery_type") or "pool").strip().lower()
+    if provider_key in {"panel", "provider", "auto"}:
+        provider_key = "youpanel"
+    options = merged.get("provider_options")
+    if options is None:
+        raw_options = merged.get("provider_options_json") or "{}"
+        try:
+            options = json.loads(raw_options) if isinstance(raw_options, str) else dict(raw_options)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            options = {}
+    if not isinstance(options, dict):
+        options = {}
     cur.execute(
         """
         UPDATE plans
@@ -1870,31 +2288,24 @@ def update_plan(plan_id, data):
             is_active=?, max_per_order=?, cost_price=?, tag=?, show_stock=?, low_stock_threshold=?,
             pre_purchase_text=?, post_purchase_text=?, delivery_type=?, panel_data_limit_bytes=?,
             panel_duration_days=?, panel_start_mode=?, panel_reset_strategy=?, panel_max_devices=?,
-            updated_at=datetime('now')
+            category_id=?, purchase_mode=?, provider_key=?, provider_options_json=?, updated_at=datetime('now')
         WHERE id=?
         """,
         (
-            title,
-            (merged.get("volume_label") or "").strip(),
-            (merged.get("duration_label") or "").strip(),
-            price,
-            (merged.get("description") or "").strip(),
-            int(merged.get("sort_order") or 100),
-            1 if int(merged.get("is_active") or 0) else 0,
-            max_per_order,
-            int(str(merged.get("cost_price") or 0).replace(",", "")),
-            (merged.get("tag") or "").strip(),
+            title, (merged.get("volume_label") or "").strip(), (merged.get("duration_label") or "").strip(), price,
+            (merged.get("description") or "").strip(), int(merged.get("sort_order") or 100),
+            1 if int(merged.get("is_active") or 0) else 0, max_per_order,
+            int(str(merged.get("cost_price") or 0).replace(",", "")), (merged.get("tag") or "").strip(),
             1 if int(merged.get("show_stock") or 0) else 0,
             int(merged.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
-            (merged.get("pre_purchase_text") or "").strip(),
-            (merged.get("post_purchase_text") or "").strip(),
-            "youpanel" if (merged.get("delivery_type") or "pool") == "youpanel" else "pool",
-            max(0, int(merged.get("panel_data_limit_bytes") or 0)),
-            max(0, int(merged.get("panel_duration_days") or 0)),
+            (merged.get("pre_purchase_text") or "").strip(), (merged.get("post_purchase_text") or "").strip(),
+            "youpanel" if provider_key == "youpanel" else "pool",
+            max(0, int(merged.get("panel_data_limit_bytes") or 0)), max(0, int(merged.get("panel_duration_days") or 0)),
             "active" if (merged.get("panel_start_mode") or "on_hold") == "active" else "on_hold",
             (merged.get("panel_reset_strategy") or "no_reset").strip() or "no_reset",
             int(merged["panel_max_devices"]) if merged.get("panel_max_devices") not in (None, "") else None,
-            int(plan_id),
+            int(merged.get("category_id") or _category_for_legacy_plan(title, merged.get("tag"))),
+            purchase_mode, provider_key, json.dumps(options, ensure_ascii=False, separators=(",", ":")), int(plan_id),
         ),
     )
     conn.commit()
@@ -2007,9 +2418,16 @@ def reset_system_button(key):
     row = get_system_button(key)
     if not row:
         return False
+    default_location = "main"
+    default_order = int(row["sort_order"] or 100)
+    for item_key, _, location, sort_order in DEFAULT_SYSTEM_BUTTONS:
+        if item_key == key:
+            default_location = location
+            default_order = int(sort_order)
+            break
     cur.execute(
-        "UPDATE system_buttons SET title=default_title, location='main', is_active=1, updated_at=datetime('now') WHERE key=?",
-        (key,),
+        "UPDATE system_buttons SET title=default_title, location=?, sort_order=?, is_active=1, updated_at=datetime('now') WHERE key=?",
+        (default_location, default_order, key),
     )
     conn.commit()
     return cur.rowcount == 1
@@ -2086,11 +2504,8 @@ def mark_topup_purchase_completed(topup_id):
 
 
 def plan_delivery_type(plan_or_id) -> str:
-    plan = plan_or_id if hasattr(plan_or_id, "keys") else get_plan(plan_or_id)
-    if not plan:
-        return "pool"
-    value = plan["delivery_type"] if "delivery_type" in plan.keys() else "pool"
-    return "youpanel" if value == "youpanel" else "pool"
+    """Backward-compatible binary delivery type used by legacy code paths."""
+    return "pool" if plan_provider_key(plan_or_id) == "pool" else "youpanel"
 
 
 def list_stale_panel_purchases(minutes=15):
@@ -2098,7 +2513,7 @@ def list_stale_panel_purchases(minutes=15):
     cur.execute(
         """
         SELECT * FROM purchases
-        WHERE provider='youpanel' AND status='provisioning'
+        WHERE COALESCE(provider,'pool')!='pool' AND status='provisioning'
           AND created_at <= datetime('now', ?)
         ORDER BY id
         """,
@@ -2112,13 +2527,19 @@ def begin_panel_purchase(user_id, quantity, unit_price=None, note="", plan_id=No
     user_id = str(user_id)
     quantity = int(quantity)
     plan_id = int(plan_id) if plan_id is not None else default_plan_id()
-    if quantity < 1 or quantity > 4:
+    if quantity < 1:
         raise PurchaseError("invalid_quantity", "تعداد خرید معتبر نیست.")
     plan = get_plan(plan_id)
     if not plan or int(plan["is_active"] or 0) != 1:
         raise PurchaseError("invalid_plan", "پلن فعال نیست یا پیدا نشد.")
-    if plan_delivery_type(plan) != "youpanel":
+    provider_key = plan_provider_key(plan)
+    if provider_key == "pool":
         raise PurchaseError("wrong_delivery_type", "این پلن از استخر لینک تحویل می‌شود.")
+    mode = plan_purchase_mode(plan)
+    if mode in {"disabled", "wholesale"}:
+        raise PurchaseError("purchase_mode", "خرید مستقیم این پلن فعال نیست.")
+    if quantity > max(1, int(plan["max_per_order"] or 1)) or (mode == "direct" and quantity != 1):
+        raise PurchaseError("invalid_quantity", "تعداد خرید بیشتر از سقف این پلن است.")
     if int(plan["panel_data_limit_bytes"] or 0) <= 0 or int(plan["panel_duration_days"] or 0) <= 0:
         raise PurchaseError("invalid_panel_plan", "حجم یا مدت ساخت خودکار پلن تنظیم نشده است.")
     unit_price = int(unit_price if unit_price is not None else plan["price"] or 0)
@@ -2139,9 +2560,9 @@ def begin_panel_purchase(user_id, quantity, unit_price=None, note="", plan_id=No
             cur.execute(
                 """
                 INSERT INTO purchases(user_id, quantity, amount, unit_price, status, note, plan_id, is_test, provider)
-                VALUES (?, ?, ?, ?, 'provisioning', ?, ?, ?, 'youpanel')
+                VALUES (?, ?, ?, ?, 'provisioning', ?, ?, ?, ?)
                 """,
-                (user_id, quantity, total, unit_price, note or "", plan_id, is_test),
+                (user_id, quantity, total, unit_price, note or "", plan_id, is_test, provider_key),
             )
             purchase_id = cur.lastrowid
             balance_after = balance_before - total
@@ -2152,7 +2573,7 @@ def begin_panel_purchase(user_id, quantity, unit_price=None, note="", plan_id=No
                 VALUES (?, 'purchase', ?, ?, ?, ?, ?)
                 """,
                 (user_id, -total, balance_before, balance_after,
-                 f"purchase_id={purchase_id};provider=youpanel;status=provisioning", is_test),
+                 f"purchase_id={purchase_id};provider={provider_key};status=provisioning", is_test),
             )
             conn.commit()
             return {
@@ -2202,11 +2623,12 @@ def finalize_panel_purchase(purchase_id, provisioned_items):
                         purchase_id, plan_id, source_type, panel_provider, panel_username,
                         panel_status, panel_data_limit, panel_used_traffic, panel_expires_at,
                         panel_duration_seconds, is_trial, last_synced_at
-                    ) VALUES (?,1,?,datetime('now'),?,?,'delivered',?,?,'youpanel','youpanel',?,?,?,?,?,?,0,datetime('now'))
+                    ) VALUES (?,1,?,datetime('now'),?,?,'delivered',?,?,?,?,?,?,?,?,?,?,0,datetime('now'))
                     """,
                     (
                         link, purchase["user_id"], int(purchase["unit_price"]), account_name,
-                        purchase_id, purchase["plan_id"], panel_username, item.get("status") or "active",
+                        purchase_id, purchase["plan_id"], purchase["provider"] or "youpanel", purchase["provider"] or "youpanel",
+                        panel_username, item.get("status") or "active",
                         int(item.get("data_limit") or 0), int(item.get("used_traffic") or 0),
                         item.get("expire"), item.get("on_hold_expire_duration"),
                     ),
@@ -2270,7 +2692,7 @@ def refund_panel_purchase(purchase_id, error=""):
                 VALUES (?, 'purchase_refund', ?, ?, ?, ?, ?)
                 """,
                 (purchase["user_id"], int(purchase["amount"] or 0), before, after,
-                 f"purchase_id={purchase_id};provider=youpanel;error={(error or '')[:300]}", int(purchase["is_test"] or 0)),
+                 f"purchase_id={purchase_id};provider={purchase['provider'] or 'provider'};error={(error or '')[:300]}", int(purchase["is_test"] or 0)),
             )
             cur.execute(
                 "UPDATE purchases SET status='failed', provision_error=?, refunded_at=datetime('now') WHERE id=?",
@@ -2281,6 +2703,24 @@ def refund_panel_purchase(purchase_id, error=""):
         except Exception:
             conn.rollback()
             raise
+
+
+# Provider-neutral names used by v6.2. Legacy *panel* functions remain as
+# compatibility entry points for older modules and database terminology.
+def list_stale_provider_purchases(minutes=15):
+    return list_stale_panel_purchases(minutes)
+
+
+def begin_provider_purchase(user_id, quantity, unit_price=None, note="", plan_id=None):
+    return begin_panel_purchase(user_id, quantity, unit_price, note, plan_id)
+
+
+def finalize_provider_purchase(purchase_id, provisioned_items):
+    return finalize_panel_purchase(purchase_id, provisioned_items)
+
+
+def refund_provider_purchase(purchase_id, error=""):
+    return refund_panel_purchase(purchase_id, error)
 
 
 def list_stale_trial_claims(minutes=15):
@@ -2297,9 +2737,49 @@ def list_stale_trial_claims(minutes=15):
         return cur.fetchall()
 
 
-def begin_trial_claim(user_id, panel_username):
+def trial_claim_stats():
+    cur.execute(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+               SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+               SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+        FROM trial_claims
+        """
+    )
+    row = cur.fetchone()
+    return {key: int(row[key] or 0) for key in ("total", "completed", "pending", "failed")}
+
+
+def list_trial_claims(status=None, limit=30, offset=0):
+    sql = """
+        SELECT tc.*, u.username, u.display_name, u.joined_at,
+               s.link, s.account_name, s.panel_status, s.panel_data_limit,
+               s.panel_used_traffic, s.panel_expires_at, s.panel_duration_seconds,
+               s.last_synced_at
+        FROM trial_claims tc
+        LEFT JOIN users u ON u.id=tc.user_id
+        LEFT JOIN subs s ON s.id=tc.sub_id
+    """
+    params = []
+    if status:
+        sql += " WHERE tc.status=?"
+        params.append(status)
+    sql += " ORDER BY tc.updated_at DESC LIMIT ? OFFSET ?"
+    params.extend([int(limit), int(offset)])
+    cur.execute(sql, params)
+    return cur.fetchall()
+
+
+def get_trial_claim_by_sub(sub_id):
+    cur.execute("SELECT * FROM trial_claims WHERE sub_id=?", (int(sub_id),))
+    return cur.fetchone()
+
+
+def begin_trial_claim(user_id, panel_username, provider_key="youpanel"):
     user_id = str(user_id)
     panel_username = (panel_username or "").strip()
+    provider_key = (provider_key or "youpanel").strip().lower()
     if not panel_username:
         return False, "invalid_username", None
     with LOCK:
@@ -2312,11 +2792,11 @@ def begin_trial_claim(user_id, panel_username):
                 return False, "already_claimed", dict(row)
             if row:
                 cur.execute(
-                    "UPDATE trial_claims SET panel_username=?, status='pending', error=NULL, updated_at=datetime('now') WHERE user_id=?",
-                    (panel_username, user_id),
+                    "UPDATE trial_claims SET panel_username=?, provider_key=?, status='pending', error=NULL, updated_at=datetime('now') WHERE user_id=?",
+                    (panel_username, provider_key, user_id),
                 )
             else:
-                cur.execute("INSERT INTO trial_claims(user_id, panel_username, status) VALUES (?, ?, 'pending')", (user_id, panel_username))
+                cur.execute("INSERT INTO trial_claims(user_id, panel_username, provider_key, status) VALUES (?, ?, ?, 'pending')", (user_id, panel_username, provider_key))
             conn.commit()
             cur.execute("SELECT * FROM trial_claims WHERE user_id=?", (user_id,))
             return True, "pending", dict(cur.fetchone())
@@ -2328,7 +2808,7 @@ def begin_trial_claim(user_id, panel_username):
             raise
 
 
-def complete_trial_claim(user_id, panel_item):
+def complete_trial_claim(user_id, panel_item, provider_key="youpanel"):
     user_id = str(user_id)
     link = (panel_item.get("subscription_url") or "").strip()
     panel_username = (panel_item.get("username") or "").strip()
@@ -2348,11 +2828,12 @@ def complete_trial_claim(user_id, panel_item):
                     purchase_id, plan_id, source_type, panel_provider, panel_username,
                     panel_status, panel_data_limit, panel_used_traffic, panel_expires_at,
                     panel_duration_seconds, is_trial, last_synced_at
-                ) VALUES (?,1,?,datetime('now'),0,?,'delivered',NULL,NULL,'youpanel','youpanel',?,?,?,?,?,?,1,datetime('now'))
+                ) VALUES (?,1,?,datetime('now'),0,?,'delivered',NULL,NULL,?,?, ?,?,?,?,?,?,1,datetime('now'))
                 """,
                 (
-                    link, user_id, "اکانت تست", panel_username, panel_item.get("status") or "on_hold",
-                    int(panel_item.get("data_limit") or 0), int(panel_item.get("used_traffic") or 0),
+                    link, user_id, "اکانت تست", provider_key, provider_key, panel_username,
+                    panel_item.get("status") or "on_hold", int(panel_item.get("data_limit") or 0),
+                    int(panel_item.get("used_traffic") or 0),
                     panel_item.get("expire"), panel_item.get("on_hold_expire_duration"),
                 ),
             )
@@ -2393,7 +2874,7 @@ def update_panel_sub(sub_id, panel_item):
             UPDATE subs SET link=COALESCE(?,link), panel_status=COALESCE(?,panel_status),
                 panel_data_limit=COALESCE(?,panel_data_limit), panel_used_traffic=COALESCE(?,panel_used_traffic),
                 panel_expires_at=?, panel_duration_seconds=?, last_synced_at=datetime('now')
-            WHERE id=? AND source_type='youpanel'
+            WHERE id=? AND COALESCE(source_type,'pool')!='pool'
             """,
             (link, panel_item.get("status"), panel_item.get("data_limit"), panel_item.get("used_traffic"),
              panel_item.get("expire"), panel_item.get("on_hold_expire_duration"), int(sub_id)),
@@ -2405,7 +2886,7 @@ def update_panel_sub(sub_id, panel_item):
 def update_panel_sub_usage(sub_id, used_traffic):
     with LOCK:
         cur.execute(
-            "UPDATE subs SET panel_used_traffic=?, last_synced_at=datetime('now') WHERE id=? AND source_type='youpanel'",
+            "UPDATE subs SET panel_used_traffic=?, last_synced_at=datetime('now') WHERE id=? AND COALESCE(source_type,'pool')!='pool'",
             (max(0, int(used_traffic or 0)), int(sub_id)),
         )
         conn.commit()
@@ -2417,13 +2898,13 @@ def mark_panel_sub_deleted(sub_id):
     with LOCK:
         try:
             conn.execute("BEGIN IMMEDIATE")
-            cur.execute("SELECT owner,purchase_id,is_trial,used FROM subs WHERE id=? AND source_type='youpanel'", (sub_id,))
+            cur.execute("SELECT owner,purchase_id,is_trial,used FROM subs WHERE id=? AND COALESCE(source_type,'pool')!='pool'", (sub_id,))
             row = cur.fetchone()
             if not row:
                 conn.rollback()
                 return False
             cur.execute(
-                "UPDATE subs SET used=0,status='deleted',panel_status='deleted',last_synced_at=datetime('now') WHERE id=? AND source_type='youpanel'",
+                "UPDATE subs SET used=0,status='deleted',panel_status='deleted',last_synced_at=datetime('now') WHERE id=? AND COALESCE(source_type,'pool')!='pool'",
                 (sub_id,),
             )
             cur.execute(

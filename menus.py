@@ -1,7 +1,7 @@
 import logging
 
 from aiogram import types
-from config import ADMIN_IDS, YOUPANEL_TRIAL_ENABLED, youpanel_configured
+from config import ADMIN_IDS, TRIAL_ENABLED, TRIAL_PROVIDER_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,16 @@ def is_admin_user(user_id) -> bool:
         return False
 
 
+
+def trial_available() -> bool:
+    if not TRIAL_ENABLED:
+        return False
+    try:
+        import subs
+        return bool(subs.get_provider_adapter(TRIAL_PROVIDER_KEY).configured())
+    except Exception:
+        return False
+
 def system_button_title(key: str) -> str:
     try:
         import db
@@ -67,7 +77,6 @@ def system_buttons_for_location(location="main", user_id=None):
         ("my_subs", BTN_MY_SUBS),
         ("wallet", BTN_WALLET),
         ("guide", BTN_GUIDE),
-        ("trial", BTN_TRIAL),
         ("referral", BTN_REFERRAL),
         ("ticket", BTN_TICKET),
     ]
@@ -79,12 +88,16 @@ def system_buttons_for_location(location="main", user_id=None):
             key = row["key"]
             if key == "admin" and not is_admin_user(user_id):
                 continue
-            if key == "trial" and (not YOUPANEL_TRIAL_ENABLED or not youpanel_configured()):
+            if key == "trial" and (not trial_available()):
                 continue
             result.append((key, row["title"] or row["default_title"]))
         return result
     except Exception:
         logger.debug("Could not load system buttons for %s", location, exc_info=True)
+        if location == "buy":
+            if trial_available():
+                return [("trial", BTN_TRIAL)]
+            return []
         if location != "main":
             return []
         result = fallback[:]
@@ -93,36 +106,112 @@ def system_buttons_for_location(location="main", user_id=None):
         return result
 
 
-def _custom_buttons_for_location(location="main", user_id=None):
-    """
-    دکمه‌های اختصاصی منتشرشده را به منوی انتخاب‌شده اضافه می‌کند.
-    خطای دیتابیس نباید منوی اصلی ربات را از کار بیندازد.
-    """
+def _audience_visible(audience, user_id=None):
+    audience = (audience or "all").strip().lower()
+    if audience == "all":
+        return True
+    if audience == "admins":
+        return is_admin_user(user_id)
+    if user_id is None:
+        return False
+    try:
+        import db
+        user = db.get_user(str(user_id))
+        purchased = int(user["purchased"] or 0) if user else 0
+        services = db.delivered_sub_count_by_user(str(user_id))
+        is_test = bool(user and int(user["is_test"] or 0))
+    except Exception:
+        return False
+    return {
+        "buyers": purchased > 0,
+        "no_buy": purchased == 0,
+        "has_service": services > 0,
+        "no_service": services == 0,
+        "normal": not is_test,
+        "test": is_test,
+    }.get(audience, False)
+
+
+def custom_button_rows_for_location(location="main", user_id=None):
     try:
         import db
         rows = db.list_active_custom_buttons(location)
     except Exception:
-        logger.debug("Could not load custom buttons for %s", location, exc_info=True)
+        logger.debug("Could not load custom button rows for %s", location, exc_info=True)
         return []
-
     result = []
     for row in rows:
         title = (row["title"] or "").strip()
         if not title or title in _SYSTEM_BUTTONS:
             continue
-
-        audience = row["audience"] or "all"
-        if audience == "admins" and not is_admin_user(user_id):
+        if not _audience_visible(row["audience"] or "all", user_id):
             continue
-
-        # فیلترهای دقیق‌تر buyers/no_buy/has_service/no_service در زمان اجرای دکمه هم بررسی می‌شوند.
-        result.append(title)
-
+        result.append(row)
     return result
 
 
-def _custom_buttons_for_main(user_id=None):
-    return _custom_buttons_for_location("main", user_id)
+def ordered_location_items(location="main", user_id=None):
+    """Merge system and custom buttons by one effective sort order."""
+    items = []
+    try:
+        import db
+        for row in db.list_system_buttons(location=location, active_only=True):
+            key = row["key"]
+            if key == "admin" and not is_admin_user(user_id):
+                continue
+            if key == "trial" and (not trial_available()):
+                continue
+            items.append({
+                "kind": "system", "key": key,
+                "title": row["title"] or row["default_title"],
+                "sort_order": int(row["sort_order"] or 100),
+            })
+        for row in custom_button_rows_for_location(location, user_id):
+            items.append({
+                "kind": "custom", "id": int(row["id"]),
+                "title": row["title"], "sort_order": int(row["sort_order"] or 100),
+            })
+        items.sort(key=lambda item: (item["sort_order"], 0 if item["kind"] == "system" else 1, item.get("key") or item.get("id")))
+        return items
+    except Exception:
+        logger.debug("Could not merge location buttons for %s", location, exc_info=True)
+        return [
+            {"kind": "system", "key": key, "title": title, "sort_order": index * 10}
+            for index, (key, title) in enumerate(system_buttons_for_location(location, user_id), start=1)
+        ]
+
+
+SYSTEM_INLINE_CALLBACKS = {
+    "buy": "buy",
+    "my_subs": "my_subs",
+    "wallet": "wallet",
+    "guide": "guide_home",
+    "trial": "trial",
+    "referral": "referral",
+    "ticket": "ticket_start",
+    "admin": "open_admin_panel",
+}
+
+
+def inline_location_buttons(location="main", user_id=None):
+    buttons = []
+    for item in ordered_location_items(location, user_id):
+        if item["kind"] == "system":
+            callback = SYSTEM_INLINE_CALLBACKS.get(item["key"])
+            if callback:
+                buttons.append(types.InlineKeyboardButton(item["title"], callback_data=callback))
+        else:
+            buttons.append(types.InlineKeyboardButton(item["title"], callback_data=f"custom_btn_{item['id']}"))
+    return buttons
+
+
+def append_location_buttons(kb, location="main", user_id=None, row_width=1):
+    for button in inline_location_buttons(location, user_id):
+        if row_width > 1:
+            kb.insert(button)
+        else:
+            kb.add(button)
+    return kb
 
 
 def main_reply_kb(user_id=None):
@@ -132,9 +221,7 @@ def main_reply_kb(user_id=None):
     اما عملکرد اصلی دکمه‌ها در کد قفل می‌ماند.
     """
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, selective=False)
-    labels = [title for _, title in system_buttons_for_location("main", user_id)]
-    custom_buttons = _custom_buttons_for_main(user_id)
-    all_buttons = labels + custom_buttons
+    all_buttons = [item["title"] for item in ordered_location_items("main", user_id)]
     for index in range(0, len(all_buttons), 2):
         kb.row(*all_buttons[index:index + 2])
     return kb

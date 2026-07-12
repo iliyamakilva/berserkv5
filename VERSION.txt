@@ -1,54 +1,54 @@
 Berserk VPN Bot
-Version: v6.1.1 YouPanel Device Limits
+Version: v6.2.0 Catalog & Provider Core
 Build Type: Full Source / Original 22 Files Preserved
-Schema Version: 610
+Schema Version: 620
 Date: 2026-07-12
 
 هدف نسخه:
-- تکمیل مدیریت محدودیت تعداد دستگاه برای پلن‌های YouPanel و اکانت تست.
-- حفظ کامل فروش استخری قبلی و افزودن فروش خودکار YouPanel در کنار آن.
-- ساخت خودکار سرویس با حجم، مدت و نوع شروع اعتبار اختصاصی هر پلن.
-- ساخت اکانت تست ۲۰۰ مگ یک‌روزه یا مقادیر قابل تنظیم، فقط یک‌بار برای هر Telegram ID.
-- مدیریت مصرف، Reset Usage، Revoke Subscription و حذف سرویس پنلی از داخل ادمین.
-- حفظ اتمیک بودن کیف پول و refund امن در شکست Provisioning.
-- نگهداری JWT فقط در حافظه و خواندن رمز پنل فقط از Environment.
+- تبدیل فروشگاه تخت به کاتالوگ دسته‌بندی‌شده.
+- جدا کردن دسته، پلن، روش خرید و تأمین‌کننده از یکدیگر.
+- تبدیل YouPanel به Adapter از سیستم Provider قابل توسعه.
+- یکپارچه‌سازی ساخت و ویرایش پلن بدون ورود دوباره حجم و مدت.
+- افزودن خرید مستقیم، انتخاب تعداد، عمده و غیرفعال برای هر پلن.
+- افزودن مدیریت اکانت‌های تست و انتقال Trial به کاتالوگ خرید.
+- اجرای واقعی جایگاه و ترتیب دکمه‌ها در منوهای مختلف.
+- قابل‌مرتب‌سازی کردن داشبورد ادمین.
+- حذف و ادغام اکشن‌های تکراری پلن و لینک.
 
-تغییرهای مهم:
-- Schema دیتابیس از 600 به 610 ارتقا یافت.
-- plans: delivery_type و تنظیمات پنلی مستقل.
-- subs: اطلاعات provider، panel username/status/usage/expiry و trial.
-- purchases: provider، provision_error، completed_at و refunded_at.
-- جدول trial_claims اضافه شد.
-- مسیر خرید بر اساس pool یا youpanel dispatch می‌شود.
-- سفارش پنلی در وضعیت provisioning رزرو و پس از دریافت همه لینک‌ها completed می‌شود.
-- شکست ساخت باعث حذف best-effort حساب نیمه‌ساخته و refund کیف پول می‌شود.
-- سفارش نیمه‌کاره بعد از Restart بازیابی و refund می‌شود.
-- دکمه سیستمی اکانت تست اضافه شد.
-- عملیات پنلی Usage/Reset/Revoke/Delete به جزئیات سرویس ادمین اضافه شد.
-- افزودن لینک دستی به پلن خودکار مسدود شد.
-- انتخاب سقف دستگاه به ویزارد ساخت سریع پلن افزوده شد.
-- سقف دستگاه در جزئیات و پیش‌نمایش پلن نمایش داده می‌شود.
-- YOUPANEL_TRIAL_MAX_DEVICES برای محدودیت دستگاه اکانت تست اضافه شد.
+تغییرهای دیتابیس:
+- Schema از 610 به 620 ارتقا یافت.
+- جدول plan_categories اضافه شد.
+- جدول admin_menu_items اضافه شد.
+- plans: category_id، purchase_mode، provider_key و provider_options_json.
+- trial_claims: provider_key.
+- Migration خودکار دسته و Provider پلن‌های قدیمی.
 
-APIهای پشتیبانی‌شده:
-- POST /api/admin/token
-- POST /api/user
-- DELETE /api/user/{username}
-- GET /api/user/{username}/usage
-- POST /api/user/{username}/reset
-- POST /api/user/{username}/revoke_sub
-- GET /api/admin
+قابلیت‌های اصلی:
+- مسیر خرید: دسته → پلن → خرید.
+- دسته‌های قابل ساخت، ویرایش، مرتب‌سازی و زمان‌بندی.
+- ویزارد واحد ساخت پلن برای استخر و Provider.
+- حالت direct بدون مرحله انتخاب تعداد.
+- حالت quantity با سقف اختصاصی هر پلن.
+- حالت wholesale و disabled.
+- Provider Registry و Interface مشترک عملیات پنل.
+- Adapter فعلی YouPanel با Login/Create/Update/Usage/Reset/Revoke/Delete.
+- مدیریت مستقل اکانت‌های تست.
+- چیدمان منوی کاربر و پنل ادمین با بالا/پایین.
+- ادغام مدیریت لینک‌ها در «استخر لینک‌ها».
 
-تست‌ها:
-- py_compile تمام فایل‌های Python
-- DB init و migration 600→610
-- خرید استخری
-- خرید پنلی موفق، چندتایی، failure و refund
-- recovery سفارش provisioning
-- Trial one-per-user و retry پس از failure
-- Mock API Login/Create/Usage/Reset/Revoke/Delete
-- جلوگیری از لینک دستی برای پلن YouPanel
-- ZIP integrity و حفظ دقیق ۲۲ فایل
+سازگاری:
+- فروش استخری و لینک‌های قبلی حفظ می‌شوند.
+- پلن‌های YouPanel قدیمی به provider_key=youpanel مهاجرت می‌کنند.
+- Environmentهای YOUPANEL_TRIAL_* همچنان پشتیبانی می‌شوند.
+- نام‌های عمومی TRIAL_* در اولویت قرار دارند.
+
+تست‌های لازم قبل از تولید:
+- Migration دیتابیس واقعی پس از تهیه بک‌آپ.
+- خرید مستقیم، تعدادی، استخری و Provider.
+- Trial یک‌بارمصرف و Retry خطا.
+- Refund شکست Provisioning.
+- ترتیب دکمه‌های مشتری و ادمین.
+- بک‌آپ و Restore در محیط تست.
 
 محدودیت:
-تست destructive زنده با پنل واقعی، توکن واقعی تلگرام و پرداخت واقعی انجام نشده است. ابتدا روی پلن و کاربر آزمایشی Deploy و بررسی شود.
+تست مخرب زنده با YouPanel واقعی، پرداخت واقعی و توکن واقعی تلگرام در محیط ساخت انجام نشده است.

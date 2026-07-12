@@ -200,8 +200,8 @@ async def cb_confirm(c: types.CallbackQuery):
         was_first_purchase = int(user["purchased"] or 0) == 0 if user else False
         try:
             plan = db.get_plan(int(target_plan_id))
-            if plan and db.plan_delivery_type(plan) == "youpanel":
-                result = await subs.provision_panel_purchase(
+            if plan and db.plan_provider_key(plan) != "pool":
+                result = await subs.provision_provider_purchase(
                     topup["user_id"],
                     int(target_qty),
                     int(target_plan_id),

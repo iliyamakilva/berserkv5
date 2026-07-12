@@ -1,4 +1,5 @@
 import asyncio
+import re
 import logging
 import os
 import sys
@@ -55,6 +56,8 @@ class AdminStates(StatesGroup):
     waiting_system_button_location = State()
     waiting_plan_form = State()
     waiting_plan_setting_value = State()
+    waiting_category_form = State()
+    waiting_category_setting = State()
     waiting_broadcast_content = State()
     waiting_broadcast_confirm = State()
 
@@ -90,24 +93,52 @@ def _button_type_select_kb():
 
 def _plan_wizard_step_text(step):
     prompts = {
-        "title": "➕ ساخت سریع پلن\n\nمرحله ۱ از ۶\nعنوان پلن را بفرستید.\nمثال: 50GB یک‌ماهه",
-        "volume": "مرحله ۲ از ۶\nحجم پلن را بفرستید.\nمثال: 50GB\nاگر حجم نمی‌خواهید، - بفرستید.",
-        "duration": "مرحله ۳ از ۶\nمدت پلن را بفرستید.\nمثال: 30 روز",
-        "price": "مرحله ۴ از ۶\nقیمت فروش را فقط عددی بفرستید.\nمثال: 180000",
-        "low_stock": "مرحله ۵ از ۶\nحد هشدار موجودی را بفرستید.\nمثال: 5",
-        "description": "مرحله ۶ از ۶\nتوضیح کوتاه پلن را بفرستید.\nمثال: مناسب استفاده روزمره\nاگر توضیح نمی‌خواهید، - بفرستید.",
-        "panel_size": "📦 حجم ساخت خودکار را بفرستید.\nمثال: 50GB یا 200MB",
-        "panel_days": "📅 مدت ساخت خودکار را بر حسب روز بفرستید.\nمثال: 30",
-        "panel_devices": "📱 تعداد دستگاه مجاز را انتخاب کنید.",
+        "title": "➕ ساخت پلن جدید\n\nعنوان پلن را بفرستید.\nمثال: اقتصادی ۵۰ گیگ",
+        "volume": "حجم پلن را بفرستید.\nمثال: 50GB یا 200MB",
+        "duration": "مدت پلن را بفرستید.\nمثال: 30 روز",
+        "price": "قیمت فروش را فقط عددی بفرستید.\nمثال: 180000",
+        "description": "توضیح کوتاه پلن را بفرستید.\nبرای خالی بودن، - بفرستید.",
     }
     return prompts.get(step, prompts["title"])
+
+
+def _plan_category_select_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    for category in db.list_plan_categories(active_only=False):
+        mark = "✅" if int(category["is_active"] or 0) else "🚫"
+        kb.add(InlineKeyboardButton(f"{mark} {category['emoji'] or '📦'} {category['title']}", callback_data=f"plan_wizard_category_{category['id']}"))
+    kb.add(InlineKeyboardButton("➕ ساخت دسته جدید", callback_data="category_create"))
+    kb.add(InlineKeyboardButton("⬅️ مدیریت پلن‌ها", callback_data="adm_plans"))
+    kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
+    return kb
+
+
+def _plan_purchase_mode_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🛒 خرید مستقیم یک سرویس", callback_data="plan_wizard_mode_direct"))
+    kb.add(InlineKeyboardButton("🔢 انتخاب تعداد", callback_data="plan_wizard_mode_quantity"))
+    kb.add(InlineKeyboardButton("📦 فقط خرید عمده", callback_data="plan_wizard_mode_wholesale"))
+    kb.add(InlineKeyboardButton("⬅️ برگشت", callback_data="fsm_back"))
+    kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
+    return kb
 
 
 def _plan_delivery_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("📦 تحویل از استخر لینک", callback_data="plan_wizard_delivery_pool"))
-    kb.add(InlineKeyboardButton("⚡ ساخت خودکار از YouPanel", callback_data="plan_wizard_delivery_youpanel"))
+    kb.add(InlineKeyboardButton("🔌 ساخت خودکار توسط تأمین‌کننده", callback_data="plan_wizard_delivery_provider"))
     kb.add(InlineKeyboardButton("⬅️ برگشت", callback_data="fsm_back"))
+    kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
+    return kb
+
+
+def _plan_provider_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    providers = subs.list_provider_adapters(configured_only=False)
+    for provider in providers:
+        status = "✅" if provider.configured() else "⚠️"
+        kb.add(InlineKeyboardButton(f"{status} {provider.label}", callback_data=f"plan_wizard_provider_{provider.key}"))
+    kb.add(InlineKeyboardButton("⬅️ روش تحویل", callback_data="fsm_back"))
     kb.add(InlineKeyboardButton("❌ لغو", callback_data="cancel_fsm"))
     return kb
 
@@ -140,16 +171,8 @@ def admin_back_kb():
 
 def admin_menu_kb():
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("👥 کاربران", callback_data="adm_section_users"),
-        InlineKeyboardButton("📦 سرویس‌ها و پلن‌ها", callback_data="adm_section_services"),
-        InlineKeyboardButton("💰 مالی و پرداخت‌ها", callback_data="adm_section_finance"),
-        InlineKeyboardButton("🎫 تیکت‌ها", callback_data="adm_tickets"),
-        InlineKeyboardButton("🎛 شخصی‌سازی", callback_data="adm_section_personalize"),
-        InlineKeyboardButton("📊 گزارش‌ها", callback_data="adm_section_reports"),
-        InlineKeyboardButton("💾 بک‌آپ و امنیت", callback_data="adm_backup_menu"),
-        InlineKeyboardButton("⚙️ تنظیمات", callback_data="adm_settings"),
-    )
+    for item in db.list_admin_menu_items(active_only=True):
+        kb.insert(InlineKeyboardButton(item["title"] or item["default_title"], callback_data=item["callback_data"]))
     kb.add(InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
 
@@ -170,12 +193,11 @@ def admin_users_section_kb():
 def admin_services_section_kb():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🏷 مدیریت پلن‌ها", callback_data="adm_plans"),
-        InlineKeyboardButton("➕ ساخت سریع پلن", callback_data="plan_create"),
-        InlineKeyboardButton("🔗 مدیریت لینک‌ها", callback_data="adm_links"),
-        InlineKeyboardButton("➕ افزودن لینک", callback_data="adm_link_add"),
-        InlineKeyboardButton("🔎 جستجوی لینک", callback_data="adm_link_search"),
-        InlineKeyboardButton("🔌 تست اتصال YouPanel", callback_data="adm_panel_health"),
+        InlineKeyboardButton("🗂 دسته‌ها", callback_data="adm_categories"),
+        InlineKeyboardButton("🏷 پلن‌ها", callback_data="adm_plans"),
+        InlineKeyboardButton("🔗 استخر لینک‌ها", callback_data="adm_links"),
+        InlineKeyboardButton("🔌 تأمین‌کننده‌ها", callback_data="adm_providers"),
+        InlineKeyboardButton("🧪 اکانت‌های تست", callback_data="adm_trials"),
     )
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
@@ -184,7 +206,6 @@ def admin_services_section_kb():
 def admin_finance_section_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("💳 شارژهای در انتظار", callback_data="adm_topups"))
-    kb.add(InlineKeyboardButton("⚙️ تنظیمات مالی و فروشگاه", callback_data="adm_settings"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
 
@@ -192,6 +213,7 @@ def admin_finance_section_kb():
 def admin_personalize_section_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("🎛 مدیریت دکمه‌ها", callback_data="adm_buttons"))
+    kb.add(InlineKeyboardButton("🧭 چیدمان پنل مدیریت", callback_data="adm_menu_layout"))
     kb.add(InlineKeyboardButton("📝 مدیریت پیام‌ها", callback_data="adm_messages"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
@@ -371,45 +393,42 @@ async def cb_fsm_back(c: types.CallbackQuery, state: FSMContext):
     current_state = await state.get_state()
     data = await state.get_data()
 
-    # ویزارد ساخت سریع پلن: برگشت مرحله‌ای
+    # ویزارد ساخت پلن: برگشت مرحله‌ای
     if current_state and current_state.endswith("waiting_plan_form") and data.get("plan_action") == "create_wizard":
-        step = data.get("plan_step") or "title"
+        step = data.get("plan_step") or "category"
+        plan_data = data.get("plan_data") or {}
+        if step == "category":
+            await state.finish()
+            return await _replace_callback_message(c, "🏷 مدیریت پلن‌ها", reply_markup=plans_menu_kb())
+        if step == "title":
+            await state.update_data(plan_step="category")
+            return await _replace_callback_message(c, "دسته پلن را انتخاب کنید:", reply_markup=_plan_category_select_kb(), cleanup=False)
         back_map = {
             "volume": "title",
             "duration": "volume",
             "price": "duration",
-            "low_stock": "price",
-            "description": "low_stock",
-            "delivery": "description",
-            "panel_size": "delivery",
-            "panel_days": "panel_size",
-            "panel_devices": "panel_days",
+            "purchase_mode": "price",
+            "delivery": "purchase_mode",
+            "provider": "delivery",
+            "panel_devices": "provider",
             "panel_start": "panel_devices",
-            "confirm": "panel_start" if (data.get("plan_data") or {}).get("delivery_type") == "youpanel" else "delivery",
+            "description": "panel_start" if plan_data.get("provider_key") not in (None, "pool") else "delivery",
+            "confirm": "description",
         }
-        if step == "delivery":
-            return await _replace_callback_message(
-                c,
-                "لطفاً روش تحویل را از دکمه‌های زیر انتخاب کنید.",
-                reply_markup=_plan_delivery_kb(),
-                cleanup=False,
-            )
-        if step == "panel_devices":
-            return await _replace_callback_message(c, "📱 تعداد دستگاه مجاز را انتخاب کنید:", reply_markup=_plan_device_limit_kb(), cleanup=False)
-        if step == "panel_start":
-            return await _replace_callback_message(c, "لطفاً زمان شروع اعتبار را از دکمه‌های زیر انتخاب کنید.", reply_markup=_plan_start_mode_kb(), cleanup=False)
-
-        if step == "title":
-            await state.finish()
-            return await _replace_callback_message(c, "🏷 مدیریت پلن‌ها", reply_markup=plans_menu_kb())
-        prev_step = back_map.get(step, "title")
+        prev_step = back_map.get(step, "category")
         await state.update_data(plan_step=prev_step)
+        if prev_step == "category":
+            return await _replace_callback_message(c, "دسته پلن را انتخاب کنید:", reply_markup=_plan_category_select_kb(), cleanup=False)
+        if prev_step == "purchase_mode":
+            return await _replace_callback_message(c, "نحوه خرید را انتخاب کنید:", reply_markup=_plan_purchase_mode_kb(), cleanup=False)
         if prev_step == "delivery":
-            return await _replace_callback_message(c, "روش تحویل این پلن را انتخاب کنید:", reply_markup=_plan_delivery_kb(), cleanup=False)
+            return await _replace_callback_message(c, "روش تحویل را انتخاب کنید:", reply_markup=_plan_delivery_kb(), cleanup=False)
+        if prev_step == "provider":
+            return await _replace_callback_message(c, "تأمین‌کننده را انتخاب کنید:", reply_markup=_plan_provider_kb(), cleanup=False)
         if prev_step == "panel_devices":
-            return await _replace_callback_message(c, "📱 تعداد دستگاه مجاز را انتخاب کنید:", reply_markup=_plan_device_limit_kb(), cleanup=False)
+            return await _replace_callback_message(c, "تعداد دستگاه را انتخاب کنید:", reply_markup=_plan_device_limit_kb(), cleanup=False)
         if prev_step == "panel_start":
-            return await _replace_callback_message(c, "زمان شروع اعتبار سرویس پنلی را انتخاب کنید:", reply_markup=_plan_start_mode_kb(), cleanup=False)
+            return await _replace_callback_message(c, "زمان شروع اعتبار را انتخاب کنید:", reply_markup=_plan_start_mode_kb(), cleanup=False)
         return await _replace_callback_message(c, _plan_wizard_step_text(prev_step), reply_markup=cancel_kb(), cleanup=False)
 
     # ویرایش فرم کامل پلن
@@ -458,11 +477,11 @@ async def cb_fsm_back(c: types.CallbackQuery, state: FSMContext):
         await state.finish()
         if plan_id and db.get_plan(plan_id):
             return await _replace_callback_message(c, _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_detail_kb(plan_id))
-        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=link_manager_kb())
+        return await _replace_callback_message(c, "🔗 استخر لینک‌ها", reply_markup=link_manager_kb())
 
     if current_state and current_state.endswith(("waiting_link_search", "waiting_link_delete_id")):
         await state.finish()
-        return await _replace_callback_message(c, "🔗 مدیریت لینک‌ها", reply_markup=link_manager_kb())
+        return await _replace_callback_message(c, "🔗 استخر لینک‌ها", reply_markup=link_manager_kb())
 
     # تنظیمات عمومی
     if current_state and current_state.endswith("waiting_setting_value"):
@@ -580,12 +599,12 @@ def service_detail_kb(user_id, sub_id, purchase_id=None):
         InlineKeyboardButton("🔗 ارسال لینک به کاربر", callback_data=f"adm_resend_link_{sub_id}_{user_id}"),
         InlineKeyboardButton("🔳 ارسال QR به کاربر", callback_data=f"adm_resend_qr_{sub_id}_{user_id}"),
     )
-    if source_type == "youpanel":
+    if source_type != "pool":
         kb.add(
-            InlineKeyboardButton("📊 مصرف پنل", callback_data=f"adm_panel_usage_{sub_id}_{user_id}"),
+            InlineKeyboardButton("📊 مصرف تأمین‌کننده", callback_data=f"adm_panel_usage_{sub_id}_{user_id}"),
             InlineKeyboardButton("♻️ صفرکردن مصرف", callback_data=f"adm_panel_reset_ask_{sub_id}_{user_id}"),
             InlineKeyboardButton("🔄 تعویض لینک", callback_data=f"adm_panel_revoke_ask_{sub_id}_{user_id}"),
-            InlineKeyboardButton("🗑 حذف از پنل", callback_data=f"adm_panel_delete_ask_{sub_id}_{user_id}"),
+            InlineKeyboardButton("🗑 حذف از تأمین‌کننده", callback_data=f"adm_panel_delete_ask_{sub_id}_{user_id}"),
         )
     else:
         kb.add(InlineKeyboardButton("↩️ بازگردانی به استخر", callback_data=f"adm_link_repool_ask_{sub_id}"))
@@ -743,9 +762,10 @@ def _fmt_service_detail(user_id, sub_id):
     lines.append(f"مبلغ: {_fmt_money(s['price_paid'])}")
     lines.append(f"وضعیت: {s['status'] or 'delivered'}")
     source_type = s["source_type"] if "source_type" in s.keys() else "pool"
-    lines.append(f"منبع سرویس: {'YouPanel' if source_type == 'youpanel' else 'استخر لینک'}")
-    if source_type == "youpanel":
-        lines.append(f"کاربر پنل: {s['panel_username'] or '-'}")
+    provider_name = subs.provider_label(source_type) if source_type != "pool" else "استخر لینک"
+    lines.append(f"منبع سرویس: {provider_name}")
+    if source_type != "pool":
+        lines.append(f"کاربر تأمین‌کننده: {s['panel_username'] or '-'}")
         lines.append(f"وضعیت پنل: {s['panel_status'] or '-'}")
         lines.append(f"حجم پنل: {_fmt_bytes(s['panel_data_limit'])}")
         lines.append(f"مصرف ثبت‌شده: {_fmt_bytes(s['panel_used_traffic'])}")
@@ -1196,15 +1216,16 @@ async def cb_panel_usage(c: types.CallbackQuery):
     payload = c.data.replace("adm_panel_usage_", "", 1)
     sub_id, user_id = payload.split("_", 1)
     item = subs.get_sub_detail(sub_id)
-    if not item or (item["source_type"] or "pool") != "youpanel" or str(item["owner"]) != str(user_id):
-        return await c.answer("سرویس پنلی پیدا نشد.", show_alert=True)
+    if not item or (item["source_type"] or "pool") == "pool" or str(item["owner"]) != str(user_id):
+        return await c.answer("سرویس تأمین‌کننده پیدا نشد.", show_alert=True)
     try:
-        result = await subs.panel_usage(item["panel_username"])
+        provider = subs.get_provider_adapter(item["source_type"] or item["panel_provider"])
+        result = await provider.usage(item["panel_username"])
         usages = result.get("usages") or []
         total = sum(int(row.get("used_traffic") or 0) for row in usages if isinstance(row, dict))
         db.update_panel_sub_usage(sub_id, total)
         lines = [
-            "📊 مصرف سرویس پنلی",
+            f"📊 مصرف سرویس | {subs.provider_label(item['source_type'])}",
             "",
             f"کاربر پنل: {item['panel_username']}",
             f"مصرف کل: {_fmt_bytes(total)}",
@@ -1218,8 +1239,8 @@ async def cb_panel_usage(c: types.CallbackQuery):
             lines.append("اطلاعات مصرفی ثبت نشده است.")
         db.log_admin_action(c.from_user.id, "panel_usage", user_id, f"sub_id={sub_id}; used={total}")
         await _replace_callback_message(c, "\n".join(lines), reply_markup=service_detail_kb(user_id, sub_id, item["purchase_id"]))
-    except subs.YouPanelError as exc:
-        await c.answer(exc.message, show_alert=True)
+    except subs.ProviderError as exc:
+        await c.answer(getattr(exc, "message", str(exc)), show_alert=True)
 
 
 async def cb_panel_action_ask(c: types.CallbackQuery):
@@ -1230,16 +1251,16 @@ async def cb_panel_action_ask(c: types.CallbackQuery):
     action, rest = raw.split("_ask_", 1)
     sub_id, user_id = rest.split("_", 1)
     item = subs.get_sub_detail(sub_id)
-    if not item or (item["source_type"] or "pool") != "youpanel" or str(item["owner"]) != str(user_id):
-        return await c.answer("سرویس پنلی پیدا نشد.", show_alert=True)
+    if not item or (item["source_type"] or "pool") == "pool" or str(item["owner"]) != str(user_id):
+        return await c.answer("سرویس تأمین‌کننده پیدا نشد.", show_alert=True)
     messages_map = {
         "reset": "مصرف ثبت‌شده این کاربر در پنل صفر می‌شود؛ حجم و زمان سرویس تغییر نمی‌کند.",
         "revoke": "لینک و شناسه اتصال قبلی باطل می‌شود و لینک جدید جایگزین خواهد شد.",
-        "delete": "کاربر از YouPanel حذف می‌شود و سرویس از حساب مشتری مخفی خواهد شد. این عملیات قابل بازگردانی نیست.",
+        "delete": "کاربر از تأمین‌کننده حذف می‌شود و سرویس از حساب مشتری مخفی خواهد شد. این عملیات قابل بازگردانی نیست.",
     }
     await _replace_callback_message(
         c,
-        f"⚠️ تأیید عملیات پنلی\n\nکاربر پنل: {item['panel_username']}\n{messages_map.get(action, '')}",
+        f"⚠️ تأیید عملیات تأمین‌کننده\n\nتأمین‌کننده: {subs.provider_label(item['source_type'])}\nکاربر: {item['panel_username']}\n{messages_map.get(action, '')}",
         reply_markup=_panel_action_confirm_kb(action, sub_id, user_id),
     )
 
@@ -1252,22 +1273,23 @@ async def cb_panel_action_confirm(c: types.CallbackQuery):
     action, rest = raw.split("_confirm_", 1)
     sub_id, user_id = rest.split("_", 1)
     item = subs.get_sub_detail(sub_id)
-    if not item or (item["source_type"] or "pool") != "youpanel" or str(item["owner"]) != str(user_id):
-        return await c.answer("سرویس پنلی پیدا نشد.", show_alert=True)
+    if not item or (item["source_type"] or "pool") == "pool" or str(item["owner"]) != str(user_id):
+        return await c.answer("سرویس تأمین‌کننده پیدا نشد.", show_alert=True)
     try:
+        provider = subs.get_provider_adapter(item["source_type"] or item["panel_provider"])
         if action == "reset":
-            result = await subs.panel_reset_usage(item["panel_username"])
+            result = await provider.reset_usage(item["panel_username"])
             db.update_panel_sub(sub_id, result)
             db.update_panel_sub_usage(sub_id, 0)
-            message = "✅ مصرف سرویس در پنل صفر شد."
+            message = "✅ مصرف سرویس در تأمین‌کننده صفر شد."
         elif action == "revoke":
-            result = await subs.panel_revoke_subscription(item["panel_username"])
+            result = await provider.revoke_subscription(item["panel_username"])
             db.update_panel_sub(sub_id, result)
             message = "✅ لینک اشتراک باطل و لینک جدید ذخیره شد."
         elif action == "delete":
-            await subs.panel_delete_user(item["panel_username"])
+            await provider.delete_user(item["panel_username"])
             db.mark_panel_sub_deleted(sub_id)
-            message = "✅ سرویس از YouPanel حذف شد."
+            message = "✅ سرویس از تأمین‌کننده حذف شد."
         else:
             return await c.answer("عملیات نامعتبر است.", show_alert=True)
         db.log_admin_action(c.from_user.id, f"panel_{action}", user_id, f"sub_id={sub_id}; panel_username={item['panel_username']}")
@@ -1275,8 +1297,8 @@ async def cb_panel_action_confirm(c: types.CallbackQuery):
             return await _replace_callback_message(c, message, reply_markup=user_history_kb(user_id, db.list_user_purchases(user_id), subs.user_subs(user_id)))
         updated = subs.get_sub_detail(sub_id)
         await _replace_callback_message(c, message + "\n\n" + _fmt_service_detail(user_id, sub_id)[0], reply_markup=service_detail_kb(user_id, sub_id, updated["purchase_id"] if updated else None))
-    except subs.YouPanelError as exc:
-        await c.answer(exc.message, show_alert=True)
+    except subs.ProviderError as exc:
+        await c.answer(getattr(exc, "message", str(exc)), show_alert=True)
 
 
 async def cb_search(c: types.CallbackQuery):
@@ -1404,14 +1426,14 @@ def link_manager_kb():
         InlineKeyboardButton("🔎 جستجوی لینک", callback_data="adm_link_search"),
         InlineKeyboardButton("🗑 حذف لینک آزاد", callback_data="adm_link_delete_manual"),
     )
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به کاتالوگ و فروش", callback_data="adm_section_services"))
     return kb
 
 
 def link_back_kb():
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("🔗 بازگشت به مدیریت لینک‌ها", callback_data="adm_links"))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+    kb.add(InlineKeyboardButton("🔗 بازگشت به استخر لینک‌ها", callback_data="adm_links"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به کاتالوگ و فروش", callback_data="adm_section_services"))
     return kb
 
 
@@ -1475,8 +1497,8 @@ def _links_list_kb(rows, back_callback="adm_links"):
         if int(row["used"] or 0) == 0:
             kb.insert(InlineKeyboardButton(f"حذف #{row['id']}", callback_data=f"adm_link_delete_ask_{row['id']}"))
 
-    kb.add(InlineKeyboardButton("🔗 بازگشت به مدیریت لینک‌ها", callback_data=back_callback))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+    kb.add(InlineKeyboardButton("🔗 بازگشت به استخر لینک‌ها", callback_data=back_callback))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به کاتالوگ و فروش", callback_data="adm_section_services"))
     return kb
 
 
@@ -1488,7 +1510,7 @@ async def cb_links(c: types.CallbackQuery):
     counts = subs.link_counts()
 
     text = (
-        "🔗 مدیریت لینک‌ها\n\n"
+        "🔗 استخر لینک‌ها\n\n"
         "از این بخش می‌تونی لینک‌های ساب رو مدیریت کنی؛ جزئیات ببینی، لینک جدید اضافه کنی یا لینک آزاد رو حذف کنی.\n\n"
         f"📊 آمار لینک‌ها:\n"
         f"کل لینک‌ها: {counts['total']}\n"
@@ -1547,8 +1569,8 @@ async def cb_link_detail(c: types.CallbackQuery):
         kb.add(InlineKeyboardButton("👤 جزئیات مالک", callback_data=f"adm_user_{row['owner']}"))
         kb.add(InlineKeyboardButton("↩️ بازگردانی به استخر", callback_data=f"adm_link_repool_ask_{row['id']}"))
 
-    kb.add(InlineKeyboardButton("🔗 بازگشت به مدیریت لینک‌ها", callback_data="adm_links"))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
+    kb.add(InlineKeyboardButton("🔗 بازگشت به استخر لینک‌ها", callback_data="adm_links"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به کاتالوگ و فروش", callback_data="adm_section_services"))
 
     await _replace_callback_message(c, text, reply_markup=kb)
 
@@ -1783,11 +1805,11 @@ async def cb_addsub(c: types.CallbackQuery, state: FSMContext):
         return await c.answer()
 
     await c.answer()
-    plans = [plan for plan in db.list_plans(active_only=True) if db.plan_delivery_type(plan) == "pool"]
+    plans = [plan for plan in db.list_plans(active_only=True) if db.plan_provider_key(plan) == "pool"]
     if not plans:
         return await _replace_callback_message(
             c,
-            "پلن استخری فعالی وجود ندارد. برای پلن‌های YouPanel لینک دستی وارد نمی‌شود.",
+            "پلن استخری فعالی وجود ندارد. برای پلن‌های دارای تأمین‌کننده، لینک دستی وارد نمی‌شود.",
             reply_markup=admin_services_section_kb(),
         )
     if len(plans) > 1:
@@ -1821,10 +1843,10 @@ async def cb_addsub_plan(c: types.CallbackQuery, state: FSMContext):
     plan = db.get_plan(plan_id)
     if not plan:
         return await _replace_callback_message(c, "این پلن پیدا نشد.", reply_markup=admin_services_section_kb())
-    if db.plan_delivery_type(plan) != "pool":
+    if db.plan_provider_key(plan) != "pool":
         return await _replace_callback_message(
             c,
-            "این پلن از YouPanel به‌صورت خودکار ساخته می‌شود و استخر لینک دستی ندارد.",
+            "این پلن توسط تأمین‌کننده به‌صورت خودکار ساخته می‌شود و استخر لینک دستی ندارد.",
             reply_markup=plan_detail_kb(plan_id),
         )
     await state.update_data(add_sub_plan_id=plan_id)
@@ -1977,30 +1999,420 @@ async def cb_admin_logs(c: types.CallbackQuery):
     await _replace_callback_message(c, "\n".join(lines), reply_markup=admin_reports_section_kb())
 
 
+def categories_menu_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("➕ ساخت دسته جدید", callback_data="category_create"))
+    for category in db.list_plan_categories(active_only=False):
+        active = "✅" if int(category["is_active"] or 0) else "🚫"
+        kb.add(InlineKeyboardButton(
+            f"{active} {category['emoji'] or '📦'} {category['title']} ({int(category['plan_count'] or 0)})",
+            callback_data=f"category_detail_{category['id']}",
+        ))
+    kb.add(InlineKeyboardButton("⬅️ کاتالوگ و فروش", callback_data="adm_section_services"))
+    return kb
+
+
+def category_detail_kb(category_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✏️ عنوان", callback_data=f"category_set_title_{category_id}"),
+        InlineKeyboardButton("😀 ایموجی", callback_data=f"category_set_emoji_{category_id}"),
+        InlineKeyboardButton("📝 توضیح", callback_data=f"category_set_description_{category_id}"),
+        InlineKeyboardButton("👥 گروه هدف", callback_data=f"category_set_audience_{category_id}"),
+        InlineKeyboardButton("🗓 شروع نمایش", callback_data=f"category_set_starts_at_{category_id}"),
+        InlineKeyboardButton("⌛ پایان نمایش", callback_data=f"category_set_ends_at_{category_id}"),
+        InlineKeyboardButton("👁 فعال/غیرفعال", callback_data=f"category_toggle_{category_id}"),
+        InlineKeyboardButton("⬆️ بالا", callback_data=f"category_move_up_{category_id}"),
+        InlineKeyboardButton("⬇️ پایین", callback_data=f"category_move_down_{category_id}"),
+    )
+    kb.add(InlineKeyboardButton("🗑 حذف دسته خالی", callback_data=f"category_delete_{category_id}"))
+    kb.add(InlineKeyboardButton("⬅️ دسته‌ها", callback_data="adm_categories"))
+    return kb
+
+
+def category_audience_kb(category_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    options = [
+        ("all", "همه"), ("buyers", "خریداران"),
+        ("no_buy", "بدون خرید"), ("has_service", "دارای سرویس"),
+        ("no_service", "بدون سرویس"), ("normal", "کاربر عادی"),
+        ("test", "کاربر تست"), ("admins", "فقط ادمین"),
+    ]
+    for value, label in options:
+        kb.insert(InlineKeyboardButton(label, callback_data=f"category_audience_{category_id}_{value}"))
+    kb.add(InlineKeyboardButton("⬅️ جزئیات دسته", callback_data=f"category_detail_{category_id}"))
+    return kb
+
+
+def _fmt_category(category):
+    return (
+        f"🗂 دسته #{category['id']}\n\n"
+        f"عنوان: {category['emoji'] or '📦'} {category['title']}\n"
+        f"توضیح: {category['description'] or '-'}\n"
+        f"ترتیب: {category['sort_order']}\n"
+        f"وضعیت: {'فعال' if int(category['is_active'] or 0) else 'غیرفعال'}\n"
+        f"گروه هدف: {BUTTON_AUDIENCE_LABELS.get(category['audience'] or 'all', category['audience'] or 'all')}\n"
+        f"شروع نمایش: {category['starts_at'] or '-'}\n"
+        f"پایان نمایش: {category['ends_at'] or '-'}\n"
+        f"تعداد پلن: {int(category['plan_count'] or 0) if 'plan_count' in category.keys() else '-'}"
+    )
+
+
+def _parse_category_form(text):
+    values = {}
+    aliases = {
+        "عنوان": "title", "title": "title", "ایموجی": "emoji", "emoji": "emoji",
+        "توضیح": "description", "description": "description", "ترتیب": "sort_order", "order": "sort_order",
+        "نمایش": "audience", "audience": "audience", "شروع": "starts_at", "starts_at": "starts_at",
+        "پایان": "ends_at", "ends_at": "ends_at",
+    }
+    for line in (text or "").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        field = aliases.get(key.strip().lower()) or aliases.get(key.strip())
+        if field:
+            values[field] = value.strip()
+    if not values.get("title"):
+        raise ValueError("عنوان دسته الزامی است")
+    if "sort_order" in values:
+        values["sort_order"] = int(values["sort_order"] or 100)
+    values.setdefault("sort_order", 100)
+    values.setdefault("is_active", 1)
+    audience = (values.get("audience") or "all").strip().lower()
+    if audience not in db.ALLOWED_CUSTOM_BUTTON_AUDIENCES:
+        raise ValueError("گروه هدف معتبر نیست: all, buyers, no_buy, has_service, no_service, normal, test, admins")
+    values["audience"] = audience
+    for field in ("starts_at", "ends_at"):
+        if values.get(field) in {"-", "none", "ندارد"}:
+            values[field] = None
+    return values
+
+
+async def cb_categories(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await _replace_callback_message(c, "🗂 مدیریت دسته‌های فروشگاه\n\nدسته‌ها صفحه اول خرید مشتری را می‌سازند؛ مثل VIP و اقتصادی.", reply_markup=categories_menu_kb())
+
+
+async def cb_category_create(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    current = await state.get_data()
+    await state.update_data(
+        category_action="create",
+        category_return_to_plan=current.get("plan_action") == "create_wizard",
+    )
+    await _replace_callback_message(
+        c,
+        "➕ ساخت دسته جدید\n\nفرم را بفرستید:\n\nعنوان: اقتصادی\nایموجی: 🌱\nتوضیح: پلن‌های مقرون‌به‌صرفه\nترتیب: 20",
+        reply_markup=cancel_kb("adm_categories", "⬅️ دسته‌ها"),
+    )
+    await AdminStates.waiting_category_form.set()
+
+
+async def process_category_form(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    if m.content_type != "text":
+        return await m.answer("فرم را به صورت متن بفرستید.", reply_markup=cancel_kb("adm_categories", "⬅️ دسته‌ها"))
+    flow = await state.get_data()
+    try:
+        data = _parse_category_form(m.text)
+        category_id = db.create_plan_category(data)
+    except Exception as exc:
+        return await m.answer(f"❌ دسته ساخته نشد: {exc}", reply_markup=cancel_kb("adm_categories", "⬅️ دسته‌ها"))
+    db.log_admin_action(m.from_user.id, "create_category", None, f"category_id={category_id};title={data['title']}")
+    if flow.get("category_return_to_plan"):
+        plan_data = dict(flow.get("plan_data") or {})
+        plan_data["category_id"] = category_id
+        await state.set_data({"plan_action": "create_wizard", "plan_step": "title", "plan_data": plan_data})
+        await state.set_state(AdminStates.waiting_plan_form.state)
+        return await m.answer("✅ دسته ساخته و برای پلن انتخاب شد.\n\n" + _plan_wizard_step_text("title"), reply_markup=cancel_kb())
+    await state.finish()
+    category = db.get_plan_category(category_id)
+    await m.answer("✅ دسته ساخته شد.\n\n" + _fmt_category(category), reply_markup=category_detail_kb(category_id))
+
+
+async def cb_category_detail(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    category_id = int(c.data.rsplit("_", 1)[1])
+    category = db.get_plan_category(category_id)
+    if not category:
+        return await _replace_callback_message(c, "دسته پیدا نشد.", reply_markup=categories_menu_kb())
+    await _replace_callback_message(c, _fmt_category(category), reply_markup=category_detail_kb(category_id))
+
+
+CATEGORY_EDIT_FIELDS = {
+    "title": "عنوان", "emoji": "ایموجی", "description": "توضیح",
+    "audience": "گروه هدف", "starts_at": "شروع نمایش", "ends_at": "پایان نمایش",
+}
+
+
+async def cb_category_set(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("category_set_", 1)[1]
+    field, category_id = raw.rsplit("_", 1)
+    if field not in CATEGORY_EDIT_FIELDS:
+        return await c.answer("فیلد نامعتبر است.", show_alert=True)
+    category = db.get_plan_category(category_id)
+    if not category:
+        return await _replace_callback_message(c, "دسته پیدا نشد.", reply_markup=categories_menu_kb())
+    if field == "audience":
+        return await _replace_callback_message(c, "👥 گروه هدف دسته را انتخاب کنید:", reply_markup=category_audience_kb(category_id))
+    await state.update_data(category_id=int(category_id), category_field=field)
+    await _replace_callback_message(c, f"مقدار جدید «{CATEGORY_EDIT_FIELDS[field]}» را بفرستید.\nمقدار فعلی: {category[field] or '-'}", reply_markup=cancel_kb(f"category_detail_{category_id}", "⬅️ جزئیات دسته"))
+    await AdminStates.waiting_category_setting.set()
+
+
+async def process_category_setting(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    data = await state.get_data()
+    category_id = int(data["category_id"])
+    field = data["category_field"]
+    value = (m.text or "").strip()
+    if value == "-":
+        value = ""
+    if field == "title" and not value:
+        return await m.answer("عنوان نمی‌تواند خالی باشد.", reply_markup=cancel_kb(f"category_detail_{category_id}"))
+    if field == "audience":
+        value = value.lower()
+        if value not in db.ALLOWED_CUSTOM_BUTTON_AUDIENCES:
+            return await m.answer("مجاز: all, buyers, no_buy, has_service, no_service, normal, test, admins", reply_markup=cancel_kb(f"category_detail_{category_id}"))
+    if field in {"starts_at", "ends_at"} and value in {"", "-", "none", "ندارد"}:
+        value = None
+    db.update_plan_category(category_id, {field: value})
+    await state.finish()
+    db.log_admin_action(m.from_user.id, "update_category", None, f"category_id={category_id};field={field}")
+    category = db.get_plan_category(category_id)
+    await m.answer("✅ دسته به‌روزرسانی شد.\n\n" + _fmt_category(category), reply_markup=category_detail_kb(category_id))
+
+
+async def cb_category_audience(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("category_audience_", 1)[1]
+    category_id_text, audience = raw.split("_", 1)
+    if audience not in db.ALLOWED_CUSTOM_BUTTON_AUDIENCES:
+        return await c.answer("گروه هدف نامعتبر است.", show_alert=True)
+    category_id = int(category_id_text)
+    if not db.update_plan_category(category_id, {"audience": audience}):
+        return await _replace_callback_message(c, "دسته پیدا نشد.", reply_markup=categories_menu_kb())
+    category = db.get_plan_category(category_id)
+    db.log_admin_action(c.from_user.id, "update_category_audience", None, f"category_id={category_id};audience={audience}")
+    await _replace_callback_message(c, "✅ گروه هدف دسته تغییر کرد.\n\n" + _fmt_category(category), reply_markup=category_detail_kb(category_id))
+
+
+async def cb_category_toggle(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    category_id = int(c.data.rsplit("_", 1)[1])
+    db.toggle_plan_category(category_id)
+    category = db.get_plan_category(category_id)
+    await _replace_callback_message(c, "✅ وضعیت دسته تغییر کرد.\n\n" + _fmt_category(category), reply_markup=category_detail_kb(category_id))
+
+
+async def cb_category_move(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("category_move_", 1)[1]
+    direction, category_id = raw.rsplit("_", 1)
+    db.move_record("plan_categories", "id", int(category_id), direction)
+    await _replace_callback_message(c, "✅ ترتیب دسته‌ها به‌روزرسانی شد.", reply_markup=categories_menu_kb())
+
+
+async def cb_category_delete(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    category_id = int(c.data.rsplit("_", 1)[1])
+    ok, reason = db.delete_plan_category(category_id)
+    text = "✅ دسته حذف شد." if ok else ("❌ ابتدا پلن‌های داخل این دسته را جابه‌جا کنید." if reason == "not_empty" else "دسته پیدا نشد.")
+    await _replace_callback_message(c, text, reply_markup=categories_menu_kb())
+
+
+def providers_menu_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    for provider in subs.list_provider_adapters(configured_only=False):
+        status = "✅ متصل" if provider.configured() else "⚠️ تنظیم نشده"
+        kb.add(InlineKeyboardButton(f"{provider.label} | {status}", callback_data=f"adm_provider_{provider.key}"))
+    kb.add(InlineKeyboardButton("⬅️ کاتالوگ و فروش", callback_data="adm_section_services"))
+    return kb
+
+
+async def cb_providers(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await _replace_callback_message(c, "🔌 تأمین‌کننده‌ها\n\nمنطق فروشگاه مستقل از پنل است. هر پنل از این بخش به‌عنوان یک تأمین‌کننده مدیریت می‌شود.", reply_markup=providers_menu_kb())
+
+
+async def cb_provider_detail(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    key = c.data.split("adm_provider_", 1)[1]
+    try:
+        provider = subs.get_provider_adapter(key)
+    except Exception as exc:
+        return await _replace_callback_message(c, f"❌ {exc}", reply_markup=providers_menu_kb())
+    text = f"🔌 {provider.label}\n\nکلید فنی: {provider.key}\nوضعیت تنظیمات: {'کامل' if provider.configured() else 'ناقص'}"
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🧪 تست اتصال", callback_data=f"adm_provider_health_{key}"))
+    kb.add(InlineKeyboardButton("⬅️ تأمین‌کننده‌ها", callback_data="adm_providers"))
+    await _replace_callback_message(c, text, reply_markup=kb)
+
+
+async def cb_provider_health(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer("در حال بررسی اتصال...")
+    key = c.data.split("adm_provider_health_", 1)[1]
+    try:
+        result = await subs.provider_health_check(key)
+        provider = subs.get_provider_adapter(key)
+        username = result.get("username") or result.get("admin", {}).get("username") or "-"
+        text = f"✅ اتصال {provider.label} برقرار است.\nحساب: {username}"
+    except Exception as exc:
+        text = f"❌ تست اتصال ناموفق بود.\n{exc}"
+    await _replace_callback_message(c, text, reply_markup=providers_menu_kb())
+
+
+def trials_menu_kb(rows):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for row in rows[:20]:
+        label = row["username"] and f"@{row['username']}" or row["display_name"] or row["user_id"]
+        status = {"completed": "✅", "pending": "⏳", "failed": "❌"}.get(row["status"], "•")
+        kb.add(InlineKeyboardButton(f"{status} {label} | {row['status']}", callback_data=f"adm_trial_detail_{row['user_id']}"))
+    kb.add(InlineKeyboardButton("⬅️ کاتالوگ و فروش", callback_data="adm_section_services"))
+    return kb
+
+
+async def cb_trials(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    stats = db.trial_claim_stats()
+    rows = db.list_trial_claims(limit=30)
+    text = (
+        "🧪 اکانت‌های تست\n\n"
+        f"کل درخواست‌ها: {stats['total']}\n"
+        f"ساخته‌شده: {stats['completed']}\n"
+        f"در حال ساخت: {stats['pending']}\n"
+        f"ناموفق: {stats['failed']}\n\n"
+        "برای جزئیات هر تست روی نام کاربر بزنید."
+    )
+    await _replace_callback_message(c, text, reply_markup=trials_menu_kb(rows), context="admin_trials", kind="list")
+
+
+async def cb_trial_detail(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    user_id = c.data.split("adm_trial_detail_", 1)[1]
+    claim = db.get_trial_claim(user_id)
+    user = db.get_user(user_id)
+    if not claim:
+        return await _replace_callback_message(c, "رکورد تست پیدا نشد.", reply_markup=trials_menu_kb(db.list_trial_claims(limit=30)))
+    lines = [
+        "🧪 جزئیات اکانت تست",
+        "",
+        f"کاربر: {_display_username(user) if user else user_id}",
+        f"Telegram ID: {user_id}",
+        f"وضعیت: {claim['status']}",
+        f"تأمین‌کننده: {subs.provider_label(claim['provider_key'] if 'provider_key' in claim.keys() else 'youpanel')}",
+        f"نام کاربری تأمین‌کننده: {claim['panel_username'] or '-'}",
+        f"تاریخ ساخت: {_dual(claim['created_at'])}",
+        f"آخرین تغییر: {_dual(claim['updated_at'])}",
+        f"خطا: {claim['error'] or '-'}",
+    ]
+    kb = InlineKeyboardMarkup(row_width=1)
+    if claim["sub_id"]:
+        kb.add(InlineKeyboardButton("📦 جزئیات سرویس تست", callback_data=f"adm_user_sub_detail_{claim['sub_id']}_{user_id}"))
+    kb.add(InlineKeyboardButton("💬 ارسال پیام به کاربر", callback_data=f"adm_msg_user_{user_id}"))
+    kb.add(InlineKeyboardButton("⬅️ اکانت‌های تست", callback_data="adm_trials"))
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=kb, context="admin_trial_detail", kind="list")
+
+
+def admin_layout_kb():
+    kb = InlineKeyboardMarkup(row_width=3)
+    for item in db.list_admin_menu_items(active_only=False):
+        title = item["title"] or item["default_title"]
+        mark = "✅" if int(item["is_active"] or 0) else "🚫"
+        kb.row(
+            InlineKeyboardButton("⬆️", callback_data=f"adm_layout_up_{item['key']}"),
+            InlineKeyboardButton(f"{mark} {title}", callback_data=f"adm_layout_toggle_{item['key']}"),
+            InlineKeyboardButton("⬇️", callback_data=f"adm_layout_down_{item['key']}"),
+        )
+    kb.add(InlineKeyboardButton("♻️ بازگردانی پیش‌فرض", callback_data="adm_layout_reset"))
+    kb.add(InlineKeyboardButton("⬅️ محتوا و ظاهر", callback_data="adm_section_personalize"))
+    return kb
+
+
+async def cb_admin_layout(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    lines = ["🧭 چیدمان پنل مدیریت", "", "با فلش‌ها ترتیب را عوض کنید و با زدن عنوان، نمایش آن بخش را فعال/غیرفعال کنید."]
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=admin_layout_kb())
+
+
+async def cb_admin_layout_action(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    if c.data == "adm_layout_reset":
+        db.reset_admin_menu_items()
+    else:
+        raw = c.data.split("adm_layout_", 1)[1]
+        action, key = raw.split("_", 1)
+        item = db.get_admin_menu_item(key)
+        if item:
+            if action in {"up", "down"}:
+                db.update_admin_menu_item(key, direction=action)
+            elif action == "toggle":
+                db.update_admin_menu_item(key, is_active=not bool(int(item["is_active"] or 0)))
+    await _replace_callback_message(c, "✅ چیدمان پنل به‌روزرسانی شد.", reply_markup=admin_layout_kb())
+
+
 def plans_menu_kb():
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("➕ ساخت سریع پلن", callback_data="plan_create"))
-    for plan in db.list_plans(limit=30):
-        active = "✅" if int(plan["is_active"] or 0) else "🚫"
+    kb.add(InlineKeyboardButton("➕ ساخت پلن جدید", callback_data="plan_create"))
+    categories = {int(row["id"]): row for row in db.list_plan_categories(active_only=False)}
+    for plan in db.list_plans(limit=100, include_disabled=True):
+        active = "✅" if int(plan["is_active"] or 0) and db.plan_purchase_mode(plan) != "disabled" else "🚫"
         default = " ⭐" if int(plan["is_default"] or 0) else ""
-        kb.add(InlineKeyboardButton(f"{active} #{plan['id']} {plan['title']}{default}", callback_data=f"plan_detail_{plan['id']}"))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به سرویس‌ها", callback_data="adm_section_services"))
+        category = categories.get(int(plan["category_id"] or 0))
+        cat = f"{category['emoji'] or '📦'} {category['title']}" if category else "بدون دسته"
+        kb.add(InlineKeyboardButton(f"{active} {plan['title']} | {cat}{default}", callback_data=f"plan_detail_{plan['id']}"))
+    kb.add(InlineKeyboardButton("⬅️ کاتالوگ و فروش", callback_data="adm_section_services"))
     return kb
 
 
 def plan_detail_kb(plan_id):
     kb = InlineKeyboardMarkup(row_width=2)
     plan = db.get_plan(plan_id)
-    delivery_type = db.plan_delivery_type(plan) if plan else "pool"
+    provider_key = db.plan_provider_key(plan) if plan else "pool"
     kb.add(
         InlineKeyboardButton("⚙️ تنظیمات پلن", callback_data=f"plan_settings_{plan_id}"),
         InlineKeyboardButton("👁 فعال/غیرفعال", callback_data=f"plan_toggle_{plan_id}"),
+        InlineKeyboardButton("⬆️ بالا", callback_data=f"plan_move_up_{plan_id}"),
+        InlineKeyboardButton("⬇️ پایین", callback_data=f"plan_move_down_{plan_id}"),
     )
-    if delivery_type == "pool":
+    if provider_key == "pool":
         kb.add(InlineKeyboardButton("📥 افزودن لینک به این پلن", callback_data=f"adm_addsub_plan_{plan_id}"))
     else:
-        kb.add(InlineKeyboardButton("🔌 تست اتصال پنل", callback_data="adm_panel_health"))
-    kb.add(InlineKeyboardButton("✏️ ویرایش فرم کامل", callback_data=f"plan_edit_{plan_id}"))
+        kb.add(InlineKeyboardButton("🔌 وضعیت تأمین‌کننده", callback_data=f"adm_provider_{provider_key}"))
     kb.add(InlineKeyboardButton("⬅️ مدیریت پلن‌ها", callback_data="adm_plans"))
     kb.add(InlineKeyboardButton("🏠 پنل مدیریت", callback_data="adm_back"))
     return kb
@@ -2019,34 +2431,38 @@ PLAN_EDIT_FIELDS = {
     "low_stock_threshold": ("حد هشدار موجودی", "int"),
     "pre_purchase_text": ("متن اختصاصی قبل از خرید", "text"),
     "post_purchase_text": ("متن اختصاصی بعد از خرید", "text"),
-    "panel_data_limit_bytes": ("حجم ساخت خودکار", "size"),
-    "panel_duration_days": ("مدت ساخت خودکار (روز)", "int"),
-    "panel_max_devices": ("حداکثر دستگاه پنلی", "optional_int"),
+    "panel_max_devices": ("حداکثر دستگاه", "optional_int"),
 }
 
 
 def plan_settings_kb(plan_id):
+    plan = db.get_plan(plan_id)
+    provider_key = db.plan_provider_key(plan) if plan else "pool"
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
+        InlineKeyboardButton("🗂 دسته", callback_data=f"plan_category_{plan_id}"),
+        InlineKeyboardButton("🛒 نحوه خرید", callback_data=f"plan_purchase_mode_{plan_id}"),
         InlineKeyboardButton("عنوان", callback_data=f"plan_set_title_{plan_id}"),
         InlineKeyboardButton("قیمت", callback_data=f"plan_set_price_{plan_id}"),
         InlineKeyboardButton("حجم", callback_data=f"plan_set_volume_label_{plan_id}"),
         InlineKeyboardButton("مدت", callback_data=f"plan_set_duration_label_{plan_id}"),
-        InlineKeyboardButton("حد هشدار", callback_data=f"plan_set_low_stock_threshold_{plan_id}"),
-        InlineKeyboardButton("حداکثر خرید", callback_data=f"plan_set_max_per_order_{plan_id}"),
         InlineKeyboardButton("توضیح", callback_data=f"plan_set_description_{plan_id}"),
         InlineKeyboardButton("برچسب", callback_data=f"plan_set_tag_{plan_id}"),
+        InlineKeyboardButton("حداکثر خرید", callback_data=f"plan_set_max_per_order_{plan_id}"),
         InlineKeyboardButton("متن قبل خرید", callback_data=f"plan_set_pre_purchase_text_{plan_id}"),
         InlineKeyboardButton("متن بعد خرید", callback_data=f"plan_set_post_purchase_text_{plan_id}"),
+        InlineKeyboardButton("🔄 روش تحویل", callback_data=f"plan_provider_{plan_id}"),
     )
-    kb.add(
-        InlineKeyboardButton("🔄 روش تحویل", callback_data=f"plan_toggle_delivery_{plan_id}"),
-        InlineKeyboardButton("⏱ شروع اعتبار", callback_data=f"plan_toggle_start_{plan_id}"),
-        InlineKeyboardButton("📦 حجم پنلی", callback_data=f"plan_set_panel_data_limit_bytes_{plan_id}"),
-        InlineKeyboardButton("📅 مدت پنلی", callback_data=f"plan_set_panel_duration_days_{plan_id}"),
-        InlineKeyboardButton("📱 سقف دستگاه", callback_data=f"plan_set_panel_max_devices_{plan_id}"),
-    )
-    kb.add(InlineKeyboardButton("👁 نمایش/عدم نمایش موجودی", callback_data=f"plan_toggle_stock_{plan_id}"))
+    if provider_key == "pool":
+        kb.add(
+            InlineKeyboardButton("حد هشدار موجودی", callback_data=f"plan_set_low_stock_threshold_{plan_id}"),
+            InlineKeyboardButton("👁 نمایش موجودی", callback_data=f"plan_toggle_stock_{plan_id}"),
+        )
+    else:
+        kb.add(
+            InlineKeyboardButton("⏱ شروع اعتبار", callback_data=f"plan_toggle_start_{plan_id}"),
+            InlineKeyboardButton("📱 سقف دستگاه", callback_data=f"plan_set_panel_max_devices_{plan_id}"),
+        )
     kb.add(InlineKeyboardButton("⬅️ جزئیات پلن", callback_data=f"plan_detail_{plan_id}"))
     return kb
 
@@ -2075,36 +2491,58 @@ def _parse_size_bytes(value):
     return result if result > 0 else None
 
 
+def _parse_duration_days(value):
+    match = re.search(r"(\d+)", (value or "").replace(",", ""))
+    if not match:
+        return None
+    days = int(match.group(1))
+    return days if days > 0 else None
+
+
+def _purchase_mode_label(value):
+    return {"direct": "خرید مستقیم", "quantity": "انتخاب تعداد", "wholesale": "فقط عمده", "disabled": "غیرفعال"}.get(value, value)
+
+
 def _fmt_plan(plan):
     stock = db.plan_stock_count(plan["id"])
     sold = db.plan_sold_count(plan["id"])
-    pre_text = (plan["pre_purchase_text"] if "pre_purchase_text" in plan.keys() else "") or ""
-    post_text = (plan["post_purchase_text"] if "post_purchase_text" in plan.keys() else "") or ""
-    return (
-        f"🏷 پلن #{plan['id']}\n\n"
-        f"عنوان: {plan['title']}\n"
-        f"حجم: {plan['volume_label'] or '-'}\n"
-        f"مدت: {plan['duration_label'] or '-'}\n"
-        f"قیمت فروش: {_fmt_money(plan['price'])}\n"
-        f"قیمت خرید/هزینه: {_fmt_money(plan['cost_price'])}\n"
-        f"برچسب: {plan['tag'] or '-'}\n"
-        f"توضیح: {plan['description'] or '-'}\n"
-        f"ترتیب نمایش: {plan['sort_order']}\n"
-        f"حداکثر خرید در سفارش: {plan['max_per_order']}\n"
-        f"نمایش موجودی به کاربر: {'بله' if int(plan['show_stock'] or 0) else 'خیر'}\n"
-        f"آستانه هشدار موجودی: {plan['low_stock_threshold']}\n"
-        f"متن قبل خرید: {_short(pre_text, 80)}\n"
-        f"متن بعد خرید: {_short(post_text, 80)}\n"
-        f"روش تحویل: {'ساخت خودکار YouPanel' if db.plan_delivery_type(plan) == 'youpanel' else 'استخر لینک'}\n"
-        f"حجم ساخت پنلی: {_fmt_bytes(plan['panel_data_limit_bytes'] if 'panel_data_limit_bytes' in plan.keys() else 0)}\n"
-        f"مدت ساخت پنلی: {int(plan['panel_duration_days'] or 0) if 'panel_duration_days' in plan.keys() else 0} روز\n"
-        f"شروع اعتبار پنلی: {'از زمان ساخت' if ('panel_start_mode' in plan.keys() and plan['panel_start_mode'] == 'active') else 'از اولین اتصال'}\n"
-        f"تعداد دستگاه مجاز: {int(plan['panel_max_devices']) if ('panel_max_devices' in plan.keys() and plan['panel_max_devices'] not in (None, '')) else 'بدون محدودیت'}\n"
-        f"وضعیت: {'فعال' if int(plan['is_active'] or 0) else 'غیرفعال'}\n"
-        f"پیش‌فرض: {'بله' if int(plan['is_default'] or 0) else 'خیر'}\n"
-        f"موجودی آزاد این پلن: {stock}\n"
-        f"فروخته‌شده از این پلن: {sold}"
-    )
+    category = db.get_plan_category(plan["category_id"]) if plan["category_id"] else None
+    provider_key = db.plan_provider_key(plan)
+    provider_name = "استخر لینک" if provider_key == "pool" else subs.provider_label(provider_key)
+    pre_text = (plan["pre_purchase_text"] or "").strip()
+    post_text = (plan["post_purchase_text"] or "").strip()
+    lines = [
+        f"🏷 پلن #{plan['id']}", "",
+        f"دسته: {(category['emoji'] or '📦') + ' ' + category['title'] if category else '-'}",
+        f"عنوان: {plan['title']}",
+        f"حجم: {plan['volume_label'] or '-'}",
+        f"مدت: {plan['duration_label'] or '-'}",
+        f"قیمت فروش: {_fmt_money(plan['price'])}",
+        f"نحوه خرید: {_purchase_mode_label(db.plan_purchase_mode(plan))}",
+        f"روش تحویل: {provider_name}",
+        f"توضیح: {plan['description'] or '-'}",
+        f"برچسب: {plan['tag'] or '-'}",
+        f"ترتیب نمایش: {plan['sort_order']}",
+        f"حداکثر خرید: {plan['max_per_order']}",
+        f"متن قبل خرید: {_short(pre_text, 80)}",
+        f"متن بعد خرید: {_short(post_text, 80)}",
+    ]
+    if provider_key == "pool":
+        lines += [
+            f"نمایش موجودی: {'بله' if int(plan['show_stock'] or 0) else 'خیر'}",
+            f"حد هشدار: {plan['low_stock_threshold']}",
+        ]
+    else:
+        lines += [
+            f"شروع اعتبار: {'از زمان ساخت' if plan['panel_start_mode'] == 'active' else 'از اولین اتصال'}",
+            f"دستگاه مجاز: {int(plan['panel_max_devices']) if plan['panel_max_devices'] not in (None, '') else 'بدون محدودیت'}",
+        ]
+    lines += [
+        f"وضعیت: {'فعال' if int(plan['is_active'] or 0) else 'غیرفعال'}",
+        f"موجودی آزاد: {stock if provider_key == 'pool' else 'ساخت خودکار'}",
+        f"فروخته‌شده: {sold}",
+    ]
+    return "\n".join(lines)
 
 
 def _plan_form_help(current=None):
@@ -2190,11 +2628,13 @@ async def cb_plans(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
-    lines = ["🏷 مدیریت پلن‌ها", "", "پلن‌های فعال در خرید سرویس به کاربر نمایش داده می‌شوند.", ""]
-    for idx, plan in enumerate(db.list_plans(limit=30), start=1):
-        delivery = db.plan_delivery_type(plan)
-        stock_label = f"موجودی {db.plan_stock_count(plan['id'])}" if delivery == "pool" else "ساخت خودکار YouPanel"
-        lines.append(f"{idx}. {'✅' if int(plan['is_active'] or 0) else '🚫'} #{plan['id']} {plan['title']} | {_fmt_money(plan['price'])} | {stock_label}")
+    categories = {int(row["id"]): row for row in db.list_plan_categories(active_only=False)}
+    lines = ["🏷 مدیریت پلن‌ها", "", "ساخت، ویرایش و ترتیب همه پلن‌ها از همین صفحه انجام می‌شود.", ""]
+    for idx, plan in enumerate(db.list_plans(limit=100, include_disabled=True), start=1):
+        category = categories.get(int(plan["category_id"] or 0))
+        cat = f"{category['emoji'] or '📦'} {category['title']}" if category else "بدون دسته"
+        provider = "استخر" if db.plan_provider_key(plan) == "pool" else subs.provider_label(db.plan_provider_key(plan))
+        lines.append(f"{idx}. {'✅' if int(plan['is_active'] or 0) and db.plan_purchase_mode(plan) != 'disabled' else '🚫'} {plan['title']} | {cat}\n   {_fmt_money(plan['price'])} | {_purchase_mode_label(db.plan_purchase_mode(plan))} | {provider}")
     await _replace_callback_message(c, "\n".join(lines), reply_markup=plans_menu_kb())
 
 
@@ -2213,16 +2653,13 @@ async def cb_plan_create(c: types.CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
-    await state.update_data(plan_action="create_wizard", plan_step="title", plan_data={})
-    await _replace_callback_message(
-        c,
-        "➕ ساخت سریع پلن\n\nمرحله ۱ از ۶\nعنوان پلن را بفرستید.\nمثال: 50GB یک‌ماهه",
-        reply_markup=cancel_kb(),
-    )
+    await state.update_data(plan_action="create_wizard", plan_step="category", plan_data={})
+    await _replace_callback_message(c, "➕ ساخت پلن جدید\n\nابتدا دسته نمایش پلن را انتخاب کنید.", reply_markup=_plan_category_select_kb())
     await AdminStates.waiting_plan_form.set()
 
 
 async def cb_plan_edit(c: types.CallbackQuery, state: FSMContext):
+    """فرم پیشرفته سازگار؛ مسیر اصلی ویرایش، تنظیمات تک‌فیلدی است."""
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
@@ -2230,52 +2667,41 @@ async def cb_plan_edit(c: types.CallbackQuery, state: FSMContext):
     plan = db.get_plan(plan_id)
     if not plan:
         return await c.message.answer("این پلن پیدا نشد.", reply_markup=plans_menu_kb())
-    if db.plan_delivery_type(plan) != "pool":
-        return await _replace_callback_message(c, "این پلن به‌صورت خودکار از YouPanel ساخته می‌شود و به استخر لینک نیاز ندارد.", reply_markup=plan_detail_kb(plan_id))
     current = (
-        f"عنوان: {plan['title']}\n"
-        f"حجم: {plan['volume_label'] or ''}\n"
-        f"مدت: {plan['duration_label'] or ''}\n"
-        f"قیمت: {plan['price']}\n"
-        f"توضیح: {plan['description'] or ''}\n"
-        f"ترتیب: {plan['sort_order']}\n"
-        f"وضعیت: {'active' if int(plan['is_active'] or 0) else 'inactive'}\n"
-        f"حداکثر: {plan['max_per_order']}\n"
-        f"هزینه: {plan['cost_price'] or 0}\n"
-        f"برچسب: {plan['tag'] or ''}\n"
+        f"عنوان: {plan['title']}\nحجم: {plan['volume_label'] or ''}\nمدت: {plan['duration_label'] or ''}\n"
+        f"قیمت: {plan['price']}\nتوضیح: {plan['description'] or ''}\nترتیب: {plan['sort_order']}\n"
+        f"حداکثر: {plan['max_per_order']}\nبرچسب: {plan['tag'] or ''}\n"
         f"نمایش موجودی: {'yes' if int(plan['show_stock'] or 0) else 'no'}\n"
-        f"هشدار موجودی: {plan['low_stock_threshold']}\n"
-        f"متن قبل خرید: {(plan['pre_purchase_text'] if 'pre_purchase_text' in plan.keys() else '') or ''}\n"
-        f"متن بعد خرید: {(plan['post_purchase_text'] if 'post_purchase_text' in plan.keys() else '') or ''}\n"
-        f"روش تحویل: {db.plan_delivery_type(plan)}\n"
-        f"حجم پنلی: {_fmt_bytes(plan['panel_data_limit_bytes'] if 'panel_data_limit_bytes' in plan.keys() else 0)}\n"
-        f"مدت پنلی: {int(plan['panel_duration_days'] or 0) if 'panel_duration_days' in plan.keys() else 0}\n"
-        f"حداکثر دستگاه: {int(plan['panel_max_devices']) if ('panel_max_devices' in plan.keys() and plan['panel_max_devices'] not in (None, '')) else 'نامحدود'}\n"
-        f"شروع اعتبار: {(plan['panel_start_mode'] if 'panel_start_mode' in plan.keys() else 'on_hold') or 'on_hold'}"
+        f"هشدار موجودی: {plan['low_stock_threshold']}\nروش تحویل: {db.plan_provider_key(plan)}\n"
+        f"حداکثر دستگاه: {plan['panel_max_devices'] if plan['panel_max_devices'] not in (None, '') else 'نامحدود'}\n"
+        f"شروع اعتبار: {plan['panel_start_mode'] or 'on_hold'}"
     )
     await state.update_data(plan_action="edit", plan_id=plan_id)
-    await _replace_callback_message(c, "✏️ ویرایش فرم کامل پلن\n\n" + _plan_form_help(current), reply_markup=cancel_kb())
+    await _replace_callback_message(c, "✏️ تنظیمات پیشرفته پلن\n\n" + _plan_form_help(current), reply_markup=cancel_kb(f"plan_detail_{plan_id}", "⬅️ جزئیات پلن"))
     await AdminStates.waiting_plan_form.set()
 
 
 def _plan_wizard_preview(data):
-    return (
-        "🧪 پیش‌نمایش پلن جدید:\n\n"
-        f"عنوان: {data.get('title') or '-'}\n"
-        f"حجم: {data.get('volume_label') or '-'}\n"
-        f"مدت: {data.get('duration_label') or '-'}\n"
-        f"قیمت: {int(data.get('price') or 0):,} تومان\n"
-        f"حد هشدار موجودی: {int(data.get('low_stock_threshold') or settings.low_stock_threshold())}\n"
-        f"توضیح: {data.get('description') or '-'}\n"
-        f"روش تحویل: {'ساخت خودکار YouPanel' if data.get('delivery_type') == 'youpanel' else 'استخر لینک'}\n"
-        + (
-            f"حجم پنلی: {_fmt_bytes(data.get('panel_data_limit_bytes'))}\n"
-            f"مدت پنلی: {int(data.get('panel_duration_days') or 0)} روز\n"
-            f"تعداد دستگاه مجاز: {int(data['panel_max_devices']) if data.get('panel_max_devices') not in (None, '') else 'بدون محدودیت'}\n"
-            f"شروع اعتبار: {'از زمان ساخت' if data.get('panel_start_mode') == 'active' else 'از اولین اتصال'}"
-            if data.get('delivery_type') == 'youpanel' else ""
-        )
-    )
+    category = db.get_plan_category(data.get("category_id")) if data.get("category_id") else None
+    provider_key = data.get("provider_key") or "pool"
+    provider = "استخر لینک" if provider_key == "pool" else subs.provider_label(provider_key)
+    lines = [
+        "🧪 پیش‌نمایش پلن جدید:", "",
+        f"دسته: {(category['emoji'] or '📦') + ' ' + category['title'] if category else '-'}",
+        f"عنوان: {data.get('title') or '-'}",
+        f"حجم: {data.get('volume_label') or '-'}",
+        f"مدت: {data.get('duration_label') or '-'}",
+        f"قیمت: {int(data.get('price') or 0):,} تومان",
+        f"نحوه خرید: {_purchase_mode_label(data.get('purchase_mode') or 'quantity')}",
+        f"روش تحویل: {provider}",
+        f"توضیح: {data.get('description') or '-'}",
+    ]
+    if provider_key != "pool":
+        lines += [
+            f"تعداد دستگاه: {data.get('panel_max_devices') if data.get('panel_max_devices') not in (None, '') else 'بدون محدودیت'}",
+            f"شروع اعتبار: {'از زمان ساخت' if data.get('panel_start_mode') == 'active' else 'از اولین اتصال'}",
+        ]
+    return "\n".join(lines)
 
 
 def _plan_wizard_confirm_kb():
@@ -2292,71 +2718,50 @@ async def process_plan_form(m: types.Message, state: FSMContext):
     if m.content_type != "text":
         return await m.answer("لطفاً مقدار را به صورت متن بفرستید.", reply_markup=cancel_kb())
     data = await state.get_data()
-
     if data.get("plan_action") == "create_wizard":
-        step = data.get("plan_step") or "title"
+        step = data.get("plan_step") or "category"
         plan_data = dict(data.get("plan_data") or {})
         value = (m.text or "").strip()
         if value in {"-", "رد", "skip", "Skip"}:
             value = ""
-
         if step == "title":
             if not value:
-                return await m.answer("عنوان پلن الزامی است. مثال: 50GB یک‌ماهه", reply_markup=cancel_kb())
+                return await m.answer("عنوان پلن الزامی است.", reply_markup=cancel_kb())
             plan_data["title"] = value
             await state.update_data(plan_step="volume", plan_data=plan_data)
-            return await m.answer("مرحله ۲ از ۶\nحجم پلن را بفرستید.\nمثال: 50GB\nاگر حجم نمی‌خواهید، - بفرستید.", reply_markup=cancel_kb())
-
+            return await m.answer(_plan_wizard_step_text("volume"), reply_markup=cancel_kb())
         if step == "volume":
-            plan_data["volume_label"] = value
+            size = _parse_size_bytes(value)
+            if not size:
+                return await m.answer("حجم را مثل 50GB یا 200MB بفرستید.", reply_markup=cancel_kb())
+            plan_data["volume_label"] = value.upper().replace(" ", "")
+            plan_data["panel_data_limit_bytes"] = size
             await state.update_data(plan_step="duration", plan_data=plan_data)
-            return await m.answer("مرحله ۳ از ۶\nمدت پلن را بفرستید.\nمثال: 30 روز", reply_markup=cancel_kb())
-
+            return await m.answer(_plan_wizard_step_text("duration"), reply_markup=cancel_kb())
         if step == "duration":
-            plan_data["duration_label"] = value or "30 روز"
+            days = _parse_duration_days(value)
+            if not days:
+                return await m.answer("مدت را به شکل عدد روز بفرستید؛ مثال: 30 روز", reply_markup=cancel_kb())
+            plan_data["duration_label"] = value
+            plan_data["panel_duration_days"] = days
             await state.update_data(plan_step="price", plan_data=plan_data)
-            return await m.answer("مرحله ۴ از ۶\nقیمت فروش را فقط عددی بفرستید.\nمثال: 180000", reply_markup=cancel_kb())
-
+            return await m.answer(_plan_wizard_step_text("price"), reply_markup=cancel_kb())
         if step == "price":
             raw = value.replace(",", "")
             if not raw.isdigit() or int(raw) <= 0:
-                return await m.answer("قیمت معتبر نیست. فقط عدد مثبت بفرستید. مثال: 180000", reply_markup=cancel_kb())
+                return await m.answer("قیمت معتبر نیست. فقط عدد مثبت بفرستید.", reply_markup=cancel_kb())
             plan_data["price"] = int(raw)
-            await state.update_data(plan_step="low_stock", plan_data=plan_data)
-            return await m.answer("مرحله ۵ از ۶\nحد هشدار موجودی را بفرستید.\nمثال: 5", reply_markup=cancel_kb())
-
-        if step == "low_stock":
-            raw = value.replace(",", "")
-            if not raw.isdigit():
-                return await m.answer("حد هشدار باید عدد باشد. مثال: 5", reply_markup=cancel_kb())
-            plan_data["low_stock_threshold"] = int(raw)
-            await state.update_data(plan_step="description", plan_data=plan_data)
-            return await m.answer("مرحله ۶ از ۶\nتوضیح کوتاه پلن را بفرستید.\nمثال: مناسب استفاده روزمره\nاگر توضیح نمی‌خواهید، - بفرستید.", reply_markup=cancel_kb())
-
+            await state.update_data(plan_step="purchase_mode", plan_data=plan_data)
+            return await m.answer("نحوه خرید این پلن را انتخاب کنید:", reply_markup=_plan_purchase_mode_kb())
         if step == "description":
             plan_data["description"] = value
-            plan_data.setdefault("max_per_order", 4)
-            plan_data.setdefault("show_stock", 1)
+            plan_data.setdefault("low_stock_threshold", settings.low_stock_threshold())
+            plan_data.setdefault("show_stock", 1 if plan_data.get("provider_key") == "pool" else 0)
             plan_data.setdefault("is_active", 1)
             plan_data.setdefault("sort_order", 100)
-            await state.update_data(plan_step="delivery", plan_data=plan_data)
-            return await m.answer("روش تحویل این پلن را انتخاب کنید:", reply_markup=_plan_delivery_kb())
-
-        if step == "panel_size":
-            parsed_size = _parse_size_bytes(value)
-            if not parsed_size:
-                return await m.answer("حجم معتبر نیست. مثال: 50GB یا 200MB", reply_markup=cancel_kb())
-            plan_data["panel_data_limit_bytes"] = parsed_size
-            await state.update_data(plan_step="panel_days", plan_data=plan_data)
-            return await m.answer(_plan_wizard_step_text("panel_days"), reply_markup=cancel_kb())
-
-        if step == "panel_days":
-            raw = value.replace(",", "")
-            if not raw.isdigit() or int(raw) <= 0:
-                return await m.answer("مدت باید عدد مثبت بر حسب روز باشد. مثال: 30", reply_markup=cancel_kb())
-            plan_data["panel_duration_days"] = int(raw)
-            await state.update_data(plan_step="panel_devices", plan_data=plan_data)
-            return await m.answer("📱 تعداد دستگاه مجاز را انتخاب کنید:", reply_markup=_plan_device_limit_kb())
+            await state.update_data(plan_step="confirm", plan_data=plan_data)
+            return await m.answer(_plan_wizard_preview(plan_data), reply_markup=_plan_wizard_confirm_kb())
+        return await m.answer("این مرحله با دکمه‌های زیر ادامه پیدا می‌کند.", reply_markup=cancel_kb())
 
     form = _parse_plan_form(m.text)
     try:
@@ -2371,10 +2776,42 @@ async def process_plan_form(m: types.Message, state: FSMContext):
     except Exception as exc:
         return await m.answer(f"❌ اطلاعات پلن معتبر نیست: {exc}\n\n" + _plan_form_help(), reply_markup=cancel_kb())
     await state.finish()
-    action_type = "update_plan" if data.get("plan_action") == "edit" else "create_plan"
-    db.log_admin_action(m.from_user.id, action_type, None, f"plan_id={plan_id}; title={form.get('title','')}")
-    plan = db.get_plan(plan_id)
-    await m.answer("✅ پلن ذخیره شد.\n\n" + _fmt_plan(plan), reply_markup=plan_detail_kb(plan_id))
+    db.log_admin_action(m.from_user.id, "update_plan", None, f"plan_id={plan_id}")
+    await m.answer("✅ پلن ذخیره شد.\n\n" + _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_detail_kb(plan_id))
+
+
+async def cb_plan_wizard_category(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    data = await state.get_data()
+    if data.get("plan_action") != "create_wizard" or data.get("plan_step") != "category":
+        return await c.answer("این مرحله فعال نیست.", show_alert=True)
+    await c.answer()
+    category_id = int(c.data.rsplit("_", 1)[1])
+    category = db.get_plan_category(category_id)
+    if not category:
+        return await c.answer("دسته پیدا نشد.", show_alert=True)
+    plan_data = dict(data.get("plan_data") or {})
+    plan_data["category_id"] = category_id
+    await state.update_data(plan_step="title", plan_data=plan_data)
+    await _replace_callback_message(c, _plan_wizard_step_text("title"), reply_markup=cancel_kb(), cleanup=False)
+
+
+async def cb_plan_wizard_mode(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    data = await state.get_data()
+    if data.get("plan_action") != "create_wizard" or data.get("plan_step") != "purchase_mode":
+        return await c.answer("این مرحله فعال نیست.", show_alert=True)
+    await c.answer()
+    mode = c.data.rsplit("_", 1)[-1]
+    if mode not in {"direct", "quantity", "wholesale"}:
+        return await c.answer("حالت خرید نامعتبر است.", show_alert=True)
+    plan_data = dict(data.get("plan_data") or {})
+    plan_data["purchase_mode"] = mode
+    plan_data["max_per_order"] = 1 if mode in {"direct", "wholesale"} else 4
+    await state.update_data(plan_step="delivery", plan_data=plan_data)
+    await _replace_callback_message(c, "روش تحویل این پلن را انتخاب کنید:", reply_markup=_plan_delivery_kb(), cleanup=False)
 
 
 async def cb_plan_wizard_delivery(c: types.CallbackQuery, state: FSMContext):
@@ -2382,17 +2819,34 @@ async def cb_plan_wizard_delivery(c: types.CallbackQuery, state: FSMContext):
         return await c.answer()
     data = await state.get_data()
     if data.get("plan_action") != "create_wizard" or data.get("plan_step") != "delivery":
-        return await c.answer("این مرحله دیگر فعال نیست.", show_alert=True)
+        return await c.answer("این مرحله فعال نیست.", show_alert=True)
     await c.answer()
     plan_data = dict(data.get("plan_data") or {})
-    delivery_type = c.data.rsplit("_", 1)[-1]
-    if delivery_type == "pool":
-        plan_data.update({"delivery_type": "pool", "panel_data_limit_bytes": 0, "panel_duration_days": 0, "panel_start_mode": "on_hold", "panel_max_devices": None})
-        await state.update_data(plan_step="confirm", plan_data=plan_data)
-        return await _replace_callback_message(c, _plan_wizard_preview(plan_data), reply_markup=_plan_wizard_confirm_kb(), cleanup=False)
-    plan_data["delivery_type"] = "youpanel"
-    await state.update_data(plan_step="panel_size", plan_data=plan_data)
-    return await _replace_callback_message(c, _plan_wizard_step_text("panel_size"), reply_markup=cancel_kb(), cleanup=False)
+    choice = c.data.rsplit("_", 1)[-1]
+    if choice == "pool":
+        plan_data.update({"provider_key": "pool", "delivery_type": "pool", "panel_max_devices": None, "panel_start_mode": "on_hold"})
+        await state.update_data(plan_step="description", plan_data=plan_data)
+        return await _replace_callback_message(c, _plan_wizard_step_text("description"), reply_markup=cancel_kb(), cleanup=False)
+    await state.update_data(plan_step="provider", plan_data=plan_data)
+    return await _replace_callback_message(c, "تأمین‌کننده ساخت خودکار را انتخاب کنید:", reply_markup=_plan_provider_kb(), cleanup=False)
+
+
+async def cb_plan_wizard_provider(c: types.CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    data = await state.get_data()
+    if data.get("plan_action") != "create_wizard" or data.get("plan_step") != "provider":
+        return await c.answer("این مرحله فعال نیست.", show_alert=True)
+    await c.answer()
+    provider_key = c.data.split("plan_wizard_provider_", 1)[1]
+    try:
+        subs.get_provider_adapter(provider_key)
+    except Exception as exc:
+        return await c.answer(str(exc), show_alert=True)
+    plan_data = dict(data.get("plan_data") or {})
+    plan_data.update({"provider_key": provider_key, "delivery_type": "youpanel" if provider_key == "youpanel" else provider_key})
+    await state.update_data(plan_step="panel_devices", plan_data=plan_data)
+    await _replace_callback_message(c, "📱 تعداد دستگاه مجاز را انتخاب کنید:", reply_markup=_plan_device_limit_kb(), cleanup=False)
 
 
 async def cb_plan_wizard_devices(c: types.CallbackQuery, state: FSMContext):
@@ -2400,18 +2854,13 @@ async def cb_plan_wizard_devices(c: types.CallbackQuery, state: FSMContext):
         return await c.answer()
     data = await state.get_data()
     if data.get("plan_action") != "create_wizard" or data.get("plan_step") != "panel_devices":
-        return await c.answer("این مرحله دیگر فعال نیست.", show_alert=True)
+        return await c.answer("این مرحله فعال نیست.", show_alert=True)
     await c.answer()
     plan_data = dict(data.get("plan_data") or {})
     raw_value = c.data.rsplit("_", 1)[-1]
     plan_data["panel_max_devices"] = None if raw_value == "unlimited" else int(raw_value)
     await state.update_data(plan_step="panel_start", plan_data=plan_data)
-    return await _replace_callback_message(
-        c,
-        "زمان شروع اعتبار سرویس پنلی را انتخاب کنید:",
-        reply_markup=_plan_start_mode_kb(),
-        cleanup=False,
-    )
+    await _replace_callback_message(c, "زمان شروع اعتبار را انتخاب کنید:", reply_markup=_plan_start_mode_kb(), cleanup=False)
 
 
 async def cb_plan_wizard_start(c: types.CallbackQuery, state: FSMContext):
@@ -2419,13 +2868,13 @@ async def cb_plan_wizard_start(c: types.CallbackQuery, state: FSMContext):
         return await c.answer()
     data = await state.get_data()
     if data.get("plan_action") != "create_wizard" or data.get("plan_step") != "panel_start":
-        return await c.answer("این مرحله دیگر فعال نیست.", show_alert=True)
+        return await c.answer("این مرحله فعال نیست.", show_alert=True)
     await c.answer()
     plan_data = dict(data.get("plan_data") or {})
     plan_data["panel_start_mode"] = "active" if c.data.endswith("_active") else "on_hold"
-    plan_data.setdefault("panel_reset_strategy", "no_reset")
-    await state.update_data(plan_step="confirm", plan_data=plan_data)
-    return await _replace_callback_message(c, _plan_wizard_preview(plan_data), reply_markup=_plan_wizard_confirm_kb(), cleanup=False)
+    plan_data["panel_reset_strategy"] = "no_reset"
+    await state.update_data(plan_step="description", plan_data=plan_data)
+    await _replace_callback_message(c, _plan_wizard_step_text("description"), reply_markup=cancel_kb(), cleanup=False)
 
 
 async def cb_plan_wizard_save(c: types.CallbackQuery, state: FSMContext):
@@ -2440,16 +2889,133 @@ async def cb_plan_wizard_save(c: types.CallbackQuery, state: FSMContext):
     except Exception as exc:
         return await c.answer(f"خطا در ثبت پلن: {exc}", show_alert=True)
     await state.finish()
-    db.log_admin_action(c.from_user.id, "create_plan", None, f"plan_id={plan_id}; title={plan_data.get('title','')}")
+    db.log_admin_action(c.from_user.id, "create_plan", None, f"plan_id={plan_id};title={plan_data.get('title','')};provider={plan_data.get('provider_key','pool')}")
     plan = db.get_plan(plan_id)
     kb = InlineKeyboardMarkup(row_width=1)
-    if db.plan_delivery_type(plan) == "pool":
+    if db.plan_provider_key(plan) == "pool":
         kb.add(InlineKeyboardButton("📥 افزودن لینک برای این پلن", callback_data=f"adm_addsub_plan_{plan_id}"))
     else:
-        kb.add(InlineKeyboardButton("🔌 تست اتصال پنل", callback_data="adm_panel_health"))
+        kb.add(InlineKeyboardButton("🔌 مشاهده تأمین‌کننده", callback_data=f"adm_provider_{db.plan_provider_key(plan)}"))
     kb.add(InlineKeyboardButton("⚙️ تنظیمات این پلن", callback_data=f"plan_settings_{plan_id}"))
     kb.add(InlineKeyboardButton("⬅️ مدیریت پلن‌ها", callback_data="adm_plans"))
     await _replace_callback_message(c, "✅ پلن ساخته شد.\n\n" + _fmt_plan(plan), reply_markup=kb)
+
+
+def plan_category_select_kb(plan_id):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for category in db.list_plan_categories(active_only=False):
+        kb.add(InlineKeyboardButton(f"{category['emoji'] or '📦'} {category['title']}", callback_data=f"plan_set_category_{plan_id}_{category['id']}"))
+    kb.add(InlineKeyboardButton("⬅️ تنظیمات پلن", callback_data=f"plan_settings_{plan_id}"))
+    return kb
+
+
+def plan_purchase_mode_select_kb(plan_id):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for key, label in [("direct", "🛒 خرید مستقیم"), ("quantity", "🔢 انتخاب تعداد"), ("wholesale", "📦 فقط عمده"), ("disabled", "🚫 غیرفعال")]:
+        kb.add(InlineKeyboardButton(label, callback_data=f"plan_set_mode_{plan_id}_{key}"))
+    kb.add(InlineKeyboardButton("⬅️ تنظیمات پلن", callback_data=f"plan_settings_{plan_id}"))
+    return kb
+
+
+def plan_provider_select_kb(plan_id):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("📦 استخر لینک", callback_data=f"plan_set_provider_{plan_id}_pool"))
+    for provider in subs.list_provider_adapters(configured_only=False):
+        mark = "✅" if provider.configured() else "⚠️"
+        kb.add(InlineKeyboardButton(f"{mark} {provider.label}", callback_data=f"plan_set_provider_{plan_id}_{provider.key}"))
+    kb.add(InlineKeyboardButton("⬅️ تنظیمات پلن", callback_data=f"plan_settings_{plan_id}"))
+    return kb
+
+
+async def cb_plan_category(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    plan_id = int(c.data.split("plan_category_", 1)[1])
+    await _replace_callback_message(c, "🗂 دسته جدید پلن را انتخاب کنید:", reply_markup=plan_category_select_kb(plan_id))
+
+
+async def cb_plan_set_category(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("plan_set_category_", 1)[1]
+    plan_id, category_id = map(int, raw.split("_", 1))
+    if not db.get_plan_category(category_id):
+        return await c.answer("دسته پیدا نشد.", show_alert=True)
+    db.update_plan(plan_id, {"category_id": category_id})
+    await _replace_callback_message(c, "✅ دسته پلن تغییر کرد.\n\n" + _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_settings_kb(plan_id))
+
+
+async def cb_plan_purchase_mode(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    plan_id = int(c.data.split("plan_purchase_mode_", 1)[1])
+    await _replace_callback_message(c, "🛒 نحوه خرید این پلن را انتخاب کنید:", reply_markup=plan_purchase_mode_select_kb(plan_id))
+
+
+async def cb_plan_set_mode(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("plan_set_mode_", 1)[1]
+    plan_id_text, mode = raw.split("_", 1)
+    plan_id = int(plan_id_text)
+    if mode not in {"direct", "quantity", "wholesale", "disabled"}:
+        return await c.answer("حالت نامعتبر است.", show_alert=True)
+    values = {"purchase_mode": mode}
+    if mode in {"direct", "wholesale"}:
+        values["max_per_order"] = 1
+    elif mode == "quantity" and int(db.get_plan(plan_id)["max_per_order"] or 1) < 2:
+        values["max_per_order"] = 4
+    db.update_plan(plan_id, values)
+    await _replace_callback_message(c, "✅ نحوه خرید تغییر کرد.\n\n" + _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_settings_kb(plan_id))
+
+
+async def cb_plan_provider(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    plan_id = int(c.data.split("plan_provider_", 1)[1])
+    await _replace_callback_message(c, "🔌 روش تحویل/تأمین‌کننده را انتخاب کنید:", reply_markup=plan_provider_select_kb(plan_id))
+
+
+async def cb_plan_set_provider(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("plan_set_provider_", 1)[1]
+    plan_id_text, provider_key = raw.split("_", 1)
+    plan_id = int(plan_id_text)
+    plan = db.get_plan(plan_id)
+    if not plan:
+        return await c.answer("پلن پیدا نشد.", show_alert=True)
+    values = {"provider_key": provider_key, "delivery_type": "pool" if provider_key == "pool" else provider_key, "show_stock": 1 if provider_key == "pool" else 0}
+    if provider_key != "pool":
+        try:
+            subs.get_provider_adapter(provider_key)
+        except Exception as exc:
+            return await c.answer(str(exc), show_alert=True)
+        size = _parse_size_bytes(plan["volume_label"])
+        days = _parse_duration_days(plan["duration_label"])
+        if not size or not days:
+            return await c.answer("ابتدا حجم و مدت را با قالب قابل تبدیل مثل 50GB و 30 روز تنظیم کنید.", show_alert=True)
+        values.update({"panel_data_limit_bytes": size, "panel_duration_days": days})
+    db.update_plan(plan_id, values)
+    await _replace_callback_message(c, "✅ روش تحویل تغییر کرد.\n\n" + _fmt_plan(db.get_plan(plan_id)), reply_markup=plan_settings_kb(plan_id))
+
+
+async def cb_plan_move(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("plan_move_", 1)[1]
+    direction, plan_id = raw.rsplit("_", 1)
+    plan = db.get_plan(plan_id)
+    if plan:
+        db.move_record("plans", "id", int(plan_id), direction, "category_id=?", (int(plan["category_id"] or 0),))
+    await _replace_callback_message(c, "✅ ترتیب پلن‌ها به‌روزرسانی شد.", reply_markup=plans_menu_kb())
 
 
 async def cb_plan_settings(c: types.CallbackQuery):
@@ -2519,8 +3085,21 @@ async def process_plan_setting_value(m: types.Message, state: FSMContext):
         if not parsed_size:
             return await m.answer("حجم معتبر نیست. مثال: 50GB یا 200MB", reply_markup=cancel_kb())
         value = parsed_size
+    updates = {field: value}
+    current_plan = db.get_plan(plan_id)
+    if current_plan and db.plan_provider_key(current_plan) != "pool":
+        if field == "volume_label":
+            parsed = _parse_size_bytes(str(value))
+            if not parsed:
+                return await m.answer("برای پلن خودکار، حجم باید مثل 50GB یا 200MB باشد.", reply_markup=cancel_kb())
+            updates["panel_data_limit_bytes"] = parsed
+        elif field == "duration_label":
+            days = _parse_duration_days(str(value))
+            if not days:
+                return await m.answer("برای پلن خودکار، مدت باید مثل 30 روز باشد.", reply_markup=cancel_kb())
+            updates["panel_duration_days"] = days
     try:
-        db.update_plan(plan_id, {field: value})
+        db.update_plan(plan_id, updates)
     except Exception as exc:
         return await m.answer(f"❌ ذخیره نشد: {exc}", reply_markup=cancel_kb())
     await state.finish()
@@ -2562,22 +3141,23 @@ async def cb_plan_toggle_start(c: types.CallbackQuery):
 
 
 async def cb_panel_health(c: types.CallbackQuery):
+    """Compatibility callback for old YouPanel health buttons."""
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer("در حال بررسی اتصال...", show_alert=False)
     try:
-        result = await subs.panel_health_check()
+        result = await subs.provider_health_check("youpanel")
         username = result.get("username") or result.get("admin", {}).get("username") or "-"
         quota = result.get("data_limit") or result.get("admin", {}).get("data_limit")
         usage = result.get("users_usage") or result.get("admin", {}).get("users_usage")
-        text = "✅ اتصال YouPanel برقرار است.\n" f"حساب پنل: {username}\n"
+        text = "✅ اتصال تأمین‌کننده YouPanel برقرار است.\n" f"حساب پنل: {username}\n"
         if quota is not None:
             text += f"سهمیه پنل: {_fmt_bytes(quota)}\n"
         if usage is not None:
             text += f"مصرف کاربران: {_fmt_bytes(usage)}"
-    except subs.YouPanelError as exc:
-        text = f"❌ اتصال YouPanel ناموفق است.\nدلیل: {exc.message}"
-    await _replace_callback_message(c, text, reply_markup=admin_services_section_kb())
+    except subs.ProviderError as exc:
+        text = f"❌ اتصال تأمین‌کننده ناموفق است.\nدلیل: {getattr(exc, 'message', str(exc))}"
+    await _replace_callback_message(c, text, reply_markup=providers_menu_kb())
 
 
 async def cb_plan_toggle_stock(c: types.CallbackQuery):
@@ -3066,6 +3646,8 @@ BUTTON_AUDIENCE_LABELS = {
     "no_buy": "بدون خرید",
     "has_service": "دارای سرویس",
     "no_service": "بدون سرویس",
+    "normal": "کاربران عادی",
+    "test": "کاربران تست",
     "admins": "فقط ادمین‌ها",
 }
 
@@ -3096,7 +3678,11 @@ def system_button_detail_kb(key):
         InlineKeyboardButton("📍 تغییر جایگاه", callback_data=f"sysbtn_location_{key}"),
     )
     kb.add(
-        InlineKeyboardButton("↕️ تغییر ترتیب", callback_data=f"sysbtn_order_{key}"),
+        InlineKeyboardButton("⬆️ بالاتر", callback_data=f"sysbtn_move_up_{key}"),
+        InlineKeyboardButton("⬇️ پایین‌تر", callback_data=f"sysbtn_move_down_{key}"),
+    )
+    kb.add(
+        InlineKeyboardButton("🔢 ترتیب دستی", callback_data=f"sysbtn_order_{key}"),
         InlineKeyboardButton("👁 فعال/غیرفعال", callback_data=f"sysbtn_toggle_{key}"),
     )
     kb.add(InlineKeyboardButton("♻️ بازگردانی پیش‌فرض", callback_data=f"sysbtn_reset_{key}"))
@@ -3212,6 +3798,23 @@ async def process_system_button_location(m: types.Message, state: FSMContext):
     await m.answer("✅ جایگاه دکمه به‌روزرسانی شد.\n\n" + _fmt_system_button(row), reply_markup=system_button_detail_kb(key))
 
 
+async def cb_system_button_move(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("sysbtn_move_", 1)[1]
+    direction, key = raw.split("_", 1)
+    row = db.get_system_button(key)
+    if not row:
+        return await _replace_callback_message(c, "این دکمه پیدا نشد.", reply_markup=system_buttons_list_kb())
+    db.move_record(
+        "system_buttons", "key", key, direction,
+        where_sql="location=?", where_params=(row["location"],),
+    )
+    row = db.get_system_button(key)
+    await _replace_callback_message(c, "✅ جای دکمه به‌روزرسانی شد.\n\n" + _fmt_system_button(row), reply_markup=system_button_detail_kb(key))
+
+
 async def cb_system_button_toggle(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
@@ -3243,7 +3846,11 @@ def custom_button_detail_kb(button_id):
     )
     kb.add(
         InlineKeyboardButton("👁 فعال / غیرفعال", callback_data=f"btn_toggle_{button_id}"),
-        InlineKeyboardButton("↕️ تغییر ترتیب", callback_data=f"btn_order_{button_id}"),
+        InlineKeyboardButton("🔢 ترتیب دستی", callback_data=f"btn_order_{button_id}"),
+    )
+    kb.add(
+        InlineKeyboardButton("⬆️ بالاتر", callback_data=f"btn_move_up_{button_id}"),
+        InlineKeyboardButton("⬇️ پایین‌تر", callback_data=f"btn_move_down_{button_id}"),
     )
     kb.add(
         InlineKeyboardButton("📍 تغییر جایگاه", callback_data=f"btn_location_{button_id}"),
@@ -3270,7 +3877,7 @@ def _button_form_help(current=None):
         "پایان: \n\n"
         "نوع‌های مجاز: text, link, submenu, file, support, buy_plan, faq, guide\n"
         "جایگاه‌های مجاز: main, buy, my_services, wallet, support, guide, account\n"
-        "نمایش‌های مجاز: all, buyers, no_buy, has_service, no_service, admins\n"
+        "نمایش‌های مجاز: all, buyers, no_buy, has_service, no_service, normal, test, admins\n"
         "نکته: تغییر اول Draft می‌شود؛ بعد از پیش‌نمایش باید ثبت نهایی شود."
         + base
     )
@@ -3537,6 +4144,20 @@ async def cb_button_toggle(c: types.CallbackQuery):
     if not ok or not row:
         return await _replace_callback_message(c, "دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
     await _replace_callback_message(c, "👁 تغییر وضعیت به‌صورت Draft ذخیره شد. برای اعمال، ثبت نهایی کنید.\n\n" + _fmt_custom_button(row), reply_markup=custom_button_detail_kb(button_id))
+
+
+async def cb_button_move(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    raw = c.data.split("btn_move_", 1)[1]
+    direction, button_id = raw.rsplit("_", 1)
+    ok = db.move_custom_button(int(button_id), direction)
+    row = db.get_custom_button(button_id)
+    if not row:
+        return await _replace_callback_message(c, "دکمه پیدا نشد.", reply_markup=custom_buttons_menu_kb())
+    message = "✅ ترتیب جدید به‌صورت Draft ذخیره شد؛ برای اعمال، ثبت نهایی کنید." if ok else "این دکمه در این جهت جابه‌جایی دیگری ندارد."
+    await _replace_callback_message(c, message + "\n\n" + _fmt_custom_button(row), reply_markup=custom_button_detail_kb(button_id))
 
 
 async def cb_button_order(c: types.CallbackQuery, state: FSMContext):
@@ -4083,16 +4704,44 @@ def register(dp):
     dp.register_callback_query_handler(cb_sales_report, lambda c: c.data == "adm_sales_report")
     dp.register_callback_query_handler(cb_admin_logs, lambda c: c.data == "adm_admin_logs")
 
+    dp.register_callback_query_handler(cb_categories, lambda c: c.data == "adm_categories")
+    dp.register_callback_query_handler(cb_category_create, lambda c: c.data == "category_create")
+    dp.register_callback_query_handler(cb_category_detail, lambda c: c.data.startswith("category_detail_"))
+    dp.register_callback_query_handler(cb_category_set, lambda c: c.data.startswith("category_set_"))
+    dp.register_callback_query_handler(cb_category_audience, lambda c: c.data.startswith("category_audience_"))
+    dp.register_callback_query_handler(cb_category_toggle, lambda c: c.data.startswith("category_toggle_"))
+    dp.register_callback_query_handler(cb_category_move, lambda c: c.data.startswith("category_move_"))
+    dp.register_callback_query_handler(cb_category_delete, lambda c: c.data.startswith("category_delete_"))
+    dp.register_message_handler(process_category_form, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_category_form)
+    dp.register_message_handler(process_category_setting, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_category_setting)
+    dp.register_callback_query_handler(cb_providers, lambda c: c.data == "adm_providers")
+    dp.register_callback_query_handler(cb_provider_health, lambda c: c.data.startswith("adm_provider_health_"))
+    dp.register_callback_query_handler(cb_provider_detail, lambda c: c.data.startswith("adm_provider_"))
+    dp.register_callback_query_handler(cb_trials, lambda c: c.data == "adm_trials")
+    dp.register_callback_query_handler(cb_trial_detail, lambda c: c.data.startswith("adm_trial_detail_"))
+    dp.register_callback_query_handler(cb_admin_layout, lambda c: c.data == "adm_menu_layout")
+    dp.register_callback_query_handler(cb_admin_layout_action, lambda c: c.data.startswith("adm_layout_"))
+
     dp.register_callback_query_handler(cb_plans, lambda c: c.data == "adm_plans")
     dp.register_callback_query_handler(cb_plan_create, lambda c: c.data == "plan_create")
     dp.register_callback_query_handler(cb_plan_detail, lambda c: c.data.startswith("plan_detail_"))
     dp.register_callback_query_handler(cb_plan_edit, lambda c: c.data.startswith("plan_edit_"))
     dp.register_callback_query_handler(cb_plan_settings, lambda c: c.data.startswith("plan_settings_"))
-    dp.register_callback_query_handler(cb_plan_set_field, lambda c: c.data.startswith("plan_set_"))
+    dp.register_callback_query_handler(cb_plan_category, lambda c: c.data.startswith("plan_category_"))
+    dp.register_callback_query_handler(cb_plan_set_category, lambda c: c.data.startswith("plan_set_category_"))
+    dp.register_callback_query_handler(cb_plan_purchase_mode, lambda c: c.data.startswith("plan_purchase_mode_"))
+    dp.register_callback_query_handler(cb_plan_set_mode, lambda c: c.data.startswith("plan_set_mode_"))
+    dp.register_callback_query_handler(cb_plan_provider, lambda c: c.data.startswith("plan_provider_"))
+    dp.register_callback_query_handler(cb_plan_set_provider, lambda c: c.data.startswith("plan_set_provider_"))
+    dp.register_callback_query_handler(cb_plan_move, lambda c: c.data.startswith("plan_move_"))
+    dp.register_callback_query_handler(cb_plan_set_field, lambda c: c.data.startswith("plan_set_") and not c.data.startswith(("plan_set_category_", "plan_set_mode_", "plan_set_provider_")))
     dp.register_callback_query_handler(cb_plan_toggle_stock, lambda c: c.data.startswith("plan_toggle_stock_"))
     dp.register_callback_query_handler(cb_plan_toggle_delivery, lambda c: c.data.startswith("plan_toggle_delivery_"))
     dp.register_callback_query_handler(cb_plan_toggle_start, lambda c: c.data.startswith("plan_toggle_start_"))
     dp.register_callback_query_handler(cb_plan_toggle, lambda c: c.data.startswith("plan_toggle_"))
+    dp.register_callback_query_handler(cb_plan_wizard_category, lambda c: c.data.startswith("plan_wizard_category_"), state=AdminStates.waiting_plan_form)
+    dp.register_callback_query_handler(cb_plan_wizard_mode, lambda c: c.data.startswith("plan_wizard_mode_"), state=AdminStates.waiting_plan_form)
+    dp.register_callback_query_handler(cb_plan_wizard_provider, lambda c: c.data.startswith("plan_wizard_provider_"), state=AdminStates.waiting_plan_form)
     dp.register_callback_query_handler(cb_plan_wizard_delivery, lambda c: c.data.startswith("plan_wizard_delivery_"), state=AdminStates.waiting_plan_form)
     dp.register_callback_query_handler(cb_plan_wizard_devices, lambda c: c.data.startswith("plan_wizard_devices_"), state=AdminStates.waiting_plan_form)
     dp.register_callback_query_handler(cb_plan_wizard_start, lambda c: c.data.startswith("plan_wizard_start_"), state=AdminStates.waiting_plan_form)
@@ -4130,6 +4779,7 @@ def register(dp):
     dp.register_callback_query_handler(cb_system_button_detail, lambda c: c.data.startswith("sysbtn_detail_"))
     dp.register_callback_query_handler(cb_system_button_title, lambda c: c.data.startswith("sysbtn_title_"))
     dp.register_message_handler(process_system_button_title, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_system_button_title)
+    dp.register_callback_query_handler(cb_system_button_move, lambda c: c.data.startswith("sysbtn_move_"))
     dp.register_callback_query_handler(cb_system_button_order, lambda c: c.data.startswith("sysbtn_order_"))
     dp.register_message_handler(process_system_button_order, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_system_button_order)
     dp.register_callback_query_handler(cb_system_button_location, lambda c: c.data.startswith("sysbtn_location_"))
@@ -4143,6 +4793,7 @@ def register(dp):
     dp.register_callback_query_handler(cb_button_delete_confirm, lambda c: c.data.startswith("btn_delete_confirm_"))
     dp.register_callback_query_handler(cb_button_delete, lambda c: c.data.startswith("btn_delete_"))
     dp.register_callback_query_handler(cb_button_toggle, lambda c: c.data.startswith("btn_toggle_"))
+    dp.register_callback_query_handler(cb_button_move, lambda c: c.data.startswith("btn_move_"))
     dp.register_callback_query_handler(cb_button_order, lambda c: c.data.startswith("btn_order_"))
     dp.register_message_handler(process_button_order, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_button_order)
     dp.register_callback_query_handler(cb_button_location, lambda c: c.data.startswith("btn_location_"))

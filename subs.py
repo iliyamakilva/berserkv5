@@ -23,7 +23,7 @@ from config import (
     YOUPANEL_INBOUNDS_JSON,
     YOUPANEL_PASSWORD,
     YOUPANEL_TIMEOUT_SECONDS,
-    YOUPANEL_TRIAL_MAX_DEVICES,
+    TRIAL_MAX_DEVICES,
     YOUPANEL_USERNAME,
     YOUPANEL_VERIFY_SSL,
     youpanel_configured,
@@ -449,9 +449,13 @@ def get_link_detail(link_id):
         return db.cur.fetchone()
 
 
-# -------------------- YouPanel integration --------------------
+# -------------------- Provider core and YouPanel adapter --------------------
 
-class YouPanelError(RuntimeError):
+class ProviderError(RuntimeError):
+    pass
+
+
+class YouPanelError(ProviderError):
     def __init__(self, code: str, message: str, status: int | None = None):
         super().__init__(message)
         self.code = code
@@ -554,12 +558,17 @@ def _clean_panel_username(value: str) -> str:
     return value[:48] or "bsv-user"
 
 
-def panel_username_for_order(user_id, purchase_id, index: int) -> str:
+def provider_username_for_order(user_id, purchase_id, index: int) -> str:
     return _clean_panel_username(f"bsv-{user_id}-{purchase_id}-{index}")
 
 
-def panel_trial_username(user_id) -> str:
+def provider_trial_username(user_id) -> str:
     return _clean_panel_username(f"trial-{user_id}")
+
+
+# Backward-compatible names for older call sites.
+panel_username_for_order = provider_username_for_order
+panel_trial_username = provider_trial_username
 
 
 def _panel_user_payload(username: str, data_limit_bytes: int, duration_days: int, start_mode="on_hold", reset_strategy="no_reset", max_devices=None):
@@ -615,28 +624,123 @@ async def panel_health_check():
     return await _panel_request("GET", "/api/admin")
 
 
-async def provision_panel_purchase(user_id, quantity, plan_id, unit_price=None, note=""):
+class ProviderAdapter:
+    key = "provider"
+    label = "تأمین‌کننده"
+
+    def configured(self) -> bool:
+        return False
+
+    async def health(self):
+        raise ProviderError("این تأمین‌کننده پیاده‌سازی نشده است.")
+
+    async def create_user(self, username, *, data_limit_bytes, duration_days, start_mode="on_hold", reset_strategy="no_reset", max_devices=None, options=None):
+        raise ProviderError("ساخت سرویس برای این تأمین‌کننده پیاده‌سازی نشده است.")
+
+    async def delete_user(self, username):
+        raise ProviderError("حذف سرویس برای این تأمین‌کننده پیاده‌سازی نشده است.")
+
+    async def reset_usage(self, username):
+        raise ProviderError("ریست مصرف برای این تأمین‌کننده پیاده‌سازی نشده است.")
+
+    async def revoke_subscription(self, username):
+        raise ProviderError("تعویض لینک برای این تأمین‌کننده پیاده‌سازی نشده است.")
+
+    async def usage(self, username, start="1970-01-01T00:00:00"):
+        raise ProviderError("گزارش مصرف برای این تأمین‌کننده پیاده‌سازی نشده است.")
+
+
+class YouPanelProvider(ProviderAdapter):
+    key = "youpanel"
+    label = "YouPanel"
+
+    def configured(self) -> bool:
+        return panel_is_configured()
+
+    async def health(self):
+        return await panel_health_check()
+
+    async def create_user(self, username, *, data_limit_bytes, duration_days, start_mode="on_hold", reset_strategy="no_reset", max_devices=None, options=None):
+        return await panel_create_user(username, data_limit_bytes, duration_days, start_mode, reset_strategy, max_devices)
+
+    async def delete_user(self, username):
+        return await panel_delete_user(username)
+
+    async def reset_usage(self, username):
+        return await panel_reset_usage(username)
+
+    async def revoke_subscription(self, username):
+        return await panel_revoke_subscription(username)
+
+    async def usage(self, username, start="1970-01-01T00:00:00"):
+        return await panel_usage(username, start)
+
+
+_PROVIDER_REGISTRY = {"youpanel": YouPanelProvider()}
+
+
+def list_provider_adapters(configured_only=False):
+    values = list(_PROVIDER_REGISTRY.values())
+    if configured_only:
+        values = [provider for provider in values if provider.configured()]
+    return values
+
+
+def get_provider_adapter(key):
+    key = (key or "").strip().lower()
+    provider = _PROVIDER_REGISTRY.get(key)
+    if not provider:
+        raise ProviderError(f"تأمین‌کننده «{key or '-'}» در این نسخه نصب نشده است.")
+    return provider
+
+
+def provider_label(key):
+    if (key or "pool") == "pool":
+        return "استخر لینک"
+    provider = _PROVIDER_REGISTRY.get((key or "").strip().lower())
+    return provider.label if provider else key
+
+
+async def provider_health_check(key):
+    provider = get_provider_adapter(key)
+    if not provider.configured():
+        raise ProviderError(f"تنظیمات {provider.label} کامل نیست.")
+    return await provider.health()
+
+
+async def provision_provider_purchase(user_id, quantity, plan_id, unit_price=None, note=""):
     plan = db.get_plan(plan_id)
     if not plan:
         raise db.PurchaseError("plan_not_found", "پلن پیدا نشد.")
-    reservation = db.begin_panel_purchase(user_id, quantity, unit_price, note=note, plan_id=plan_id)
+    provider_key = db.plan_provider_key(plan)
+    if provider_key == "pool":
+        raise db.PurchaseError("wrong_provider", "این پلن از استخر لینک تحویل می‌شود.")
+    try:
+        provider = get_provider_adapter(provider_key)
+    except ProviderError as exc:
+        raise db.PurchaseError("provider_not_installed", str(exc)) from exc
+    if not provider.configured():
+        raise db.PurchaseError("provider_not_configured", f"اتصال {provider.label} تنظیم نشده است.")
+    reservation = db.begin_provider_purchase(user_id, quantity, unit_price, note=note, plan_id=plan_id)
+    provider_options = db.plan_provider_options(plan)
     created = []
     attempted_usernames = []
     try:
         for index in range(1, int(quantity) + 1):
-            panel_username = panel_username_for_order(user_id, reservation["purchase_id"], index)
-            attempted_usernames.append(panel_username)
-            panel_item = await panel_create_user(
-                panel_username,
-                int(plan["panel_data_limit_bytes"] or 0),
-                int(plan["panel_duration_days"] or 0),
-                plan["panel_start_mode"] or "on_hold",
-                plan["panel_reset_strategy"] or "no_reset",
-                plan["panel_max_devices"],
+            provider_username = provider_username_for_order(user_id, reservation["purchase_id"], index)
+            attempted_usernames.append(provider_username)
+            item = await provider.create_user(
+                provider_username,
+                data_limit_bytes=int(plan["panel_data_limit_bytes"] or 0),
+                duration_days=int(plan["panel_duration_days"] or 0),
+                start_mode=plan["panel_start_mode"] or "on_hold",
+                reset_strategy=plan["panel_reset_strategy"] or "no_reset",
+                max_devices=plan["panel_max_devices"],
+                options=provider_options,
             )
-            panel_item["account_name"] = db.generate_service_code()
-            created.append(panel_item)
-        finalized = db.finalize_panel_purchase(reservation["purchase_id"], created)
+            item["account_name"] = db.generate_service_code()
+            created.append(item)
+        finalized = db.finalize_provider_purchase(reservation["purchase_id"], created)
         purchase = finalized["purchase"]
         return {
             "purchase_id": int(purchase["id"]),
@@ -647,89 +751,112 @@ async def provision_panel_purchase(user_id, quantity, plan_id, unit_price=None, 
             "balance_after": reservation["balance_after"],
             "is_test": int(purchase["is_test"] or 0),
             "items": finalized["items"],
+            "provider": provider_key,
         }
     except Exception as exc:
         cleanup_errors = []
-        for panel_username in dict.fromkeys(attempted_usernames):
+        for provider_username in dict.fromkeys(attempted_usernames):
             try:
-                await panel_delete_user(panel_username)
-            except YouPanelError as cleanup_exc:
-                if cleanup_exc.status != 404:
-                    cleanup_errors.append(cleanup_exc.message)
+                await provider.delete_user(provider_username)
+            except ProviderError as cleanup_exc:
+                if getattr(cleanup_exc, "status", None) != 404:
+                    cleanup_errors.append(getattr(cleanup_exc, "message", str(cleanup_exc)))
             except Exception as cleanup_exc:
                 cleanup_errors.append(str(cleanup_exc))
         detail = str(exc)
         if cleanup_errors:
             detail += "; cleanup_failed=" + " | ".join(cleanup_errors)
-        db.refund_panel_purchase(reservation["purchase_id"], detail)
+        db.refund_provider_purchase(reservation["purchase_id"], detail)
         if isinstance(exc, db.PurchaseError):
             raise
-        if isinstance(exc, YouPanelError):
-            raise db.PurchaseError("panel_error", exc.message) from exc
-        raise db.PurchaseError("panel_error", "ساخت خودکار سرویس ناموفق بود و مبلغ به کیف پول برگشت.") from exc
+        if isinstance(exc, ProviderError):
+            raise db.PurchaseError("provider_error", str(exc)) from exc
+        raise db.PurchaseError("provider_error", "ساخت خودکار سرویس ناموفق بود و مبلغ به کیف پول برگشت.") from exc
 
 
-async def create_trial_service(user_id, size_mb: int, days: int):
-    username = panel_trial_username(user_id)
-    ok, reason, claim = db.begin_trial_claim(user_id, username)
+async def provision_panel_purchase(user_id, quantity, plan_id, unit_price=None, note=""):
+    """Compatibility alias for v6.1 integrations."""
+    return await provision_provider_purchase(user_id, quantity, plan_id, unit_price, note)
+
+
+async def create_trial_service(user_id, size_mb: int, days: int, provider_key="youpanel"):
+    provider = get_provider_adapter(provider_key)
+    if not provider.configured():
+        raise ProviderError(f"اتصال {provider.label} تنظیم نشده است.")
+    username = provider_trial_username(user_id)
+    ok, reason, claim = db.begin_trial_claim(user_id, username, provider_key=provider_key)
     if not ok:
         if reason == "already_claimed":
-            raise YouPanelError("already_claimed", "برای این حساب قبلاً اکانت تست ثبت شده است.")
-        raise YouPanelError(reason, "امکان شروع اکانت تست وجود ندارد.")
+            raise ProviderError("برای این حساب قبلاً اکانت تست ثبت شده است.")
+        raise ProviderError("امکان شروع اکانت تست وجود ندارد: " + str(reason))
     try:
-        item = await panel_create_user(
+        item = await provider.create_user(
             username,
-            int(size_mb) * 1024 * 1024,
-            int(days),
-            "on_hold",
-            max_devices=YOUPANEL_TRIAL_MAX_DEVICES,
+            data_limit_bytes=int(size_mb) * 1024 * 1024,
+            duration_days=int(days),
+            start_mode="on_hold",
+            reset_strategy="no_reset",
+            max_devices=TRIAL_MAX_DEVICES,
+            options={"trial": True},
         )
-        return db.complete_trial_claim(user_id, item)
+        return db.complete_trial_claim(user_id, item, provider_key=provider_key)
     except Exception as exc:
         try:
-            await panel_delete_user(username)
-        except YouPanelError as cleanup_exc:
-            if cleanup_exc.status != 404:
-                logger.warning("trial cleanup failed for %s: %s", username, cleanup_exc.message)
+            await provider.delete_user(username)
+        except ProviderError as cleanup_exc:
+            if getattr(cleanup_exc, "status", None) != 404:
+                logger.warning("trial cleanup failed for %s: %s", username, getattr(cleanup_exc, "message", str(cleanup_exc)))
         except Exception:
             logger.warning("trial cleanup failed for %s", username, exc_info=True)
         db.fail_trial_claim(user_id, str(exc))
         raise
 
 
-async def recover_stale_panel_purchases(minutes: int = 15):
+async def recover_stale_provider_purchases(minutes: int = 15):
     """Best-effort cleanup and refund for interrupted provisioning orders."""
     recovered = []
-    for purchase in db.list_stale_panel_purchases(minutes):
+    for purchase in db.list_stale_provider_purchases(minutes):
         cleanup_errors = []
+        provider_key = purchase["provider"] or "youpanel"
+        try:
+            provider = get_provider_adapter(provider_key)
+        except ProviderError:
+            provider = None
         for index in range(1, int(purchase["quantity"] or 0) + 1):
-            username = panel_username_for_order(purchase["user_id"], purchase["id"], index)
+            username = provider_username_for_order(purchase["user_id"], purchase["id"], index)
             try:
-                await panel_delete_user(username)
-            except YouPanelError as exc:
+                if provider:
+                    await provider.delete_user(username)
+            except ProviderError as exc:
                 # A 404 means there was no orphan account to delete. Other
                 # failures are recorded but the wallet is still refunded.
-                if exc.status != 404:
-                    cleanup_errors.append(exc.message)
+                if getattr(exc, "status", None) != 404:
+                    cleanup_errors.append(getattr(exc, "message", str(exc)))
         detail = "startup_recovery"
         if cleanup_errors:
             detail += "; cleanup=" + " | ".join(cleanup_errors)
-        ok, _, _ = db.refund_panel_purchase(purchase["id"], detail)
+        ok, _, _ = db.refund_provider_purchase(purchase["id"], detail)
         if ok:
             recovered.append(int(purchase["id"]))
     return recovered
+
+# Compatibility alias for deployments and call sites from v6.1.
+recover_stale_panel_purchases = recover_stale_provider_purchases
+
 
 async def recover_stale_trial_claims(minutes: int = 15):
     """Delete deterministic orphan trial users and reopen failed claims."""
     recovered = []
     for claim in db.list_stale_trial_claims(minutes):
         username = claim["panel_username"]
+        provider_key = claim["provider_key"] if "provider_key" in claim.keys() else "youpanel"
         error = "startup_trial_recovery"
         try:
-            await panel_delete_user(username)
-        except YouPanelError as exc:
-            if exc.status != 404:
-                error += f"; cleanup={exc.message}"
+            provider = get_provider_adapter(provider_key)
+            await provider.delete_user(username)
+        except ProviderError as exc:
+            if getattr(exc, "status", None) != 404:
+                error += f"; cleanup={getattr(exc, 'message', str(exc))}"
         except Exception as exc:
             error += f"; cleanup={str(exc)[:200]}"
         if db.fail_trial_claim(claim["user_id"], error):

@@ -79,10 +79,19 @@ YOUPANEL_INBOUNDS_JSON = os.getenv(
     "YOUPANEL_INBOUNDS_JSON",
     '{"vless":["RTL-1","VLESS + WS","tcp","TUN"]}',
 ).strip()
-YOUPANEL_TRIAL_ENABLED = _get_bool("YOUPANEL_TRIAL_ENABLED", True)
-YOUPANEL_TRIAL_SIZE_MB = max(1, _get_int("YOUPANEL_TRIAL_SIZE_MB", 200) or 200)
-YOUPANEL_TRIAL_DAYS = max(1, _get_int("YOUPANEL_TRIAL_DAYS", 1) or 1)
-YOUPANEL_TRIAL_MAX_DEVICES = max(1, _get_int("YOUPANEL_TRIAL_MAX_DEVICES", 1) or 1)
+# Trial catalog item is provider-agnostic. Generic TRIAL_* variables take
+# precedence; legacy YOUPANEL_TRIAL_* names remain valid for compatibility.
+TRIAL_PROVIDER_KEY = os.getenv("TRIAL_PROVIDER_KEY", "youpanel").strip().lower() or "youpanel"
+TRIAL_ENABLED = _get_bool("TRIAL_ENABLED", _get_bool("YOUPANEL_TRIAL_ENABLED", True))
+TRIAL_SIZE_MB = max(1, _get_int("TRIAL_SIZE_MB", _get_int("YOUPANEL_TRIAL_SIZE_MB", 200)) or 200)
+TRIAL_DAYS = max(1, _get_int("TRIAL_DAYS", _get_int("YOUPANEL_TRIAL_DAYS", 1)) or 1)
+TRIAL_MAX_DEVICES = max(1, _get_int("TRIAL_MAX_DEVICES", _get_int("YOUPANEL_TRIAL_MAX_DEVICES", 1)) or 1)
+
+# Backward-compatible aliases used by older deployments and modules.
+YOUPANEL_TRIAL_ENABLED = TRIAL_ENABLED
+YOUPANEL_TRIAL_SIZE_MB = TRIAL_SIZE_MB
+YOUPANEL_TRIAL_DAYS = TRIAL_DAYS
+YOUPANEL_TRIAL_MAX_DEVICES = TRIAL_MAX_DEVICES
 
 
 def youpanel_configured() -> bool:

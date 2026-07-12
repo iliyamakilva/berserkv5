@@ -115,6 +115,25 @@ def inspect_sqlite_file(path):
             except sqlite3.DatabaseError:
                 pass
 
+        if result["schema_version"] is not None and result["schema_version"] >= 620:
+            catalog_schema = {
+                "plan_categories": {"id", "title", "sort_order", "is_active", "audience"},
+                "admin_menu_items": {"key", "title", "callback_data", "sort_order", "is_active"},
+                "plans": {"category_id", "purchase_mode", "provider_key", "provider_options_json"},
+                "trial_claims": {"provider_key"},
+            }
+            for table, required_columns in catalog_schema.items():
+                if table not in tables:
+                    result["errors"].append(f"جدول ضروری نسخه 620 یعنی {table} وجود ندارد.")
+                    continue
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = {row[1] for row in cursor.fetchall()}
+                missing = required_columns - columns
+                if missing:
+                    result["errors"].append(
+                        f"ستون‌های نسخه 620 جدول {table} ناقص است: {', '.join(sorted(missing))}"
+                    )
+
         if result["schema_version"] is None:
             result["warnings"].append(
                 "این بک‌آپ قدیمی است و schema_version ندارد؛ migration هنگام اجرای ربات انجام می‌شود."
@@ -137,6 +156,9 @@ def inspect_sqlite_file(path):
             "purchases": _query_count(cursor, "SELECT COUNT(*) FROM purchases"),
             "ledger": _query_count(cursor, "SELECT COUNT(*) FROM ledger"),
             "plans": _query_count(cursor, "SELECT COUNT(*) FROM plans"),
+            "plan_categories": _query_count(cursor, "SELECT COUNT(*) FROM plan_categories"),
+            "trial_claims": _query_count(cursor, "SELECT COUNT(*) FROM trial_claims"),
+            "provider_services": _query_count(cursor, "SELECT COUNT(*) FROM subs WHERE COALESCE(source_type,'pool')!='pool"),
             "custom_buttons": _query_count(cursor, "SELECT COUNT(*) FROM custom_buttons"),
         }
         result["ok"] = result["integrity_ok"] and not result["errors"]
@@ -169,7 +191,9 @@ def format_backup_info(info):
         f"کل سرویس‌ها: {counts.get('subs', 0)}",
         f"سرویس‌های آزاد: {counts.get('subs_available', 0)}",
         f"سرویس‌های تحویل‌شده: {counts.get('subs_sold', 0)}",
-        f"پلن‌ها: {counts.get('plans', 0)}",
+        f"دسته‌ها / پلن‌ها: {counts.get('plan_categories', 0)} / {counts.get('plans', 0)}",
+        f"سرویس‌های تأمین‌کننده: {counts.get('provider_services', 0)}",
+        f"اکانت‌های تست: {counts.get('trial_claims', 0)}",
         f"شارژها: {counts.get('topups', 0)}",
         f"خریدها: {counts.get('purchases', 0)}",
         f"تراکنش‌های کیف پول: {counts.get('ledger', 0)}",
