@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 import traceback
 
 from aiogram import Bot, Dispatcher, types
@@ -7,6 +8,8 @@ from aiogram.dispatcher import FSMContext
 from aiogram.utils import executor
 
 import admin
+import commerce
+import content
 import backup
 import db
 import menus
@@ -15,6 +18,8 @@ import settings
 import subs
 import tickets
 import wallet
+import v63_handlers
+import v64_handlers
 from affiliate import reward_ref
 from config import (
     ADMIN_COMMAND, ADMIN_IDS, BOT_TOKEN, TRIAL_DAYS, TRIAL_ENABLED,
@@ -22,11 +27,12 @@ from config import (
     validate,
 )
 from fsm_storage import SQLiteStorage
-from utils import cleanup_qr, format_dual_datetime, make_qr
+from utils import cleanup_qr, make_qr
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,8 @@ if ADMIN_COMMAND == "panel_secret":
 bot = Bot(token=BOT_TOKEN)
 
 db.init()
+commerce.init_schema()
+content.init_schema()
 settings.ensure_defaults()
 
 dp = Dispatcher(bot, storage=SQLiteStorage())
@@ -52,7 +60,7 @@ def wallet_menu_kb(include_bulk=False, user_id=None):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(types.InlineKeyboardButton("💳 شارژ کیف پول", callback_data="topup_start"))
     if include_bulk:
-        kb.add(types.InlineKeyboardButton("📦 خرید عمده", callback_data="buy_bulk"))
+        kb.add(types.InlineKeyboardButton(content.render_button("btn_bulk"), callback_data="buy_bulk"))
     menus.append_location_buttons(kb, "wallet", user_id)
     kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
@@ -90,51 +98,102 @@ def _audience_allowed(audience, user_id):
     }.get(audience, False)
 
 
+def _normalized_text(value):
+    return "\n".join(line.rstrip() for line in str(value or "").strip().splitlines()).strip()
+
+
+def _shared_plan_text(plans, field):
+    """Return a non-empty field only when every plan uses the same text."""
+    values = [_normalized_text(plan[field]) for plan in plans]
+    if not values or any(not value for value in values):
+        return ""
+    return values[0] if all(value == values[0] for value in values[1:]) else ""
+
+
+def _package_label(plan):
+    """Compact customer-facing package label without category counts or stock numbers."""
+    parts = []
+    if plan["volume_label"]:
+        parts.append(str(plan["volume_label"]).strip())
+    if plan["duration_label"]:
+        parts.append(str(plan["duration_label"]).strip())
+    if not parts:
+        parts.append(str(plan["title"] or "بسته سرویس").strip())
+    parts.append(f"{int(plan['price'] or 0):,} تومان")
+    return " | ".join(parts)
+
+
 def catalog_root_kb(user_id=None):
     kb = types.InlineKeyboardMarkup(row_width=1)
     for category in db.list_plan_categories(active_only=True, include_empty=False):
         if not _audience_allowed(category["audience"], user_id):
             continue
         icon = (category["emoji"] or "📦").strip()
-        count = int(category["active_plan_count"] or 0)
-        kb.add(types.InlineKeyboardButton(f"{icon} {category['title']} ({count})", callback_data=f"buy_cat_{category['id']}"))
+        label = f"{icon} {category['title']}"
+        category_display = content.get_display_settings(category_id=category["id"])
+        if category_display["show_category_plan_count"]:
+            label += f" ({int(category['active_plan_count'] or 0)})"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"buy_cat_{category['id']}"))
     menus.append_location_buttons(kb, "buy", user_id)
-    kb.add(types.InlineKeyboardButton("📦 خرید عمده", callback_data="buy_bulk"))
+    kb.add(types.InlineKeyboardButton(content.render_button("btn_bulk"), callback_data="buy_bulk"))
     kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
 
 
 def category_plans_kb(category_id, user_id=None):
+    """Render customer-editable package labels while callbacks stay immutable."""
     kb = types.InlineKeyboardMarkup(row_width=1)
     for plan in db.list_plans(active_only=True, category_id=category_id):
+        settings_view = content.get_display_settings(category_id=category_id, plan_id=plan["id"])
         provider_key = db.plan_provider_key(plan)
-        stock = subs.stock_count(plan["id"]) if provider_key == "pool" else None
-        parts = [plan["title"]]
-        if plan["volume_label"]:
-            parts.append(plan["volume_label"])
-        parts.append(f"{int(plan['price']):,} تومان")
-        if provider_key == "pool" and stock is not None and stock <= 0:
-            parts.append("ناموجود")
-        kb.add(types.InlineKeyboardButton(" • ".join(parts), callback_data=f"buy_plan_{plan['id']}"))
+        stock_count = subs.stock_count(plan["id"]) if provider_key == "pool" else None
+        unavailable = provider_key == "pool" and stock_count <= 0
+        if unavailable:
+            stock_status = "ناموجود"
+        elif settings_view["show_numeric_stock"] and stock_count is not None:
+            stock_status = f"موجودی: {stock_count}"
+        else:
+            stock_status = "موجود"
+        label = content.render_button(
+            "package_button",
+            {
+                "title": plan["title"] or "بسته سرویس",
+                "volume": plan["volume_label"] or "-",
+                "duration": plan["duration_label"] or "-",
+                "price": content.money(plan["price"]),
+                "tag": plan["tag"] or "",
+                "stock_status": stock_status if settings_view["show_stock_status"] else "",
+            },
+            category_id=category_id,
+            plan_id=plan["id"],
+        )
+        if unavailable and settings_view["show_stock_status"] and "ناموجود" not in label:
+            label += " | ناموجود"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"buy_plan_{plan['id']}"))
     kb.add(types.InlineKeyboardButton("⬅️ دسته‌های سرویس", callback_data="buy"))
     kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
     return kb
 
 
 def plan_action_kb(plan, max_qty=1, user_id=None):
+    """Checkout actions only; texts are editable, callbacks remain hard-coded."""
     kb = types.InlineKeyboardMarkup(row_width=2)
     plan_id = int(plan["id"])
+    category_id = plan["category_id"] if "category_id" in plan.keys() else None
+    display = content.get_display_settings(category_id=category_id, plan_id=plan_id)
     mode = db.plan_purchase_mode(plan)
-    if mode == "direct":
-        kb.add(types.InlineKeyboardButton("🛒 خرید این سرویس", callback_data=f"buy_qty_1_{plan_id}"))
+    safe_max_qty = min(4, max(1, int(max_qty)))
+    if mode == "direct" or (mode == "quantity" and safe_max_qty == 1):
+        kb.add(types.InlineKeyboardButton(content.render_button("btn_pay"), callback_data=f"buy_qty_1_{plan_id}"))
     elif mode == "quantity":
-        for qty in range(1, min(4, max(1, int(max_qty))) + 1):
+        for qty in range(1, safe_max_qty + 1):
             kb.insert(types.InlineKeyboardButton(f"{qty} عدد", callback_data=f"buy_qty_{qty}_{plan_id}"))
     elif mode == "wholesale":
-        kb.add(types.InlineKeyboardButton("📦 درخواست خرید عمده", callback_data="buy_bulk"))
-    category_id = plan["category_id"] if "category_id" in plan.keys() else None
+        kb.add(types.InlineKeyboardButton(content.render_button("btn_bulk"), callback_data="buy_bulk"))
+    if mode in {"direct", "quantity"} and display["show_discount_button"]:
+        kb.add(types.InlineKeyboardButton(content.render_button("btn_discount"), callback_data=f"discount_plan_{plan_id}"))
     if category_id:
-        kb.add(types.InlineKeyboardButton("⬅️ بازگشت به سرویس‌های این دسته", callback_data=f"buy_cat_{category_id}"))
+        kb.add(types.InlineKeyboardButton(content.render_button("btn_back_packages"), callback_data=f"buy_cat_{category_id}"))
     else:
         kb.add(types.InlineKeyboardButton("⬅️ بازگشت به پلن‌ها", callback_data="buy"))
     kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
@@ -161,14 +220,9 @@ def buy_quantity_kb(max_qty: int, plan_id=None):
 
 async def send_main_menu(target, user_id: int):
     await _start_clean_section(target, user_id, "main")
-    return await _send_answer(
-        target,
-        user_id,
-        "⚡ Berserk VPN Ready\n\n"
-        "از منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
-        reply_markup=menus.main_reply_kb(user_id),
-        context="main",
-        kind="menu",
+    return await _send_content(
+        target, user_id, "main_menu",
+        reply_markup=menus.main_reply_kb(user_id), context="main", kind="menu",
     )
 
 async def _safe_delete_callback_message(c: types.CallbackQuery):
@@ -238,6 +292,18 @@ async def _send_template(
     return sent
 
 
+async def _send_content(
+    target, user_id, key, values=None, *, category_id=None, plan_id=None,
+    reply_markup=None, context="", kind="menu"
+):
+    sent = await content.send(
+        target, key, values or {}, category_id=category_id, plan_id=plan_id,
+        reply_markup=reply_markup,
+    )
+    await _track_sent(user_id, sent, context or key, kind=kind)
+    return sent
+
+
 async def _send_answer(
     target, user_id, text, reply_markup=None, context="", kind="menu"
 ):
@@ -255,36 +321,53 @@ async def _send_answer(
 
 
 async def render_buy(target, user_id: int, username: str = "", plan_id=None, category_id=None):
+    """Render one clean catalog path using the v6.4 content engine."""
     await _start_clean_section(target, user_id, "buy")
     user_id_str = str(user_id)
     user = db.get_user(user_id_str)
     if user and user["banned"]:
-        return await _send_answer(target, user_id, "⛔ حساب شما مسدود است.", context="buy")
+        return await _send_content(target, user_id, "account_banned", reply_markup=menus.main_reply_kb(user_id), context="buy")
     if not _is_admin_user(user_id) and not settings.sales_enabled():
-        return await _send_template(target, user_id, "menu_buy", settings.sales_closed_message(), reply_markup=menus.main_reply_kb(user_id), context="buy_closed")
+        return await _send_content(
+            target, user_id, "sales_closed",
+            reply_markup=menus.main_reply_kb(user_id), context="buy_closed",
+        )
     db.touch_active(user_id_str, username, getattr(target.from_user, "full_name", None) if hasattr(target, "from_user") else None)
     if user is None:
         user, _ = db.get_or_create_user(user_id_str, username)
+    balance = int(user["balance"] or 0) if user else 0
+    session_key = f"tg:{user_id}:{getattr(getattr(target, 'chat', None), 'id', user_id)}:{getattr(target, 'message_id', 0)}"
 
     if plan_id is None and category_id is None:
+        content.record_funnel(user_id, "buy_open", session_key=session_key)
         categories = [
             category for category in db.list_plan_categories(active_only=True, include_empty=False)
             if _audience_allowed(category["audience"], user_id)
         ]
         buy_extras = menus.inline_location_buttons("buy", user_id)
         if not categories and not buy_extras:
-            return await _send_answer(target, user_id, "❌ در حال حاضر سرویس فعالی برای فروش وجود ندارد.", reply_markup=menus.main_reply_kb(user_id), context="buy")
-        if categories:
-            lines = ["🛒 خرید سرویس", "", "ابتدا نوع سرویس موردنظر را انتخاب کنید:", ""]
-        else:
-            lines = ["🛒 خرید سرویس", "", "فعلاً پلن فروشی فعالی وجود ندارد؛ از گزینه‌های زیر استفاده کنید.", ""]
+            return await _send_content(
+                target, user_id, "no_services",
+                reply_markup=menus.main_reply_kb(user_id), context="buy",
+            )
+        summary_lines = []
+        display = content.get_display_settings()
         for category in categories:
             icon = category["emoji"] or "📦"
-            lines.append(f"{icon} {category['title']} — {int(category['active_plan_count'] or 0)} سرویس")
+            label = f"{icon} {category['title']}"
+            if display["show_category_plan_count"]:
+                label += f" ({int(category['active_plan_count'] or 0)})"
+            summary_lines.append(label)
             if category["description"]:
-                lines.append(category["description"])
-            lines.append("")
-        return await _send_template(target, user_id, "menu_buy", "\n".join(lines).strip(), reply_markup=catalog_root_kb(user_id), context="buy")
+                summary_lines.append(str(category["description"]).strip())
+        return await _send_content(
+            target, user_id, "buy_root",
+            {
+                "categories_summary": "\n".join(summary_lines),
+                "wallet_balance": content.money(balance),
+            },
+            reply_markup=catalog_root_kb(user_id), context="buy",
+        )
 
     if plan_id is None and category_id is not None:
         category = db.get_plan_category(category_id)
@@ -296,71 +379,140 @@ async def render_buy(target, user_id: int, username: str = "", plan_id=None, cat
             return await render_buy(target, user_id, username)
         plans = db.list_plans(active_only=True, category_id=category_id)
         if not plans:
-            return await _send_answer(target, user_id, "این دسته فعلاً سرویس فعالی ندارد.", reply_markup=catalog_root_kb(user_id), context="buy_category")
-        icon = category["emoji"] or "📦"
-        lines = [f"{icon} {category['title']}", ""]
-        if category["description"]:
-            lines += [category["description"], ""]
-        lines.append("سرویس موردنظر را انتخاب کنید:")
-        for index, plan in enumerate(plans, start=1):
-            lines.append(f"\n{index}. {plan['title']} | {plan['volume_label'] or '-'} | {plan['duration_label'] or '-'}\nقیمت: {int(plan['price']):,} تومان")
-        return await _send_answer(target, user_id, "\n".join(lines), reply_markup=category_plans_kb(category_id, user_id), context="buy_category")
+            return await _send_content(
+                target, user_id, "category_empty", category_id=category_id,
+                reply_markup=catalog_root_kb(user_id), context="buy_category",
+            )
+        content.record_funnel(user_id, "category_view", category_id=category_id, session_key=session_key)
+        display = content.get_display_settings(category_id=category_id)
+        category_description = _normalized_text(category["description"])
+        shared_description = _shared_plan_text(plans, "description")
+        if shared_description == category_description:
+            shared_description = ""
+        shared_pre_purchase = _shared_plan_text(plans, "pre_purchase_text")
+        if shared_pre_purchase in {category_description, shared_description}:
+            shared_pre_purchase = ""
+        provider_keys = {db.plan_provider_key(plan) for plan in plans}
+        delivery_line = ""
+        if display["show_delivery"] and len(provider_keys) == 1:
+            provider_key = next(iter(provider_keys))
+            delivery_line = f"🚚 تحویل: {'آماده و فوری' if provider_key == 'pool' else 'ساخت خودکار'}"
+        devices_line = ""
+        device_values = {
+            "نامحدود" if plan["panel_max_devices"] in (None, "", 0) else f"{plan['panel_max_devices']} دستگاه"
+            for plan in plans
+        }
+        if display["show_devices"] and len(device_values) == 1:
+            devices_line = f"📱 دستگاه: {next(iter(device_values))}"
+        start_mode_line = ""
+        start_modes = {
+            "اولین اتصال" if (plan["panel_start_mode"] or "on_hold") == "on_hold" else "فوری"
+            for plan in plans
+        }
+        if display["show_start_mode"] and len(start_modes) == 1:
+            start_mode_line = f"⏱ شروع اعتبار: {next(iter(start_modes))}"
+        return await _send_content(
+            target, user_id, "buy_category",
+            {
+                "category_emoji": category["emoji"] or "📦",
+                "category_title": category["title"] or "سرویس‌ها",
+                "category_description": category_description,
+                "shared_description": shared_description,
+                "shared_pre_purchase": shared_pre_purchase,
+                "delivery_line": delivery_line,
+                "devices_line": devices_line,
+                "start_mode_line": start_mode_line,
+                "wallet_balance_line": f"💳 موجودی کیف پول: {content.money(balance)}" if display["show_wallet_balance"] else "",
+            },
+            category_id=category_id,
+            reply_markup=category_plans_kb(category_id, user_id), context="buy_category",
+        )
 
     plan = db.get_plan(plan_id)
     if not plan or int(plan["is_active"] or 0) != 1 or db.plan_purchase_mode(plan) == "disabled":
-        return await _send_answer(target, user_id, "این سرویس فعال نیست یا پیدا نشد.", reply_markup=catalog_root_kb(user_id), context="buy")
+        return await _send_content(
+            target, user_id, "plan_unavailable",
+            reply_markup=catalog_root_kb(user_id), context="buy",
+        )
     plan_id = int(plan["id"])
-    price = int(plan["price"])
-    balance = int(user["balance"] or 0) if user else 0
+    category_id = int(plan["category_id"] or 0) or None
     provider_key = db.plan_provider_key(plan)
     stock = subs.stock_count(plan_id) if provider_key == "pool" else None
     max_per_order = max(1, min(100, int(plan["max_per_order"] or 1)))
     max_qty = min(max_per_order, 4, stock) if provider_key == "pool" and stock is not None else min(max_per_order, 4)
-    category = db.get_plan_category(plan["category_id"]) if plan["category_id"] else None
+    category = db.get_plan_category(category_id) if category_id else None
     if category:
         active_category_ids = {
             int(row["id"]) for row in db.list_plan_categories(active_only=True, include_empty=True)
             if _audience_allowed(row["audience"], user_id)
         }
         if int(category["id"]) not in active_category_ids:
-            return await _send_answer(target, user_id, "این دسته برای حساب شما فعال نیست.", reply_markup=catalog_root_kb(user_id), context="buy")
+            return await _send_content(
+                target, user_id, "plan_unavailable",
+                reply_markup=catalog_root_kb(user_id), context="buy",
+            )
 
-    provider_text = "تحویل از موجودی آماده" if provider_key == "pool" else "ساخت و تحویل فوری"
-    text = (
-        f"{(category['emoji'] if category else '📦')} {plan['title']}\n\n"
-        f"حجم: {plan['volume_label'] or '-'}\n"
-        f"مدت: {plan['duration_label'] or '-'}\n"
-        f"قیمت: {price:,} تومان\n"
-        f"روش تحویل: {provider_text}\n"
-        f"موجودی کیف پول: {balance:,} تومان\n"
-    )
-    if plan["description"]:
-        text += f"\n{plan['description']}\n"
-    if provider_key == "pool" and int(plan["show_stock"] or 0):
-        text += f"\nموجودی آماده: {stock}\n"
+    if provider_key == "pool" and stock <= 0:
+        return await _send_content(
+            target, user_id, "plan_unavailable", category_id=category_id, plan_id=plan_id,
+            reply_markup=category_plans_kb(category_id, user_id), context="buy_checkout",
+        )
+
+    provider_notice = ""
     if provider_key != "pool":
+        active_provider, provider_notice = commerce.resolve_provider_for_plan(plan)
+        if not active_provider:
+            return await _send_content(
+                target, user_id, "provider_unavailable", category_id=category_id, plan_id=plan_id,
+                reply_markup=category_plans_kb(category_id, user_id), context="buy_checkout",
+            )
         try:
-            provider = subs.get_provider_adapter(provider_key)
+            provider = subs.get_provider_adapter(active_provider)
             if not provider.configured():
                 raise subs.ProviderError("provider not configured")
         except Exception:
-            return await _send_answer(target, user_id, "❌ تأمین‌کننده این سرویس روی سرور تنظیم نشده است.", reply_markup=category_plans_kb(plan["category_id"], user_id), context="buy")
+            return await _send_content(
+                target, user_id, "provider_unavailable", category_id=category_id, plan_id=plan_id,
+                reply_markup=category_plans_kb(category_id, user_id), context="buy_checkout",
+            )
         if int(plan["panel_data_limit_bytes"] or 0) <= 0 or int(plan["panel_duration_days"] or 0) <= 0:
-            return await _send_answer(target, user_id, "❌ تنظیمات فنی حجم یا مدت این سرویس کامل نیست.", reply_markup=category_plans_kb(plan["category_id"], user_id), context="buy")
-    pre_purchase_text = (plan["pre_purchase_text"] or "").strip()
-    if pre_purchase_text:
-        text += "\n" + pre_purchase_text + "\n"
-    if provider_key == "pool" and stock <= 0:
-        text += "\n❌ موجودی این سرویس تمام شده است."
-        return await _send_template(target, user_id, "menu_buy", text, reply_markup=plan_action_kb({**dict(plan), "purchase_mode": "wholesale"}, 1, user_id), context="buy_plan")
+            return await _send_content(
+                target, user_id, "provider_unavailable", category_id=category_id, plan_id=plan_id,
+                reply_markup=category_plans_kb(category_id, user_id), context="buy_checkout",
+            )
+
+    content.record_funnel(user_id, "plan_checkout", category_id=category_id, plan_id=plan_id, session_key=session_key)
+    display = content.get_display_settings(category_id=category_id, plan_id=plan_id)
     mode = db.plan_purchase_mode(plan)
-    if mode == "direct":
-        text += "\nبرای ادامه، دکمه خرید این سرویس را بزنید."
+    if mode == "direct" or (mode == "quantity" and max_qty == 1):
+        checkout_hint = "برای پرداخت و دریافت سرویس، دکمه زیر را بزنید."
     elif mode == "quantity":
-        text += "\nتعداد موردنظر را انتخاب کنید. اگر موجودی کیف پول کافی نباشد، مستقیم به پرداخت کسری هدایت می‌شوید."
-    elif mode == "wholesale":
-        text += "\nاین سرویس فقط با هماهنگی خرید عمده ارائه می‌شود."
-    return await _send_template(target, user_id, "menu_buy", text, reply_markup=plan_action_kb(plan, max_qty, user_id), context="buy_plan")
+        checkout_hint = "تعداد موردنظر را انتخاب کنید؛ در صورت کسری موجودی، مستقیم به پرداخت هدایت می‌شوید."
+    else:
+        checkout_hint = "این سرویس فقط با هماهنگی خرید عمده ارائه می‌شود."
+    if provider_notice:
+        checkout_hint = f"{provider_notice}\n{checkout_hint}"
+    devices = ""
+    if display["show_devices"]:
+        devices = "نامحدود" if plan["panel_max_devices"] in (None, "", 0) else f"{plan['panel_max_devices']} دستگاه"
+    return await _send_content(
+        target, user_id, "checkout",
+        {
+            "category_title": category["title"] if category else (plan["title"] or "سرویس"),
+            "package_title": plan["title"] or plan["volume_label"] or "بسته سرویس",
+            "volume": plan["volume_label"] or "-",
+            "duration": plan["duration_label"] or "-",
+            "devices_line": f"📱 دستگاه: {devices}" if devices else "",
+            "price": content.money(plan["price"]),
+            "wallet_balance_line": f"💳 موجودی کیف پول: {content.money(balance)}" if display["show_wallet_balance"] else "",
+            "discount_line": "",
+            "plan_description": _normalized_text(plan["description"]),
+            "pre_purchase_text": _normalized_text(plan["pre_purchase_text"]),
+            "checkout_hint": checkout_hint,
+        },
+        category_id=category_id, plan_id=plan_id,
+        reply_markup=plan_action_kb(plan, max_qty, user_id), context="buy_checkout",
+    )
 
 async def check_low_stock_alert(plan_id=None):
     """هشدار موجودی کم برای هر پلن، بدون ارسال تکراری تا وقتی موجودی دوباره بالا برود."""
@@ -405,17 +557,17 @@ def _is_admin_user(user_id) -> bool:
 
 async def _send_bot_disabled(target, user_id):
     await _start_clean_section(target, user_id, "bot_disabled")
-    return await _send_answer(
-        target, user_id, settings.bot_disabled_message(),
-        reply_markup=menus.main_reply_kb(user_id), context="bot_disabled", kind="menu"
+    return await _send_content(
+        target, user_id, "bot_disabled", reply_markup=menus.main_reply_kb(user_id),
+        context="bot_disabled", kind="menu",
     )
 
 
 async def _send_sales_closed(target, user_id):
     await _start_clean_section(target, user_id, "sales_closed")
-    return await _send_answer(
-        target, user_id, settings.sales_closed_message(),
-        reply_markup=menus.main_reply_kb(user_id), context="sales_closed", kind="menu"
+    return await _send_content(
+        target, user_id, "sales_closed", reply_markup=menus.main_reply_kb(user_id),
+        context="sales_closed", kind="menu",
     )
 
 
@@ -443,7 +595,7 @@ async def start(m: types.Message):
     db.touch_active(user_id, m.from_user.username, m.from_user.full_name)
 
     if row["banned"]:
-        return await m.answer("⛔ حساب شما مسدود شده.\nبرای پیگیری با پشتیبانی تماس بگیرید.")
+        return await _send_content(m, m.from_user.id, "account_banned", reply_markup=menus.main_reply_kb(m.from_user.id), context="account_banned")
 
     await _start_clean_section(m, m.from_user.id, "welcome")
     await _send_template(
@@ -480,49 +632,47 @@ async def text_guide(m: types.Message):
 async def _create_and_send_trial(target, user_id: int, username: str = "", full_name: str = ""):
     await _start_clean_section(target, user_id, "trial")
     if not TRIAL_ENABLED:
-        return await _send_answer(target, user_id, "اکانت تست در حال حاضر غیرفعال است.", reply_markup=menus.main_reply_kb(user_id), context="trial")
+        return await _send_content(target, user_id, "trial_error", reply_markup=menus.main_reply_kb(user_id), context="trial")
     try:
         trial_provider = subs.get_provider_adapter(TRIAL_PROVIDER_KEY)
-    except subs.ProviderError as exc:
-        return await _send_answer(target, user_id, f"تأمین‌کننده تست در دسترس نیست: {exc}", reply_markup=menus.main_reply_kb(user_id), context="trial")
+    except subs.ProviderError:
+        return await _send_content(target, user_id, "trial_error", reply_markup=menus.main_reply_kb(user_id), context="trial")
     if not trial_provider.configured():
-        return await _send_answer(target, user_id, f"اتصال {trial_provider.label} برای ساخت اکانت تست هنوز تنظیم نشده است.", reply_markup=menus.main_reply_kb(user_id), context="trial")
+        return await _send_content(target, user_id, "trial_error", reply_markup=menus.main_reply_kb(user_id), context="trial")
     user, _ = db.get_or_create_user(str(user_id), username, display_name=full_name)
     if int(user["banned"] or 0):
-        return await _send_answer(target, user_id, "⛔ حساب شما مسدود است.", reply_markup=menus.main_reply_kb(user_id), context="trial")
-    await _send_answer(
-        target, user_id,
-        f"⏳ در حال ساخت اکانت تست {TRIAL_SIZE_MB} مگابایتی {TRIAL_DAYS} روزه "
-        f"برای {TRIAL_MAX_DEVICES} دستگاه...",
+        return await _send_content(target, user_id, "account_banned", reply_markup=menus.main_reply_kb(user_id), context="trial")
+    await _send_content(
+        target, user_id, "trial_build",
+        {"volume": f"{TRIAL_SIZE_MB} مگابایت", "duration": f"{TRIAL_DAYS} روز", "devices": f"{TRIAL_MAX_DEVICES} دستگاه"},
         context="trial_build", kind="temp",
     )
     try:
         item = await subs.create_trial_service(str(user_id), TRIAL_SIZE_MB, TRIAL_DAYS, provider_key=TRIAL_PROVIDER_KEY)
     except subs.ProviderError as exc:
-        message = getattr(exc, "message", str(exc))
         if exc.code == "already_claimed":
-            message = "شما قبلاً اکانت تست دریافت کرده‌اید. هر حساب تلگرام فقط یک تست دارد."
-        return await _send_answer(target, user_id, f"❌ {message}", reply_markup=menus.main_reply_kb(user_id), context="trial_result", kind="important")
+            return await _send_content(target, user_id, "trial_duplicate", reply_markup=menus.main_reply_kb(user_id), context="trial_result", kind="important")
+        return await _send_content(target, user_id, "trial_error", reply_markup=menus.main_reply_kb(user_id), context="trial_result", kind="important")
     except Exception:
         logger.exception("trial provisioning failed for user %s", user_id)
-        return await _send_answer(target, user_id, "❌ ساخت اکانت تست ناموفق بود. لطفاً بعداً دوباره تلاش کنید.", reply_markup=menus.main_reply_kb(user_id), context="trial_result", kind="important")
+        return await _send_content(target, user_id, "trial_error", reply_markup=menus.main_reply_kb(user_id), context="trial_result", kind="important")
 
+    await _send_content(
+        target, user_id, "trial_success",
+        {
+            "username": item["account_name"] or "اکانت تست",
+            "volume": f"{TRIAL_SIZE_MB} مگابایت",
+            "duration": f"{TRIAL_DAYS} روز از اولین اتصال",
+            "subscription_url": item["link"],
+        },
+        reply_markup=menus.main_reply_kb(user_id), context="trial_delivery", kind="delivery",
+    )
     qr_path = make_qr(item["link"], str(user_id))
     try:
         with open(qr_path, "rb") as qr_file:
-            sent = await target.answer_photo(
-                qr_file,
-                caption=(
-                    "✅ اکانت تست شما ساخته شد.\n\n"
-                    f"حجم: {TRIAL_SIZE_MB} مگابایت\n"
-                    f"مدت: {TRIAL_DAYS} روز از اولین اتصال\n"
-                    f"تعداد دستگاه مجاز: {TRIAL_MAX_DEVICES}\n"
-                    f"شناسه: {item['account_name'] or 'اکانت تست'}\n\n"
-                    f"لینک اشتراک:\n{item['link']}"
-                ),
-                reply_markup=menus.main_reply_kb(user_id),
-            )
-            await _track_sent(user_id, sent, "trial_delivery", kind="delivery")
+            qr_caption = content.render("trial_qr", {"username": item["account_name"] or ""})
+            sent = await target.answer_photo(qr_file, caption=qr_caption["text"], parse_mode=qr_caption["parse_mode_api"])
+            await _track_sent(user_id, sent, "trial_qr", kind="delivery")
     finally:
         cleanup_qr(qr_path)
     for admin_id in ADMIN_IDS:
@@ -623,12 +773,10 @@ async def back_main(c: types.CallbackQuery):
     await c.answer()
     await _cleanup_user_messages(c.message.chat.id, c.from_user.id)
     await _safe_delete_callback_message(c)
-    sent = await bot.send_message(
-        c.message.chat.id,
-        "⚡ Berserk VPN Ready\n\nاز منوی پایین تلگرام استفاده کنید؛ لازم نیست هر بار /start بزنید.",
-        reply_markup=menus.main_reply_kb(c.from_user.id),
+    await _send_content(
+        c.message, c.from_user.id, "main_menu",
+        reply_markup=menus.main_reply_kb(c.from_user.id), context="main", kind="menu",
     )
-    await _track_sent(c.from_user.id, sent, "main", kind="menu")
 
 
 @dp.callback_query_handler(lambda c: c.data == "buy")
@@ -663,7 +811,8 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
     user = db.get_user(user_id)
 
     if user and user["banned"]:
-        return await c.answer("⛔ حساب شما مسدود است.", show_alert=True)
+        await c.answer()
+        return await _send_content(c.message, c.from_user.id, "account_banned", reply_markup=menus.main_reply_kb(c.from_user.id), context="account_banned")
 
     if not _is_admin_user(c.from_user.id) and not settings.sales_enabled():
         await c.answer()
@@ -676,56 +825,91 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
         qty = int(parts[2])
         plan_id = int(parts[3]) if len(parts) > 3 else db.default_plan_id()
     except ValueError:
-        return await c.message.answer("درخواست خرید نامعتبر است.", reply_markup=menus.main_reply_kb(c.from_user.id))
+        return await _send_content(c.message, c.from_user.id, "invalid_purchase", reply_markup=catalog_root_kb(c.from_user.id), context="invalid_purchase")
 
     if qty < 1 or qty > 4:
-        return await c.message.answer("تعداد انتخاب‌شده معتبر نیست.", reply_markup=menus.main_reply_kb(c.from_user.id))
+        return await _send_content(c.message, c.from_user.id, "invalid_quantity", {"reason": "تعداد باید بین ۱ تا ۴ باشد."}, reply_markup=catalog_root_kb(c.from_user.id), context="invalid_quantity")
 
     if user is None:
         user, _ = db.get_or_create_user(user_id, c.from_user.username, display_name=c.from_user.full_name)
 
     plan = db.get_plan(plan_id)
     if not plan or int(plan["is_active"] or 0) != 1:
-        return await c.message.answer("این پلن فعال نیست یا پیدا نشد.", reply_markup=menus.main_reply_kb(c.from_user.id))
+        return await _send_content(
+            c.message, c.from_user.id, "plan_unavailable",
+            reply_markup=catalog_root_kb(c.from_user.id), context="plan_unavailable",
+        )
 
     purchase_mode = db.plan_purchase_mode(plan)
     if purchase_mode in {"disabled", "wholesale"}:
-        return await c.message.answer("خرید مستقیم این سرویس فعال نیست.", reply_markup=catalog_root_kb(c.from_user.id))
+        return await _send_content(c.message, c.from_user.id, "invalid_quantity", {"reason": "خرید مستقیم این بسته در حال حاضر فعال نیست."}, category_id=plan["category_id"], plan_id=plan_id, reply_markup=catalog_root_kb(c.from_user.id), context="invalid_quantity")
     if purchase_mode == "direct" and qty != 1:
-        return await c.message.answer("این سرویس فقط به‌صورت یک‌عددی قابل خرید است.", reply_markup=catalog_root_kb(c.from_user.id))
+        return await _send_content(c.message, c.from_user.id, "invalid_quantity", {"reason": "این بسته فقط به‌صورت یک‌عددی قابل خرید است."}, category_id=plan["category_id"], plan_id=plan_id, reply_markup=catalog_root_kb(c.from_user.id), context="invalid_quantity")
     max_per_order = max(1, min(100, int(plan["max_per_order"] or 1)))
     if qty > max_per_order:
-        return await c.message.answer(
-            "تعداد انتخاب‌شده برای این پلن مجاز نیست.",
-            reply_markup=menus.main_reply_kb(c.from_user.id),
+        return await _send_content(
+            c.message, c.from_user.id, "invalid_quantity",
+            {"reason": f"حداکثر تعداد مجاز در هر سفارش {max_per_order} عدد است."},
+            category_id=plan["category_id"], plan_id=plan_id,
+            reply_markup=catalog_root_kb(c.from_user.id), context="invalid_quantity",
         )
     provider_key = db.plan_provider_key(plan)
     delivery_type = "pool" if provider_key == "pool" else "provider"
     if delivery_type == "pool" and subs.stock_count(plan_id) < qty:
-        return await c.message.answer(
-            "موجودی این پلن برای تعداد انتخاب‌شده کافی نیست.",
-            reply_markup=menus.main_reply_kb(c.from_user.id),
+        return await _send_content(
+            c.message, c.from_user.id, "insufficient_stock",
+            category_id=plan["category_id"], plan_id=plan_id,
+            reply_markup=category_plans_kb(plan["category_id"], c.from_user.id), context="insufficient_stock",
         )
+    active_provider_key = provider_key
     if provider_key != "pool":
+        active_provider_key, unavailable_reason = commerce.resolve_provider_for_plan(plan)
+        if not active_provider_key:
+            return await c.message.answer(
+                unavailable_reason or "این سرویس موقتاً در دسترس نیست.",
+                reply_markup=catalog_root_kb(c.from_user.id),
+            )
         try:
-            provider = subs.get_provider_adapter(provider_key)
+            provider = subs.get_provider_adapter(active_provider_key)
             configured = provider.configured()
         except Exception:
             configured = False
         if not configured:
-            return await c.message.answer(
-                "تأمین‌کننده این سرویس روی سرور تنظیم نشده است. لطفاً با پشتیبانی تماس بگیرید.",
-                reply_markup=menus.main_reply_kb(c.from_user.id),
+            return await _send_content(
+                c.message, c.from_user.id, "purchase_config_error",
+                category_id=plan["category_id"], plan_id=plan_id,
+                reply_markup=category_plans_kb(plan["category_id"], c.from_user.id), context="purchase_config_error",
             )
     if provider_key != "pool" and (int(plan["panel_data_limit_bytes"] or 0) <= 0 or int(plan["panel_duration_days"] or 0) <= 0):
+        return await _send_content(
+            c.message, c.from_user.id, "purchase_config_error",
+            category_id=plan["category_id"], plan_id=plan_id,
+            reply_markup=category_plans_kb(plan["category_id"], c.from_user.id), context="purchase_config_error",
+        )
+
+    request_key = commerce.purchase_request_key(
+        user_id,
+        c.message.chat.id,
+        c.message.message_id,
+        c.data,
+    )
+    state_data = await state.get_data()
+    discount_code = None
+    if int(state_data.get("active_discount_plan_id") or 0) == plan_id:
+        discount_code = (state_data.get("active_discount_code") or "").strip().upper() or None
+    try:
+        quote = commerce.quote_purchase(user_id, plan, qty, discount_code)
+    except db.PurchaseError as exc:
         return await c.message.answer(
-            "تنظیمات ساخت خودکار این پلن کامل نیست. لطفاً با پشتیبانی تماس بگیرید.",
-            reply_markup=menus.main_reply_kb(c.from_user.id),
+            exc.message,
+            reply_markup=plan_action_kb(plan, min(4, max_per_order), c.from_user.id),
         )
 
     was_first_purchase = int(user["purchased"] or 0) == 0
     price = int(plan["price"])
-    total = qty * price
+    subtotal = int(quote["subtotal"])
+    discount_amount = int(quote["amount"])
+    total = int(quote["total"])
     balance = int(user["balance"] or 0)
     missing = max(0, total - balance)
 
@@ -737,33 +921,72 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
             target_plan_id=plan_id,
             target_total=total,
             target_unit_price=price,
+            request_key=request_key,
         )
+        commerce.attach_topup_discount(topup_id, discount_code)
         await state.update_data(topup_id=topup_id)
         await wallet.TopupStates.waiting_receipt.set()
-        text = (
-            f"💳 پرداخت خرید {qty} سرویس\n\n"
-            f"پلن: {plan['title']}\n"
-            f"قیمت کل: {total:,} تومان\n"
-            f"موجودی فعلی کیف پول: {balance:,} تومان\n"
-            f"مبلغ قابل پرداخت برای تکمیل خرید: {missing:,} تومان\n\n"
-            f"شماره کارت:\n{settings.card_number()}\n"
-            f"به نام: {settings.card_holder()}\n\n"
-            "بعد از واریز، عکس رسید پرداخت را همینجا ارسال کنید.\n"
-            "بعد از تأیید ادمین، ربات تلاش می‌کند همین خرید را خودکار تکمیل کند."
+        content.record_funnel(user_id, "payment_started", category_id=plan["category_id"], plan_id=plan_id, session_key=request_key)
+        return await _send_content(
+            c.message, c.from_user.id, "payment_topup",
+            {
+                "package_title": plan["title"] or plan["volume_label"] or "بسته سرویس",
+                "quantity": qty,
+                "subtotal": content.money(subtotal),
+                "discount": content.money(discount_amount),
+                "total": content.money(total),
+                "wallet_balance": content.money(balance),
+                "payable": content.money(missing),
+                "card_number": settings.card_number(),
+                "card_holder": settings.card_holder(),
+                "payment_id": topup_id,
+            },
+            category_id=plan["category_id"], plan_id=plan_id,
+            reply_markup=wallet.cancel_kb(), context="targeted_topup", kind="important",
         )
-        sent = await c.message.answer(text, reply_markup=wallet.cancel_kb())
-        await _track_sent(c.from_user.id, sent, "targeted_topup", kind="important")
-        return
 
     try:
         if provider_key != "pool":
-            result = await subs.provision_provider_purchase(user_id, qty, plan_id, price)
+            result = await subs.provision_provider_purchase(
+                user_id,
+                qty,
+                plan_id,
+                price,
+                discount_code=discount_code,
+                request_key=request_key,
+            )
         else:
-            result = db.complete_purchase(user_id, qty, price, plan_id=plan_id)
+            result = commerce.complete_pool_purchase(
+                user_id,
+                qty,
+                plan_id,
+                discount_code=discount_code,
+                request_key=request_key,
+            )
     except db.PurchaseError as exc:
         if exc.code == "insufficient_balance":
             return await c.message.answer(exc.message, reply_markup=wallet_menu_kb(include_bulk=True))
         return await c.message.answer(exc.message, reply_markup=menus.main_reply_kb(c.from_user.id))
+
+    await state.update_data(active_discount_code=None, active_discount_plan_id=None)
+    await state.reset_state(with_data=False)
+
+    if result.get("queued"):
+        content.record_funnel(user_id, "purchase_queued", category_id=plan["category_id"], plan_id=plan_id, purchase_id=result["purchase_id"], session_key=request_key)
+        return await _send_content(
+            c.message, c.from_user.id, "order_queued",
+            {"order_id": result["purchase_id"], "total": content.money(result.get("amount") or total)},
+            reply_markup=menus.main_reply_kb(c.from_user.id), context="purchase_queued", kind="important",
+        )
+
+    if result.get("refunded"):
+        commerce.claim_purchase_notification(result["purchase_id"], "refund")
+        content.record_funnel(user_id, "purchase_refunded", category_id=plan["category_id"], plan_id=plan_id, purchase_id=result["purchase_id"], session_key=request_key)
+        return await _send_content(
+            c.message, c.from_user.id, "order_refunded",
+            {"order_id": result["purchase_id"], "refund_amount": content.money(result.get("amount") or total)},
+            reply_markup=menus.main_reply_kb(c.from_user.id), context="purchase_refunded", kind="important",
+        )
 
     if was_first_purchase:
         status, detail = reward_ref(user_id)
@@ -787,39 +1010,61 @@ async def buy_qty(c: types.CallbackQuery, state: FSMContext):
     await check_low_stock_alert(plan_id)
 
     post_purchase_text = (plan["post_purchase_text"] if "post_purchase_text" in plan.keys() else "") or ""
-    test_notice = "\n🧪 این خرید آزمایشی است و در گزارش فروش واقعی محاسبه نمی‌شود." if result.get("is_test") else ""
-    success_text = (
-        f"✅ خرید موفق!\n"
-        f"شماره خرید: #{result['purchase_id']}\n"
-        f"پلن: {plan['title']}\n"
-        f"تعداد تحویل‌شده: {len(result['items'])} عدد\n"
-        f"مبلغ کسرشده: {result['amount']:,} تومان\n"
-        f"موجودی جدید: {result['balance_after']:,} تومان"
-        f"{test_notice}"
+    test_notice = "🧪 این خرید آزمایشی است و در گزارش فروش واقعی محاسبه نمی‌شود." if result.get("is_test") else ""
+    commerce.claim_purchase_notification(result["purchase_id"], "delivery")
+    content.record_funnel(user_id, "payment_success", category_id=plan["category_id"], plan_id=plan_id, purchase_id=result["purchase_id"], session_key=request_key)
+    await _send_content(
+        c.message, c.from_user.id, "purchase_success",
+        {
+            "order_id": result["purchase_id"],
+            "plan_title": plan["title"] or "سرویس",
+            "quantity": len(result["items"]),
+            "subtotal": content.money(result.get("subtotal") or result["amount"]),
+            "discount": content.money(result.get("discount_amount") or 0),
+            "total": content.money(result["amount"]),
+            "balance_after": content.money(result["balance_after"]),
+            "test_notice": test_notice,
+            "post_purchase_text": post_purchase_text.strip(),
+        },
+        category_id=plan["category_id"], plan_id=plan_id,
+        reply_markup=menus.main_reply_kb(c.from_user.id), context="purchase_result", kind="important",
     )
-    if post_purchase_text.strip():
-        success_text += "\n\n" + post_purchase_text.strip()
-    sent = await c.message.answer(
-        success_text,
-        reply_markup=menus.main_reply_kb(c.from_user.id),
-    )
-    await _track_sent(c.from_user.id, sent, "purchase_result", kind="important")
 
     for index, item in enumerate(result["items"], start=1):
+        expire_date = item.get("panel_expires_at") or item.get("expires_at") or "-"
+        provider_public = "تحویل آماده" if db.plan_provider_key(plan) == "pool" else "ساخت خودکار"
+        await _send_content(
+            c.message, c.from_user.id, "service_delivery",
+            {
+                "order_id": result["purchase_id"],
+                "plan_title": plan["title"] or "سرویس",
+                "username": item.get("account_name") or item.get("panel_username") or f"سرویس {index}",
+                "volume": plan["volume_label"] or "-",
+                "duration": plan["duration_label"] or "-",
+                "devices": "نامحدود" if plan["panel_max_devices"] in (None, "", 0) else f"{plan['panel_max_devices']} دستگاه",
+                "expire_date": expire_date,
+                "subscription_url": item["link"],
+                "provider_public_name": provider_public,
+                "created_at": item.get("assigned_at") or "-",
+            },
+            category_id=plan["category_id"], plan_id=plan_id,
+            context="purchase_link", kind="delivery",
+        )
         qr_path = make_qr(item["link"], user_id)
         try:
+            qr_caption = content.render(
+                "service_qr", {"username": item.get("account_name") or f"سرویس {index}"},
+                category_id=plan["category_id"], plan_id=plan_id,
+            )
             with open(qr_path, "rb") as f:
                 sent_photo = await c.message.answer_photo(
-                    f,
-                    caption=(
-                        f"✅ سرویس #{index}\n"
-                        f"شناسه سرویس: {item['account_name']}\n\n"
-                        f"لینک سرویس:\n{item['link']}"
-                    ),
+                    f, caption=qr_caption["text"], parse_mode=qr_caption["parse_mode_api"],
                 )
-                await _track_sent(c.from_user.id, sent_photo, "purchase_link", kind="delivery")
+                await _track_sent(c.from_user.id, sent_photo, "purchase_qr", kind="delivery")
         finally:
             cleanup_qr(qr_path)
+
+    content.record_funnel(user_id, "purchase_delivered", category_id=plan["category_id"], plan_id=plan_id, purchase_id=result["purchase_id"], session_key=request_key)
 
     for admin_id in ADMIN_IDS:
         try:
@@ -867,10 +1112,9 @@ async def buy_bulk(c: types.CallbackQuery):
         except Exception as exc:
             logger.warning("could not create bulk-purchase admin ticket message for %s: %s", admin_id, exc)
 
-    await c.message.answer(
-        "✅ درخواست خرید عمده برای مدیریت ارسال شد.\n"
-        "به‌زودی برای هماهنگی با شما تماس گرفته می‌شود.",
-        reply_markup=menus.main_reply_kb(c.from_user.id),
+    await _send_content(
+        c.message, c.from_user.id, "bulk_request_sent", {"ticket_id": ticket_id},
+        reply_markup=menus.main_reply_kb(c.from_user.id), context="bulk_request",
     )
 
 
@@ -881,35 +1125,31 @@ async def show_my_subs(target, user_id: int, username: str = ""):
     rows = subs.user_subs(user_id_str)
 
     if not rows:
-        return await _send_template(
-            target,
-            user_id,
-            "my_services_empty",
-            "هنوز هیچ سرویسی خریداری نکردید.",
-            reply_markup=section_menu_kb("my_services", user_id),
-            context="my_subs",
+        return await _send_content(
+            target, user_id, "services_empty",
+            reply_markup=section_menu_kb("my_services", user_id), context="my_subs",
         )
 
-    lines = ["📦 سرویس‌های شما:\n"]
-
-    for index, r in enumerate(rows, start=1):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for r in rows:
         plan = db.get_plan(r["plan_id"]) if "plan_id" in r.keys() and r["plan_id"] else None
         plan_title = plan["title"] if plan else "سرویس"
-        source_type = r["source_type"] if "source_type" in r.keys() else "pool"
-        trial_text = " | 🧪 تست" if "is_trial" in r.keys() and int(r["is_trial"] or 0) else ""
-        panel_state = ""
-        if source_type != "pool":
-            state = r["panel_status"] or "نامشخص"
-            panel_state = f"تأمین‌کننده: {subs.provider_label(source_type)} | وضعیت: {state}\n"
-        lines.append(
-            f"{index}️⃣ {plan_title}{trial_text}\n"
-            f"شناسه سرویس: {r['account_name'] or '-'}\n"
-            f"تاریخ خرید: {format_dual_datetime(r['assigned_at'])}\n"
-            f"{panel_state}"
-            f"لینک:\n{r['link']}\n"
+        trial_label = "🧪 تست" if "is_trial" in r.keys() and int(r["is_trial"] or 0) else ""
+        label = content.render_button(
+            "service_button",
+            {
+                "plan_title": plan_title,
+                "username": r["account_name"] or "-",
+                "status": r["panel_status"] or r["status"] or "",
+                "trial_label": trial_label,
+            },
+            category_id=plan["category_id"] if plan else None,
+            plan_id=plan["id"] if plan else None,
         )
-
-    await _send_answer(target, user_id, "\n".join(lines), reply_markup=section_menu_kb("my_services", user_id), context="my_subs")
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"service_detail_{r['id']}"))
+    menus.append_location_buttons(kb, "my_services", user_id)
+    kb.add(types.InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"))
+    await _send_content(target, user_id, "services_list", reply_markup=kb, context="my_subs")
 
 @dp.callback_query_handler(lambda c: c.data == "my_subs")
 async def my_subs(c: types.CallbackQuery):
@@ -1128,6 +1368,8 @@ async def referral(c: types.CallbackQuery):
 
 wallet.register(dp)
 tickets.register(dp)
+v64_handlers.register(dp)
+v63_handlers.register(dp)
 admin.register(dp)
 
 
@@ -1137,15 +1379,9 @@ async def global_error_handler(update: types.Update, exception: Exception):
 
     try:
         if update.message:
-            await update.message.answer(
-                "⚠️ مشکلی پیش اومد. لطفاً دوباره تلاش کنید یا /cancel رو بزنید.",
-                reply_markup=menus.main_reply_kb(update.message.from_user.id),
-            )
+            await content.send(update.message, "generic_error", reply_markup=menus.main_reply_kb(update.message.from_user.id))
         elif update.callback_query:
-            await update.callback_query.message.answer(
-                "⚠️ مشکلی پیش اومد. لطفاً دوباره تلاش کنید یا /cancel رو بزنید.",
-                reply_markup=menus.main_reply_kb(update.callback_query.from_user.id),
-            )
+            await content.send(update.callback_query.message, "generic_error", reply_markup=menus.main_reply_kb(update.callback_query.from_user.id))
     except Exception as notify_exc:
         logger.debug("could not notify user about handler error: %s", notify_exc)
 
@@ -1161,19 +1397,16 @@ async def global_error_handler(update: types.Update, exception: Exception):
 @dp.message_handler(content_types=types.ContentTypes.ANY, state="*")
 async def fallback_message(m: types.Message, state: FSMContext):
     await _start_clean_section(m, m.from_user.id, "fallback")
-    await _send_answer(
-        m,
-        m.from_user.id,
-        "متوجه نشدم. از منوی پایین تلگرام استفاده کنید یا /start رو بزنید.",
-        reply_markup=menus.main_reply_kb(m.from_user.id),
-        context="fallback",
-        kind="menu",
+    await _send_content(
+        m, m.from_user.id, "fallback",
+        reply_markup=menus.main_reply_kb(m.from_user.id), context="fallback", kind="menu",
     )
 
 
 @dp.callback_query_handler(lambda c: True, state="*")
 async def fallback_callback(c: types.CallbackQuery):
-    await c.answer("این دکمه دیگر معتبر نیست.")
+    text = content.render("stale_action")["text"]
+    await c.answer(text[:190], show_alert=True)
 
 
 async def on_startup(dispatcher):
@@ -1183,10 +1416,10 @@ async def on_startup(dispatcher):
         recovered = await subs.recover_stale_provider_purchases(15)
         recovered_trials = await subs.recover_stale_trial_claims(15)
         if recovered:
-            logger.warning("recovered stale provider purchases: %s", recovered)
+            logger.warning("processed stale provider purchases: %s", recovered)
             for admin_id in ADMIN_IDS:
                 try:
-                    await bot.send_message(admin_id, f"⚠️ سفارش‌های خودکار نیمه‌کاره بازیابی و مبلغشان برگشت داده شد: {recovered}")
+                    await bot.send_message(admin_id, f"⚠️ سفارش‌های نیمه‌کاره بدون ساخت تکراری بررسی شدند: {recovered}")
                 except Exception:
                     logger.debug("could not notify admin about provider recovery", exc_info=True)
         if recovered_trials:
@@ -1199,9 +1432,18 @@ async def on_startup(dispatcher):
     except Exception:
         logger.exception("stale provider purchase recovery failed")
     asyncio.create_task(backup.daily_backup_loop(bot, ADMIN_IDS), name="daily-backup")
-    logger.info("Berserk VPN bot started; database health OK; daily backup scheduled.")
+    asyncio.create_task(v63_handlers.provider_queue_loop(bot), name="provider-order-queue")
+    asyncio.create_task(v63_handlers.campaign_loop(bot), name="sales-campaigns")
+    logger.info("Berserk VPN v6.4 started; database health OK; content, backup, provider queue and campaigns scheduled.")
 
 
 if __name__ == "__main__":
     logger.info("Berserk VPN bot starting...")
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        on_startup=on_startup,
+        timeout=30,
+        relax=1.0,
+        fast=False,
+    )

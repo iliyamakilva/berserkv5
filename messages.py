@@ -1,8 +1,12 @@
-"""Editable message templates and safe Telegram rendering."""
+"""Compatibility layer for legacy message calls.
 
+Since v6.4 all editable customer text is stored by :mod:`content`. Existing
+handlers keep using messages.send/compose, while the admin sees one unified
+content center with draft, preview, publish, media and version history.
+"""
 from __future__ import annotations
 
-import db
+import content
 
 MESSAGE_KEYS = [
     ("welcome", "پیام خوش‌آمد /start"),
@@ -24,7 +28,7 @@ MESSAGE_KEYS = [
 
 _VALID_KEYS = {key for key, _ in MESSAGE_KEYS}
 DYNAMIC_MESSAGE_KEYS = {"menu_buy", "menu_wallet", "menu_referral"}
-PLACEHOLDERS = ("{body}", "{{body}}", "{default}", "{{default}}")
+LEGACY_TO_CONTENT = dict(content.LEGACY_MESSAGE_MAP)
 TELEGRAM_TEXT_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
 
@@ -37,34 +41,17 @@ def is_dynamic_key(key):
     return key in DYNAMIC_MESSAGE_KEYS
 
 
-def has_system_placeholder(text):
-    text = text or ""
-    return any(placeholder in text for placeholder in PLACEHOLDERS)
-
-
-def render_template(key, template_text, body_text):
-    """Render a template without allowing dynamic system data to disappear."""
-    template_text = (template_text or "").strip()
-    body_text = body_text or ""
-
-    if not template_text:
-        return body_text
-
-    rendered = template_text
-    for placeholder in PLACEHOLDERS:
-        rendered = rendered.replace(placeholder, body_text)
-
-    if is_dynamic_key(key) and not has_system_placeholder(template_text) and body_text.strip():
-        rendered = f"{template_text}\n\n{body_text}".strip()
-
-    return rendered.strip()
+def _slot(key):
+    slot = LEGACY_TO_CONTENT.get(key)
+    if not slot:
+        raise ValueError("invalid message key")
+    return slot
 
 
 def split_text(text, limit=TELEGRAM_TEXT_LIMIT):
     text = str(text or "")
     if len(text) <= limit:
         return [text]
-
     chunks = []
     remaining = text
     while len(remaining) > limit:
@@ -81,72 +68,36 @@ def split_text(text, limit=TELEGRAM_TEXT_LIMIT):
 
 
 def get(key):
-    row = db.get_message(key)
+    slot = _slot(key)
+    row = content.get_template(slot, content.SCOPE_GLOBAL, 0)
     if not row:
         return None, None
-    return row["text"], row["photo_file_id"]
+    return row["published_text"], row["published_photo_file_id"]
 
 
 def get_draft(key):
-    row = db.get_message(key)
+    slot = _slot(key)
+    row = content.get_template(slot, content.SCOPE_GLOBAL, 0)
     if not row:
         return None, None
     return row["draft_text"], row["draft_photo_file_id"]
 
 
 def compose(key, default_text):
-    custom_text, photo_file_id = get(key)
-    if custom_text and custom_text.strip():
-        return render_template(key, custom_text, default_text), photo_file_id
-    return default_text, photo_file_id
+    slot = _slot(key)
+    result = content.render(slot, {"body": default_text})
+    return result["text"], result["photo_file_id"]
 
 
 def compose_preview(key, default_text):
-    draft_text, draft_photo = get_draft(key)
-    if draft_text and draft_text.strip():
-        return render_template(key, draft_text, default_text), draft_photo
-    final_text, final_photo = compose(key, default_text)
-    return final_text, draft_photo or final_photo
+    slot = _slot(key)
+    result = content.render(slot, {"body": default_text}, draft=True)
+    return result["text"], result["photo_file_id"]
 
 
 async def send(target, key, body_text, reply_markup=None):
-    """Send an editable message safely, splitting oversized text when needed."""
-    final_text, photo_file_id = compose(key, body_text)
-    sent_messages = []
-
-    if photo_file_id:
-        if final_text and len(final_text) <= TELEGRAM_CAPTION_LIMIT:
-            sent_messages.append(
-                await target.answer_photo(
-                    photo_file_id,
-                    caption=final_text,
-                    reply_markup=reply_markup,
-                )
-            )
-            return sent_messages
-
-        sent_messages.append(await target.answer_photo(photo_file_id))
-        chunks = split_text(final_text) if final_text else []
-        for index, chunk in enumerate(chunks):
-            sent_messages.append(
-                await target.answer(
-                    chunk,
-                    reply_markup=reply_markup if index == len(chunks) - 1 else None,
-                )
-            )
-        if not chunks and reply_markup:
-            sent_messages.append(await target.answer("از منوی پایین استفاده کنید.", reply_markup=reply_markup))
-        return sent_messages
-
-    chunks = split_text(final_text)
-    for index, chunk in enumerate(chunks):
-        sent_messages.append(
-            await target.answer(
-                chunk,
-                reply_markup=reply_markup if index == len(chunks) - 1 else None,
-            )
-        )
-    return sent_messages
+    slot = _slot(key)
+    return await content.send(target, slot, {"body": body_text}, reply_markup=reply_markup)
 
 
 def _validate_key(key):
@@ -156,34 +107,38 @@ def _validate_key(key):
 
 def set_text(key, text):
     _validate_key(key)
-    db.set_message_text(key, text)
+    slot = _slot(key)
+    content.save_draft(slot, text, admin_id=None)
+    content.publish(slot)
 
 
 def set_photo(key, photo_file_id):
     _validate_key(key)
-    db.set_message_photo(key, photo_file_id)
+    slot = _slot(key)
+    content.save_draft_photo(slot, photo_file_id)
+    content.publish(slot)
 
 
 def set_draft_text(key, text):
     _validate_key(key)
-    db.set_message_draft_text(key, text)
+    content.save_draft(_slot(key), text)
 
 
 def set_draft_photo(key, photo_file_id):
     _validate_key(key)
-    db.set_message_draft_photo(key, photo_file_id)
+    content.save_draft_photo(_slot(key), photo_file_id)
 
 
 def publish_draft(key):
     _validate_key(key)
-    return db.publish_message_draft(key)
+    return content.publish(_slot(key))
 
 
 def clear_draft(key):
     _validate_key(key)
-    db.clear_message_draft(key)
+    return content.clear_draft(_slot(key))
 
 
 def clear(key):
     _validate_key(key)
-    db.clear_message(key)
+    return content.restore_default(_slot(key))

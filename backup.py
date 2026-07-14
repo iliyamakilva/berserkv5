@@ -134,6 +134,54 @@ def inspect_sqlite_file(path):
                         f"ستون‌های نسخه 620 جدول {table} ناقص است: {', '.join(sorted(missing))}"
                     )
 
+        if result["schema_version"] is not None and result["schema_version"] >= 630:
+            reliability_schema = {
+                "provider_states": {"provider_key", "is_sales_enabled", "last_status", "capabilities_json"},
+                "provider_logs": {"provider_key", "operation", "result", "created_at"},
+                "provider_jobs": {"purchase_id", "active_provider", "status", "retry_count", "next_retry_at"},
+                "provider_job_items": {"purchase_id", "item_index", "provider_username", "status"},
+                "discounts": {"code", "discount_type", "value", "is_active"},
+                "discount_redemptions": {"discount_id", "user_id", "purchase_id", "amount"},
+                "campaigns": {"title", "inactivity_days", "message_text", "is_active"},
+                "campaign_deliveries": {"campaign_id", "user_id", "status", "sent_at"},
+                "plan_text_templates": {"title", "body", "is_system", "is_active"},
+                "plans": {"fallback_provider_key", "template_id"},
+                "plan_categories": {"template_id"},
+                "purchases": {"subtotal_amount", "discount_amount", "retry_count", "review_required", "request_key"},
+                "topups": {"discount_code", "request_key"},
+                "tickets": {"service_id", "issue_type", "snapshot_json"},
+            }
+            for table, required_columns in reliability_schema.items():
+                if table not in tables:
+                    result["errors"].append(f"جدول ضروری نسخه 630 یعنی {table} وجود ندارد.")
+                    continue
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = {row[1] for row in cursor.fetchall()}
+                missing = required_columns - columns
+                if missing:
+                    result["errors"].append(
+                        f"ستون‌های نسخه 630 جدول {table} ناقص است: {', '.join(sorted(missing))}"
+                    )
+
+        if result["schema_version"] is not None and result["schema_version"] >= 640:
+            content_schema = {
+                "content_templates": {"slot_key", "scope_type", "scope_id", "published_text", "draft_text", "parse_mode", "is_active"},
+                "content_template_versions": {"template_id", "slot_key", "scope_type", "scope_id", "text_value", "action", "created_at"},
+                "content_display_settings": {"scope_type", "scope_id", "settings_json", "updated_at"},
+                "purchase_funnel_events": {"user_id", "event_type", "category_id", "plan_id", "purchase_id", "created_at"},
+            }
+            for table, required_columns in content_schema.items():
+                if table not in tables:
+                    result["errors"].append(f"جدول ضروری نسخه 640 یعنی {table} وجود ندارد.")
+                    continue
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = {row[1] for row in cursor.fetchall()}
+                missing = required_columns - columns
+                if missing:
+                    result["errors"].append(
+                        f"ستون‌های نسخه 640 جدول {table} ناقص است: {', '.join(sorted(missing))}"
+                    )
+
         if result["schema_version"] is None:
             result["warnings"].append(
                 "این بک‌آپ قدیمی است و schema_version ندارد؛ migration هنگام اجرای ربات انجام می‌شود."
@@ -158,6 +206,9 @@ def inspect_sqlite_file(path):
             "plans": _query_count(cursor, "SELECT COUNT(*) FROM plans"),
             "plan_categories": _query_count(cursor, "SELECT COUNT(*) FROM plan_categories"),
             "trial_claims": _query_count(cursor, "SELECT COUNT(*) FROM trial_claims"),
+            "content_templates": _query_count(cursor, "SELECT COUNT(*) FROM content_templates"),
+            "content_versions": _query_count(cursor, "SELECT COUNT(*) FROM content_template_versions"),
+            "funnel_events": _query_count(cursor, "SELECT COUNT(*) FROM purchase_funnel_events"),
             "provider_services": _query_count(cursor, "SELECT COUNT(*) FROM subs WHERE COALESCE(source_type,'pool')!='pool"),
             "custom_buttons": _query_count(cursor, "SELECT COUNT(*) FROM custom_buttons"),
         }

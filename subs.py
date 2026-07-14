@@ -18,6 +18,7 @@ import time
 import aiohttp
 
 import db
+import commerce
 from config import (
     YOUPANEL_BASE_URL,
     YOUPANEL_INBOUNDS_JSON,
@@ -452,15 +453,16 @@ def get_link_detail(link_id):
 # -------------------- Provider core and YouPanel adapter --------------------
 
 class ProviderError(RuntimeError):
-    pass
-
-
-class YouPanelError(ProviderError):
-    def __init__(self, code: str, message: str, status: int | None = None):
+    def __init__(self, message: str, code: str = "provider_error", status: int | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+
+
+class YouPanelError(ProviderError):
+    def __init__(self, code: str, message: str, status: int | None = None):
+        super().__init__(message, code=code, status=status)
 
 
 _panel_token: str | None = None
@@ -546,8 +548,17 @@ async def _panel_request(method: str, path: str, *, json_body=None, params=None,
         await _panel_login(force=True)
         return await _panel_request(method, path, json_body=json_body, params=params, retry_auth=False)
     if status < 200 or status >= 300:
+        if status in {502, 503, 504, 520, 521, 522, 523, 524, 525, 526}:
+            raise YouPanelError(
+                "upstream_unavailable",
+                "پنل تأمین‌کننده موقتاً در دسترس نیست. چند دقیقه دیگر دوباره تلاش کنید.",
+                status,
+            )
         detail = payload.get("detail") if isinstance(payload, dict) else None
-        raise YouPanelError("api_error", f"خطای YouPanel: {detail or status}", status)
+        detail_text = str(detail or status).strip()
+        if len(detail_text) > 300:
+            detail_text = detail_text[:297] + "..."
+        raise YouPanelError("api_error", f"خطای YouPanel: {detail_text}", status)
     if not isinstance(payload, dict):
         raise YouPanelError("invalid_response", "پاسخ YouPanel ساختار معتبر ندارد.", status)
     return payload
@@ -601,6 +612,15 @@ async def panel_create_user(username: str, data_limit_bytes: int, duration_days:
     return result
 
 
+async def panel_get_user(username: str):
+    try:
+        return await _panel_request("GET", f"/api/user/{_clean_panel_username(username)}")
+    except YouPanelError as exc:
+        if getattr(exc, "status", None) == 404:
+            return None
+        raise
+
+
 async def panel_delete_user(username: str):
     return await _panel_request("DELETE", f"/api/user/{_clean_panel_username(username)}")
 
@@ -627,12 +647,20 @@ async def panel_health_check():
 class ProviderAdapter:
     key = "provider"
     label = "تأمین‌کننده"
+    capabilities = {
+        "create": False, "renew": False, "add_volume": False,
+        "reset_usage": False, "revoke": False, "device_limit": False,
+        "usage": False, "delete": False, "lookup": False,
+    }
 
     def configured(self) -> bool:
         return False
 
     async def health(self):
         raise ProviderError("این تأمین‌کننده پیاده‌سازی نشده است.")
+
+    async def get_user(self, username):
+        return None
 
     async def create_user(self, username, *, data_limit_bytes, duration_days, start_mode="on_hold", reset_strategy="no_reset", max_devices=None, options=None):
         raise ProviderError("ساخت سرویس برای این تأمین‌کننده پیاده‌سازی نشده است.")
@@ -653,12 +681,20 @@ class ProviderAdapter:
 class YouPanelProvider(ProviderAdapter):
     key = "youpanel"
     label = "YouPanel"
+    capabilities = {
+        "create": True, "renew": True, "add_volume": True,
+        "reset_usage": True, "revoke": True, "device_limit": True,
+        "usage": True, "delete": True, "lookup": True,
+    }
 
     def configured(self) -> bool:
         return panel_is_configured()
 
     async def health(self):
         return await panel_health_check()
+
+    async def get_user(self, username):
+        return await panel_get_user(username)
 
     async def create_user(self, username, *, data_limit_bytes, duration_days, start_mode="on_hold", reset_strategy="no_reset", max_devices=None, options=None):
         return await panel_create_user(username, data_limit_bytes, duration_days, start_mode, reset_strategy, max_devices)
@@ -703,75 +739,258 @@ def provider_label(key):
 
 async def provider_health_check(key):
     provider = get_provider_adapter(key)
+    commerce.ensure_provider(provider.key, provider.capabilities)
     if not provider.configured():
+        commerce.record_provider_log(provider.key, "health", "error", error_code="not_configured", error_message="تنظیمات کامل نیست.")
         raise ProviderError(f"تنظیمات {provider.label} کامل نیست.")
-    return await provider.health()
+    started = time.monotonic()
+    try:
+        result = await provider.health()
+    except Exception as exc:
+        elapsed = int((time.monotonic() - started) * 1000)
+        commerce.record_provider_log(provider.key, "health", "error", response_ms=elapsed,
+                                     error_code=getattr(exc, "code", "health_error"), error_message=str(exc))
+        raise
+    elapsed = int((time.monotonic() - started) * 1000)
+    commerce.record_provider_log(provider.key, "health", "success", response_ms=elapsed)
+    return result
 
 
-async def provision_provider_purchase(user_id, quantity, plan_id, unit_price=None, note=""):
-    plan = db.get_plan(plan_id)
-    if not plan:
-        raise db.PurchaseError("plan_not_found", "پلن پیدا نشد.")
-    provider_key = db.plan_provider_key(plan)
-    if provider_key == "pool":
-        raise db.PurchaseError("wrong_provider", "این پلن از استخر لینک تحویل می‌شود.")
+def _normalize_existing_provider_item(item, username):
+    if not item or not isinstance(item, dict):
+        return None
+    link = (item.get("subscription_url") or item.get("link") or "").strip()
+    if not link:
+        return None
+    normalized = dict(item)
+    normalized["username"] = normalized.get("username") or username
+    normalized["subscription_url"] = link
+    return normalized
+
+
+async def process_provider_job(purchase_id: int):
+    purchase = commerce.get_order_detail(purchase_id)
+    if not purchase:
+        raise db.PurchaseError("purchase_not_found", "سفارش پیدا نشد.")
+    if purchase["status"] == "completed":
+        db.cur.execute("SELECT * FROM subs WHERE purchase_id=? ORDER BY id", (int(purchase_id),))
+        return {"completed": True, "queued": False, "purchase_id": int(purchase_id), "items": [dict(r) for r in db.cur.fetchall()]}
+    if purchase["status"] == "refunded":
+        return {"completed": False, "queued": False, "refunded": True, "purchase_id": int(purchase_id), "items": []}
+    if not commerce.claim_provider_job(purchase_id):
+        return {"completed": False, "queued": True, "purchase_id": int(purchase_id), "items": []}
+
+    job = commerce.get_provider_job(purchase_id)
+    plan = db.get_plan(purchase["plan_id"])
+    if not job or not plan:
+        commerce.release_provider_job(purchase_id)
+        raise db.PurchaseError("invalid_job", "اطلاعات صف سفارش ناقص است.")
+    provider_key = job["active_provider"]
+    fallback = (job["fallback_provider"] or "").strip().lower()
+    provider_options = db.plan_provider_options(plan)
+
     try:
         provider = get_provider_adapter(provider_key)
-    except ProviderError as exc:
-        raise db.PurchaseError("provider_not_installed", str(exc)) from exc
-    if not provider.configured():
-        raise db.PurchaseError("provider_not_configured", f"اتصال {provider.label} تنظیم نشده است.")
-    reservation = db.begin_provider_purchase(user_id, quantity, unit_price, note=note, plan_id=plan_id)
-    provider_options = db.plan_provider_options(plan)
-    created = []
-    attempted_usernames = []
-    try:
-        for index in range(1, int(quantity) + 1):
-            provider_username = provider_username_for_order(user_id, reservation["purchase_id"], index)
-            attempted_usernames.append(provider_username)
-            item = await provider.create_user(
-                provider_username,
-                data_limit_bytes=int(plan["panel_data_limit_bytes"] or 0),
-                duration_days=int(plan["panel_duration_days"] or 0),
-                start_mode=plan["panel_start_mode"] or "on_hold",
-                reset_strategy=plan["panel_reset_strategy"] or "no_reset",
-                max_devices=plan["panel_max_devices"],
-                options=provider_options,
-            )
-            item["account_name"] = db.generate_service_code()
-            created.append(item)
-        finalized = db.finalize_provider_purchase(reservation["purchase_id"], created)
-        purchase = finalized["purchase"]
+        commerce.ensure_provider(provider.key, provider.capabilities)
+        if not provider.configured() or not commerce.provider_sales_enabled(provider.key):
+            if fallback and fallback != provider_key and commerce.provider_sales_enabled(fallback):
+                fallback_adapter = get_provider_adapter(fallback)
+                if fallback_adapter.configured():
+                    commerce.switch_job_provider(purchase_id, fallback)
+                    commerce.record_provider_log(provider_key, "failover", "success", purchase_id=purchase_id,
+                                                 plan_id=plan["id"], user_id=purchase["user_id"],
+                                                 error_message=f"switched_to={fallback}")
+                    commerce.release_provider_job(purchase_id)
+                    return await process_provider_job(purchase_id)
+            raise ProviderError(f"فروش یا اتصال {provider.label} فعال نیست.")
+
+        ready_items = []
+        rows = commerce.list_provider_job_items(purchase_id)
+        for row in rows:
+            username = provider_username_for_order(purchase["user_id"], purchase_id, int(row["item_index"]))
+            if row["status"] == "ready" and row["subscription_url"]:
+                payload = json.loads(row["payload_json"] or "{}")
+                payload.update({"username": username, "subscription_url": row["subscription_url"], "account_name": db.generate_service_code()})
+                ready_items.append(payload)
+                continue
+
+            started = time.monotonic()
+            try:
+                existing = await provider.get_user(username)
+                item = _normalize_existing_provider_item(existing, username)
+                if item is None:
+                    item = await provider.create_user(
+                        username,
+                        data_limit_bytes=(
+                            int(plan["panel_data_limit_bytes"] or 0)
+                            + int(purchase["bonus_volume_mb"] or 0) * 1024 * 1024
+                        ),
+                        duration_days=int(plan["panel_duration_days"] or 0),
+                        start_mode=plan["panel_start_mode"] or "on_hold",
+                        reset_strategy=plan["panel_reset_strategy"] or "no_reset",
+                        max_devices=plan["panel_max_devices"],
+                        options=provider_options,
+                    )
+                elapsed = int((time.monotonic() - started) * 1000)
+                commerce.record_provider_log(provider.key, "create", "success", user_id=purchase["user_id"],
+                                             plan_id=plan["id"], purchase_id=purchase_id, response_ms=elapsed)
+                commerce.set_job_item_ready(purchase_id, row["item_index"], provider.key, username, item)
+                normalized = dict(item)
+                normalized["account_name"] = db.generate_service_code()
+                ready_items.append(normalized)
+            except Exception as exc:
+                elapsed = int((time.monotonic() - started) * 1000)
+                commerce.set_job_item_error(purchase_id, row["item_index"], str(exc))
+                commerce.record_provider_log(provider.key, "create", "error", user_id=purchase["user_id"],
+                                             plan_id=plan["id"], purchase_id=purchase_id, response_ms=elapsed,
+                                             error_code=getattr(exc, "code", "provider_error"), error_message=str(exc))
+                raise
+
+        finalized = commerce.mark_provider_purchase_completed(purchase_id, ready_items)
+        p = finalized["purchase"]
         return {
-            "purchase_id": int(purchase["id"]),
-            "quantity": int(purchase["quantity"]),
-            "unit_price": int(purchase["unit_price"]),
-            "amount": int(purchase["amount"]),
-            "balance_before": reservation["balance_before"],
-            "balance_after": reservation["balance_after"],
-            "is_test": int(purchase["is_test"] or 0),
-            "items": finalized["items"],
-            "provider": provider_key,
+            "purchase_id": int(p["id"]), "quantity": int(p["quantity"]), "unit_price": int(p["unit_price"]),
+            "subtotal": int(p["subtotal_amount"] or p["amount"]), "discount_amount": int(p["discount_amount"] or 0),
+            "amount": int(p["amount"]), "balance_before": None, "balance_after": int(db.get_user(p["user_id"])["balance"] or 0),
+            "is_test": int(p["is_test"] or 0), "items": finalized["items"], "provider": p["provider"],
+            "queued": False, "completed": True,
         }
     except Exception as exc:
-        cleanup_errors = []
-        for provider_username in dict.fromkeys(attempted_usernames):
+        # Runtime failover is safe only before any item has been created.  Once a
+        # partial order exists, retries stay on the same provider to avoid a mixed
+        # delivery and duplicate remote accounts.
+        current_job = commerce.get_provider_job(purchase_id)
+        current_rows = commerce.list_provider_job_items(purchase_id)
+        ready_count = sum(1 for item in current_rows if item["status"] == "ready")
+        runtime_fallback = ((current_job["fallback_provider"] if current_job else None) or "").strip().lower()
+        current_provider = ((current_job["active_provider"] if current_job else provider_key) or "").strip().lower()
+        primary_provider = ((current_job["primary_provider"] if current_job else provider_key) or "").strip().lower()
+        if (
+            ready_count == 0
+            and runtime_fallback
+            and current_provider == primary_provider
+            and runtime_fallback != current_provider
+            and commerce.provider_sales_enabled(runtime_fallback)
+        ):
             try:
-                await provider.delete_user(provider_username)
-            except ProviderError as cleanup_exc:
-                if getattr(cleanup_exc, "status", None) != 404:
-                    cleanup_errors.append(getattr(cleanup_exc, "message", str(cleanup_exc)))
-            except Exception as cleanup_exc:
-                cleanup_errors.append(str(cleanup_exc))
-        detail = str(exc)
-        if cleanup_errors:
-            detail += "; cleanup_failed=" + " | ".join(cleanup_errors)
-        db.refund_provider_purchase(reservation["purchase_id"], detail)
-        if isinstance(exc, db.PurchaseError):
-            raise
-        if isinstance(exc, ProviderError):
-            raise db.PurchaseError("provider_error", str(exc)) from exc
-        raise db.PurchaseError("provider_error", "ساخت خودکار سرویس ناموفق بود و مبلغ به کیف پول برگشت.") from exc
+                fallback_adapter = get_provider_adapter(runtime_fallback)
+                if fallback_adapter.configured():
+                    commerce.switch_job_provider(purchase_id, runtime_fallback)
+                    commerce.record_provider_log(
+                        current_provider,
+                        "runtime_failover",
+                        "success",
+                        purchase_id=purchase_id,
+                        plan_id=plan["id"],
+                        user_id=purchase["user_id"],
+                        error_message=f"switched_to={runtime_fallback};cause={str(exc)[:300]}",
+                    )
+                    commerce.release_provider_job(purchase_id)
+                    return await process_provider_job(purchase_id)
+            except Exception as fallback_exc:
+                commerce.record_provider_log(
+                    runtime_fallback,
+                    "runtime_failover",
+                    "error",
+                    purchase_id=purchase_id,
+                    plan_id=plan["id"],
+                    user_id=purchase["user_id"],
+                    error_code=getattr(fallback_exc, "code", "fallback_error"),
+                    error_message=str(fallback_exc),
+                )
+        schedule = commerce.schedule_provider_retry(purchase_id, str(exc))
+        if schedule.get("final"):
+            cleanup_errors = []
+            job = commerce.get_provider_job(purchase_id)
+            active_key = (job["active_provider"] if job else provider_key) or provider_key
+            try:
+                cleanup_provider = get_provider_adapter(active_key)
+            except Exception:
+                cleanup_provider = None
+            for row in commerce.list_provider_job_items(purchase_id):
+                username = provider_username_for_order(purchase["user_id"], purchase_id, int(row["item_index"]))
+                if not cleanup_provider:
+                    continue
+                try:
+                    await cleanup_provider.delete_user(username)
+                except ProviderError as cleanup_exc:
+                    if getattr(cleanup_exc, "status", None) != 404:
+                        cleanup_errors.append(str(cleanup_exc))
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+            detail = str(exc)
+            if cleanup_errors:
+                detail += "; cleanup=" + " | ".join(cleanup_errors)
+            commerce.refund_purchase_once(purchase_id, detail, review_required=True)
+            return {"purchase_id": int(purchase_id), "queued": False, "completed": False, "refunded": True, "items": [], "error": str(exc)}
+        return {"purchase_id": int(purchase_id), "queued": True, "completed": False, "items": [],
+                "retry_count": schedule.get("retry_count"), "retry_delay": schedule.get("delay"), "error": str(exc)}
+    finally:
+        commerce.release_provider_job(purchase_id)
+
+
+async def provision_provider_purchase(
+    user_id,
+    quantity,
+    plan_id,
+    unit_price=None,
+    note="",
+    discount_code=None,
+    request_key=None,
+):
+    # unit_price is accepted for backward compatibility; the current plan price is authoritative.
+    reservation = commerce.begin_provider_purchase(
+        user_id,
+        quantity,
+        plan_id,
+        discount_code=discount_code,
+        note=note,
+        request_key=request_key,
+    )
+    existing_status = (reservation.get("status") or "").lower()
+    if reservation.get("existing") and existing_status in {"retry", "provisioning", "paid"}:
+        result = {
+            "purchase_id": int(reservation["purchase_id"]),
+            "queued": True,
+            "completed": False,
+            "items": reservation.get("items") or [],
+            "existing": True,
+            "status": existing_status,
+        }
+    elif reservation.get("existing") and existing_status == "refunded":
+        result = {
+            "purchase_id": int(reservation["purchase_id"]),
+            "queued": False,
+            "completed": False,
+            "refunded": True,
+            "items": [],
+            "existing": True,
+            "status": existing_status,
+        }
+    else:
+        result = await process_provider_job(reservation["purchase_id"])
+    result.setdefault("balance_before", reservation["balance_before"])
+    result.setdefault("balance_after", reservation["balance_after"])
+    result.setdefault("subtotal", reservation["subtotal"])
+    result.setdefault("discount_amount", reservation["discount_amount"])
+    result.setdefault("amount", reservation["amount"])
+    result.setdefault("quantity", reservation["quantity"])
+    result.setdefault("unit_price", reservation["unit_price"])
+    result.setdefault("is_test", reservation["is_test"])
+    result.setdefault("provider", reservation["provider"])
+    result.setdefault("provider_notice", reservation.get("provider_notice"))
+    return result
+
+
+async def recover_due_provider_jobs(limit: int = 20):
+    results = []
+    for row in commerce.due_provider_jobs(limit):
+        try:
+            result = await process_provider_job(int(row["purchase_id"]))
+            results.append(result)
+        except Exception:
+            logger.exception("provider queue recovery failed for purchase %s", row["purchase_id"])
+    return results
 
 
 async def provision_panel_purchase(user_id, quantity, plan_id, unit_price=None, note=""):
@@ -787,7 +1006,7 @@ async def create_trial_service(user_id, size_mb: int, days: int, provider_key="y
     ok, reason, claim = db.begin_trial_claim(user_id, username, provider_key=provider_key)
     if not ok:
         if reason == "already_claimed":
-            raise ProviderError("برای این حساب قبلاً اکانت تست ثبت شده است.")
+            raise ProviderError("برای این حساب قبلاً اکانت تست ثبت شده است.", code="already_claimed")
         raise ProviderError("امکان شروع اکانت تست وجود ندارد: " + str(reason))
     try:
         item = await provider.create_user(
@@ -813,32 +1032,10 @@ async def create_trial_service(user_id, size_mb: int, days: int, provider_key="y
 
 
 async def recover_stale_provider_purchases(minutes: int = 15):
-    """Best-effort cleanup and refund for interrupted provisioning orders."""
-    recovered = []
-    for purchase in db.list_stale_provider_purchases(minutes):
-        cleanup_errors = []
-        provider_key = purchase["provider"] or "youpanel"
-        try:
-            provider = get_provider_adapter(provider_key)
-        except ProviderError:
-            provider = None
-        for index in range(1, int(purchase["quantity"] or 0) + 1):
-            username = provider_username_for_order(purchase["user_id"], purchase["id"], index)
-            try:
-                if provider:
-                    await provider.delete_user(username)
-            except ProviderError as exc:
-                # A 404 means there was no orphan account to delete. Other
-                # failures are recorded but the wallet is still refunded.
-                if getattr(exc, "status", None) != 404:
-                    cleanup_errors.append(getattr(exc, "message", str(exc)))
-        detail = "startup_recovery"
-        if cleanup_errors:
-            detail += "; cleanup=" + " | ".join(cleanup_errors)
-        ok, _, _ = db.refund_provider_purchase(purchase["id"], detail)
-        if ok:
-            recovered.append(int(purchase["id"]))
-    return recovered
+    """Compatibility entry point; v6.3 recovers idempotent queued jobs."""
+    results = await recover_due_provider_jobs(50)
+    return [int(item["purchase_id"]) for item in results if item.get("completed") or item.get("refunded")]
+
 
 # Compatibility alias for deployments and call sites from v6.1.
 recover_stale_panel_purchases = recover_stale_provider_purchases

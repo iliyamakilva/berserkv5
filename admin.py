@@ -198,6 +198,8 @@ def admin_services_section_kb():
         InlineKeyboardButton("🔗 استخر لینک‌ها", callback_data="adm_links"),
         InlineKeyboardButton("🔌 تأمین‌کننده‌ها", callback_data="adm_providers"),
         InlineKeyboardButton("🧪 اکانت‌های تست", callback_data="adm_trials"),
+        InlineKeyboardButton("📋 صف سفارش‌ها", callback_data="adm_order_queue"),
+        InlineKeyboardButton("🎁 تخفیف‌ها و کمپین‌ها", callback_data="adm_discounts"),
     )
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
@@ -214,7 +216,7 @@ def admin_personalize_section_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("🎛 مدیریت دکمه‌ها", callback_data="adm_buttons"))
     kb.add(InlineKeyboardButton("🧭 چیدمان پنل مدیریت", callback_data="adm_menu_layout"))
-    kb.add(InlineKeyboardButton("📝 مدیریت پیام‌ها", callback_data="adm_messages"))
+    kb.add(InlineKeyboardButton("🧠 مرکز محتوا و تجربه مشتری", callback_data="adm_content"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
 
@@ -910,7 +912,7 @@ async def cb_section_personalize(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
-    await _replace_callback_message(c, "🎛 شخصی‌سازی ربات\n\nمدیریت دکمه‌ها و متن‌های قابل ویرایش از این بخش انجام می‌شود.", reply_markup=admin_personalize_section_kb())
+    await _replace_callback_message(c, "🎛 شخصی‌سازی ربات\n\nمتن‌ها، رسانه‌ها، دکمه‌های نمایشی و چیدمان از این بخش مدیریت می‌شوند.", reply_markup=admin_personalize_section_kb())
 
 
 async def cb_section_reports(c: types.CallbackQuery):
@@ -1240,7 +1242,7 @@ async def cb_panel_usage(c: types.CallbackQuery):
         db.log_admin_action(c.from_user.id, "panel_usage", user_id, f"sub_id={sub_id}; used={total}")
         await _replace_callback_message(c, "\n".join(lines), reply_markup=service_detail_kb(user_id, sub_id, item["purchase_id"]))
     except subs.ProviderError as exc:
-        await c.answer(getattr(exc, "message", str(exc)), show_alert=True)
+        await c.answer(_callback_error_text(exc), show_alert=True)
 
 
 async def cb_panel_action_ask(c: types.CallbackQuery):
@@ -1298,7 +1300,7 @@ async def cb_panel_action_confirm(c: types.CallbackQuery):
         updated = subs.get_sub_detail(sub_id)
         await _replace_callback_message(c, message + "\n\n" + _fmt_service_detail(user_id, sub_id)[0], reply_markup=service_detail_kb(user_id, sub_id, updated["purchase_id"] if updated else None))
     except subs.ProviderError as exc:
-        await c.answer(getattr(exc, "message", str(exc)), show_alert=True)
+        await c.answer(_callback_error_text(exc), show_alert=True)
 
 
 async def cb_search(c: types.CallbackQuery):
@@ -2463,8 +2465,19 @@ def plan_settings_kb(plan_id):
             InlineKeyboardButton("⏱ شروع اعتبار", callback_data=f"plan_toggle_start_{plan_id}"),
             InlineKeyboardButton("📱 سقف دستگاه", callback_data=f"plan_set_panel_max_devices_{plan_id}"),
         )
+        kb.add(InlineKeyboardButton("🔀 Provider جایگزین", callback_data=f"v63_plan_fallback_{plan_id}"))
     kb.add(InlineKeyboardButton("⬅️ جزئیات پلن", callback_data=f"plan_detail_{plan_id}"))
     return kb
+
+
+def _callback_error_text(exc: Exception) -> str:
+    """Return a safe Telegram callback alert (answerCallbackQuery is limited to 200 chars)."""
+    code = str(getattr(exc, "code", "") or "")
+    status = getattr(exc, "status", None)
+    if code in {"network", "upstream_unavailable"} or status in {502, 503, 504, 520, 521, 522, 523, 524, 525, 526}:
+        return "⚠️ ارتباط با پنل موقتاً برقرار نیست. چند دقیقه دیگر دوباره تلاش کنید."
+    text = str(getattr(exc, "message", None) or str(exc) or "خطای نامشخص تأمین‌کننده").strip()
+    return text if len(text) <= 180 else text[:177] + "..."
 
 
 def _fmt_bytes(value):
@@ -2509,6 +2522,7 @@ def _fmt_plan(plan):
     category = db.get_plan_category(plan["category_id"]) if plan["category_id"] else None
     provider_key = db.plan_provider_key(plan)
     provider_name = "استخر لینک" if provider_key == "pool" else subs.provider_label(provider_key)
+    fallback_provider = (plan["fallback_provider_key"] if "fallback_provider_key" in plan.keys() else None) or "-"
     pre_text = (plan["pre_purchase_text"] or "").strip()
     post_text = (plan["post_purchase_text"] or "").strip()
     lines = [
@@ -2520,6 +2534,7 @@ def _fmt_plan(plan):
         f"قیمت فروش: {_fmt_money(plan['price'])}",
         f"نحوه خرید: {_purchase_mode_label(db.plan_purchase_mode(plan))}",
         f"روش تحویل: {provider_name}",
+        f"تأمین‌کننده جایگزین: {subs.provider_label(fallback_provider) if fallback_provider != '-' else '-'}",
         f"توضیح: {plan['description'] or '-'}",
         f"برچسب: {plan['tag'] or '-'}",
         f"ترتیب نمایش: {plan['sort_order']}",
@@ -3206,8 +3221,7 @@ def settings_menu_kb():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton(f"🤖 وضعیت ربات: {'روشن' if settings.bot_enabled() else 'خاموش'}", callback_data="adm_bot_status"))
     kb.add(InlineKeyboardButton(f"🛒 وضعیت فروش: {'باز' if settings.sales_enabled() else 'بسته'}", callback_data="adm_sales_status"))
-    kb.add(InlineKeyboardButton("✏️ پیام خاموش بودن ربات", callback_data="setkey_bot_disabled_message"))
-    kb.add(InlineKeyboardButton("✏️ پیام بسته بودن فروش", callback_data="setkey_sales_closed_message"))
+    kb.add(InlineKeyboardButton("🧠 ویرایش پیام‌های وضعیت", callback_data="adm_content"))
     for key, label, getter, _ in SETTING_FIELDS:
         value = getter()
         display = f"{value:,}" if isinstance(value, int) else value
@@ -3224,7 +3238,7 @@ async def cb_settings(c: types.CallbackQuery):
     await _replace_callback_message(
         c,
         "⚙️ تنظیمات کل ربات\n\n"
-        "تنظیمات عمومی اینجا می‌ماند. تنظیمات اختصاصی هر پلن از بخش «📦 سرویس‌ها و پلن‌ها» مدیریت می‌شود.",
+        "تنظیمات عمومی اینجا می‌ماند. متن پیام‌های خاموش‌بودن ربات و بسته‌بودن فروش از «مرکز محتوا» مدیریت می‌شوند تا مسیر ویرایش تکراری نداشته باشند.",
         reply_markup=settings_menu_kb(),
     )
 
@@ -4701,7 +4715,6 @@ def register(dp):
 
     dp.register_callback_query_handler(cb_topups, lambda c: c.data == "adm_topups")
     dp.register_callback_query_handler(cb_stats, lambda c: c.data == "adm_stats")
-    dp.register_callback_query_handler(cb_sales_report, lambda c: c.data == "adm_sales_report")
     dp.register_callback_query_handler(cb_admin_logs, lambda c: c.data == "adm_admin_logs")
 
     dp.register_callback_query_handler(cb_categories, lambda c: c.data == "adm_categories")
@@ -4714,7 +4727,6 @@ def register(dp):
     dp.register_callback_query_handler(cb_category_delete, lambda c: c.data.startswith("category_delete_"))
     dp.register_message_handler(process_category_form, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_category_form)
     dp.register_message_handler(process_category_setting, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_category_setting)
-    dp.register_callback_query_handler(cb_providers, lambda c: c.data == "adm_providers")
     dp.register_callback_query_handler(cb_provider_health, lambda c: c.data.startswith("adm_provider_health_"))
     dp.register_callback_query_handler(cb_provider_detail, lambda c: c.data.startswith("adm_provider_"))
     dp.register_callback_query_handler(cb_trials, lambda c: c.data == "adm_trials")
@@ -4755,19 +4767,8 @@ def register(dp):
     dp.register_callback_query_handler(cb_setkey, lambda c: c.data.startswith("setkey_"))
     dp.register_message_handler(process_setting_value, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_setting_value)
 
-    dp.register_callback_query_handler(cb_messages, lambda c: c.data == "adm_messages")
-    dp.register_callback_query_handler(cb_msg_category, lambda c: c.data.startswith("msgcat_"))
-    dp.register_callback_query_handler(cb_msgkey, lambda c: c.data.startswith("msgkey_"))
-    dp.register_callback_query_handler(cb_msg_default, lambda c: c.data.startswith("msg_default_"))
-    dp.register_callback_query_handler(cb_msg_copy_default, lambda c: c.data.startswith("msg_copy_default_"))
-    dp.register_callback_query_handler(cb_msg_edit_start, lambda c: c.data.startswith("msg_edit_"))
-    dp.register_callback_query_handler(cb_msg_prefix, lambda c: c.data.startswith("msg_prefix_"))
-    dp.register_callback_query_handler(cb_msg_suffix, lambda c: c.data.startswith("msg_suffix_"))
-    dp.register_callback_query_handler(cb_msg_preview, lambda c: c.data.startswith("msg_preview_"))
-    dp.register_callback_query_handler(cb_msg_publish, lambda c: c.data.startswith("msg_publish_"))
-    dp.register_callback_query_handler(cb_msg_clear_draft, lambda c: c.data.startswith("msg_clear_draft_"))
-    dp.register_callback_query_handler(cb_msg_clear_published, lambda c: c.data.startswith("msg_clear_published_"))
-    dp.register_message_handler(process_message_edit, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_message_edit)
+    # Legacy message editor handlers are intentionally not registered in v6.4.
+    # Stale callbacks are redirected by v64_handlers to the unified content center.
 
     dp.register_callback_query_handler(cb_buttons, lambda c: c.data == "adm_buttons")
     dp.register_callback_query_handler(cb_button_create, lambda c: c.data == "btn_create")

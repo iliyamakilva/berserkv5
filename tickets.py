@@ -11,6 +11,7 @@ from aiogram import Bot, types
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 
+import content
 import db
 import menus
 from config import ADMIN_IDS
@@ -35,10 +36,7 @@ def cancel_kb():
 
 async def cb_ticket_start(c: types.CallbackQuery):
     await c.answer()
-    sent = await c.message.answer(
-        "پیام یا سوالتون رو بفرستید (متن، عکس، فایل - هرچی می‌خواید):",
-        reply_markup=cancel_kb(),
-    )
+    sent = (await content.send(c.message, "support_prompt", reply_markup=cancel_kb()))[-1]
     db.track_bot_message(sent.chat.id, c.from_user.id, sent.message_id, "ticket_form", kind="temp")
     await TicketStates.waiting_message.set()
 
@@ -74,9 +72,8 @@ async def process_ticket_message(m: types.Message, state: FSMContext):
     if delivered_to_admins == 0:
         logger.error("Ticket %s was stored but could not be delivered to any admin", ticket_id)
 
-    await m.answer(
-        f"✅ پیام شما ثبت شد (تیکت #{ticket_id}).\n"
-        "به‌زودی پاسخ داده میشه.",
+    await content.send(
+        m, "support_created", {"ticket_id": ticket_id},
         reply_markup=menus.main_reply_kb(m.from_user.id),
     )
 

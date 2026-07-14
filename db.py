@@ -11,7 +11,7 @@ from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 620
+SCHEMA_VERSION = 640
 
 _db_parent = Path(DB_PATH).expanduser().parent
 if str(_db_parent) not in ("", "."):
@@ -980,27 +980,66 @@ def set_setting(key, value):
     conn.commit()
 
 
-def create_topup(user_id, amount, target_quantity=None, target_plan_id=None, target_total=None, target_unit_price=None):
+def create_topup(
+    user_id,
+    amount,
+    target_quantity=None,
+    target_plan_id=None,
+    target_total=None,
+    target_unit_price=None,
+    request_key=None,
+):
     user = get_user(user_id)
     is_test = int(user["is_test"] or 0) if user and "is_test" in user.keys() else 0
-    cur.execute(
-        """
-        INSERT INTO topups(
-            user_id, amount, target_quantity, target_plan_id, target_total, target_unit_price, is_test
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(user_id),
-            int(amount),
-            int(target_quantity) if target_quantity is not None else None,
-            int(target_plan_id) if target_plan_id is not None else None,
-            int(target_total) if target_total is not None else None,
-            int(target_unit_price) if target_unit_price is not None else None,
-            is_test,
-        ),
-    )
-    conn.commit()
-    return cur.lastrowid
+    request_key = (request_key or "").strip()[:180] or None
+    with LOCK:
+        if request_key:
+            cur.execute(
+                """SELECT id,user_id,amount,target_quantity,target_plan_id,target_total,target_unit_price
+                   FROM topups WHERE request_key=?""",
+                (request_key,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                expected = (
+                    str(user_id),
+                    int(amount),
+                    int(target_quantity) if target_quantity is not None else None,
+                    int(target_plan_id) if target_plan_id is not None else None,
+                    int(target_total) if target_total is not None else None,
+                    int(target_unit_price) if target_unit_price is not None else None,
+                )
+                actual = (
+                    str(existing["user_id"]),
+                    int(existing["amount"]),
+                    existing["target_quantity"],
+                    existing["target_plan_id"],
+                    existing["target_total"],
+                    existing["target_unit_price"],
+                )
+                if actual != expected:
+                    raise ValueError("idempotency key conflicts with another top-up")
+                return int(existing["id"])
+        cur.execute(
+            """
+            INSERT INTO topups(
+                user_id, amount, target_quantity, target_plan_id, target_total,
+                target_unit_price, is_test, request_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(user_id),
+                int(amount),
+                int(target_quantity) if target_quantity is not None else None,
+                int(target_plan_id) if target_plan_id is not None else None,
+                int(target_total) if target_total is not None else None,
+                int(target_unit_price) if target_unit_price is not None else None,
+                is_test,
+                request_key,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
 
 
 def get_topup(topup_id):
@@ -2242,7 +2281,7 @@ def create_plan(data):
             1 if int(data.get("show_stock", 1) or 0) else 0,
             int(data.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
             (data.get("pre_purchase_text") or "").strip(), (data.get("post_purchase_text") or "").strip(),
-            "youpanel" if provider_key == "youpanel" else "pool",
+            "pool" if provider_key == "pool" else "youpanel",
             max(0, int(data.get("panel_data_limit_bytes") or 0)), max(0, int(data.get("panel_duration_days") or 0)),
             "active" if (data.get("panel_start_mode") or "on_hold") == "active" else "on_hold",
             (data.get("panel_reset_strategy") or "no_reset").strip() or "no_reset",
@@ -2299,7 +2338,7 @@ def update_plan(plan_id, data):
             1 if int(merged.get("show_stock") or 0) else 0,
             int(merged.get("low_stock_threshold") or get_setting_int("low_stock_threshold", 5)),
             (merged.get("pre_purchase_text") or "").strip(), (merged.get("post_purchase_text") or "").strip(),
-            "youpanel" if provider_key == "youpanel" else "pool",
+            "pool" if provider_key == "pool" else "youpanel",
             max(0, int(merged.get("panel_data_limit_bytes") or 0)), max(0, int(merged.get("panel_duration_days") or 0)),
             "active" if (merged.get("panel_start_mode") or "on_hold") == "active" else "on_hold",
             (merged.get("panel_reset_strategy") or "no_reset").strip() or "no_reset",
