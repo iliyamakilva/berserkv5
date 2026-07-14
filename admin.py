@@ -12,6 +12,8 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import backup
+import commerce
+import content
 import db
 import menus
 import messages
@@ -180,15 +182,18 @@ def admin_menu_kb():
 def admin_users_section_kb():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("👤 آخرین کاربران", callback_data="adm_users"),
+        InlineKeyboardButton("🧠 خلاصه هوشمند", callback_data="adm_users_insights"),
+        InlineKeyboardButton("🗂 دسته‌بندی کاربران", callback_data="adm_users_segments"),
+        InlineKeyboardButton("👥 فهرست کاربران", callback_data="adm_users"),
         InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="adm_search"),
+        InlineKeyboardButton("⚠️ نیازمند پیگیری", callback_data="adm_useg_attention_0"),
+        InlineKeyboardButton("💎 مشتریان ارزشمند", callback_data="adm_useg_valuable_0"),
         InlineKeyboardButton("💰 تغییر موجودی", callback_data="adm_addbal"),
         InlineKeyboardButton("⛔ بن کاربر", callback_data="adm_ban"),
         InlineKeyboardButton("✅ آن‌بن کاربر", callback_data="adm_unban"),
     )
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
-
 
 def admin_services_section_kb():
     kb = InlineKeyboardMarkup(row_width=2)
@@ -222,14 +227,217 @@ def admin_personalize_section_kb():
 
 
 def admin_reports_section_kb():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("📊 آمار و درآمد", callback_data="adm_stats"))
-    kb.add(InlineKeyboardButton("💹 گزارش فروش سریع", callback_data="adm_sales_report"))
-    kb.add(InlineKeyboardButton("🧾 لاگ عملیات ادمین", callback_data="adm_admin_logs"))
-    kb.add(InlineKeyboardButton("📢 پیام همگانی", callback_data="adm_broadcast"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("💰 فروش و درآمد", callback_data="adm_report_sales"),
+        InlineKeyboardButton("👥 کاربران", callback_data="adm_report_users"),
+        InlineKeyboardButton("📦 سرویس‌ها", callback_data="adm_report_services"),
+        InlineKeyboardButton("💳 پرداخت‌ها", callback_data="adm_report_payments"),
+        InlineKeyboardButton("🎫 پشتیبانی", callback_data="adm_report_support"),
+        InlineKeyboardButton("📈 قیف خرید", callback_data="adm_report_funnel"),
+    )
+    kb.add(InlineKeyboardButton("📢 پیام هدفمند و همگانی", callback_data="adm_broadcast"))
+    kb.add(
+        InlineKeyboardButton("🧾 رویدادهای مدیریتی", callback_data="adm_admin_logs"),
+        InlineKeyboardButton("📚 گزارش کامل قدیمی", callback_data="adm_stats"),
+    )
+    kb.add(InlineKeyboardButton("🔄 بروزرسانی داشبورد", callback_data="adm_section_reports"))
     kb.add(InlineKeyboardButton("⬅️ بازگشت به پنل مدیریت", callback_data="adm_back"))
     return kb
 
+USER_LIST_PAGE_SIZE = 6
+USER_SEGMENTS = {
+    "all": ("👥 همه کاربران", "همه حساب‌های ثبت‌شده"),
+    "new7": ("🆕 کاربران جدید", "عضویت در ۷ روز اخیر"),
+    "no_buy": ("🛒 عضو بدون خرید", "عضو شده اما خرید موفق ندارد"),
+    "has_sub": ("✅ دارای سرویس", "حداقل یک سرویس تحویل‌شده"),
+    "expiring3": ("⏳ نزدیک پایان", "اعتبار سرویس تا ۳ روز آینده تمام می‌شود"),
+    "low_volume20": ("📉 حجم رو به پایان", "حداقل ۸۰٪ حجم سرویس مصرف شده"),
+    "zero_usage7": ("🧩 سرویس بدون مصرف", "سرویس Provider بیش از ۷ روز بدون مصرف"),
+    "payment_problem30": ("💳 مشکل پرداخت", "پرداخت یا سفارش مسئله‌دار در ۳۰ روز اخیر"),
+    "inactive30_buyers": ("🌙 مشتری غیرفعال", "خریدار با بیش از ۳۰ روز عدم فعالیت"),
+    "returning": ("🔄 مشتری برگشتی", "حداقل دو خرید موفق"),
+    "valuable": ("💎 مشتری ارزشمند", "مجموع خرید موفق حداقل یک میلیون تومان"),
+    "open_ticket": ("🎫 تیکت باز", "دارای تیکت باز"),
+    "positive_balance_no_buy": ("💰 موجودی بدون خرید", "کیف پول مثبت اما بدون خرید موفق"),
+    "attention": ("⚠️ نیازمند پیگیری", "تیکت باز، مشکل سفارش یا سرویس نزدیک پایان"),
+    "banned": ("⛔ کاربران مسدود", "حساب‌های بن‌شده"),
+    "test": ("🧪 کاربران تست", "حساب‌های علامت‌گذاری‌شده به‌عنوان تست"),
+}
+
+BROADCASTABLE_USER_SEGMENTS = {
+    "all", "new7", "no_buy", "has_sub", "expiring3", "low_volume20",
+    "zero_usage7", "payment_problem30", "inactive30_buyers", "returning",
+    "valuable", "open_ticket", "positive_balance_no_buy",
+}
+
+
+def _fmt_bytes(value):
+    value = max(0, int(value or 0))
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{value} B"
+
+
+def _fmt_users_dashboard():
+    counts = db.user_segment_counts(("all", "buyers", "has_sub", "active7", "new7", "attention", "banned", "test"))
+    return (
+        "👥 مرکز مدیریت کاربران\n\n"
+        f"کل حساب‌ها: {counts.get('all', 0):,}\n"
+        f"کاربران واقعی: {db.count_real_users():,} | تست: {counts.get('test', 0):,}\n"
+        f"خریداران: {counts.get('buyers', 0):,} | دارای سرویس: {counts.get('has_sub', 0):,}\n"
+        f"فعال ۷ روز اخیر: {counts.get('active7', 0):,}\n"
+        f"عضو جدید ۷ روز اخیر: {counts.get('new7', 0):,}\n"
+        f"نیازمند پیگیری: {counts.get('attention', 0):,}\n"
+        f"مسدود: {counts.get('banned', 0):,}\n\n"
+        "برای تحلیل رفتار، «خلاصه هوشمند» و برای عملیات گروهی، «دسته‌بندی کاربران» را باز کنید."
+    )
+
+
+def user_segments_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    ordered = (
+        "new7", "no_buy", "has_sub", "expiring3", "low_volume20", "zero_usage7",
+        "payment_problem30", "inactive30_buyers", "returning", "valuable",
+        "open_ticket", "positive_balance_no_buy", "banned", "test",
+    )
+    for key in ordered:
+        title, _ = USER_SEGMENTS[key]
+        try:
+            count = db.count_user_segment(key)
+        except Exception:
+            count = "?"
+        kb.add(InlineKeyboardButton(f"{title} — {count}", callback_data=f"adm_useg_{key}_0"))
+    kb.add(InlineKeyboardButton("👥 همه کاربران", callback_data="adm_useg_all_0"))
+    kb.add(InlineKeyboardButton("⬅️ مرکز کاربران", callback_data="adm_section_users"))
+    return kb
+
+
+def _user_segment_page_kb(segment, page, rows, total):
+    kb = InlineKeyboardMarkup(row_width=1)
+    for index, row in enumerate(rows, start=page * USER_LIST_PAGE_SIZE + 1):
+        kb.add(InlineKeyboardButton(_user_button_label(row, index), callback_data=f"adm_user_{row['id']}"))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"adm_useg_{segment}_{page - 1}"))
+    if (page + 1) * USER_LIST_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"adm_useg_{segment}_{page + 1}"))
+    if nav:
+        kb.row(*nav)
+    if segment in BROADCASTABLE_USER_SEGMENTS and segment in BROADCAST_SCOPES:
+        kb.add(InlineKeyboardButton("📣 پیام به کاربران غیرمسدود گروه", callback_data=f"broadcast_scope_{segment}"))
+    kb.add(InlineKeyboardButton("🗂 دسته‌بندی‌ها", callback_data="adm_users_segments"))
+    kb.add(InlineKeyboardButton("⬅️ مرکز کاربران", callback_data="adm_section_users"))
+    return kb
+
+
+def _fmt_user_segment_page(segment, page, rows, total):
+    title, description = USER_SEGMENTS.get(segment, USER_SEGMENTS["all"])
+    pages = max(1, (total + USER_LIST_PAGE_SIZE - 1) // USER_LIST_PAGE_SIZE)
+    lines = [title, "", description, f"تعداد: {total:,} | صفحه {page + 1} از {pages}", ""]
+    if not rows:
+        lines.append("کاربری در این گروه پیدا نشد.")
+        return "\n".join(lines)
+    for index, row in enumerate(rows, start=page * USER_LIST_PAGE_SIZE + 1):
+        status = "⛔" if int(row["banned"] or 0) else "✅"
+        test_mark = " | 🧪 تست" if int(row["is_test"] or 0) else ""
+        lines.append(f"{index}. {status} {_display_username(row)} | ID: {row['id']}{test_mark}")
+        lines.append(
+            f"   خرید: {int(row['purchase_count'] or 0)} | سرویس: {int(row['delivered_count'] or 0)} | "
+            f"مبلغ: {_fmt_money(row['spent_total'])}"
+        )
+        if int(row["open_ticket_count"] or 0):
+            lines.append(f"   🎫 تیکت باز: {int(row['open_ticket_count'])}")
+        lines.append(f"   آخرین فعالیت: {_dual(row['last_active'])}")
+    return "\n".join(lines)
+
+
+def _fmt_user_insights(days=7):
+    data = db.user_insights(days)
+    suggestions = []
+    if data["new_without_buy"]:
+        suggestions.append(f"• برای {data['new_without_buy']} عضو جدید بدون خرید، راهنما یا پیشنهاد شروع ارسال شود.")
+    if data["payment_problems"]:
+        suggestions.append(f"• {data['payment_problems']} کاربر با مشکل پرداخت/سفارش نیاز به پیگیری دارند.")
+    if data["expiring3"]:
+        suggestions.append(f"• سرویس {data['expiring3']} کاربر تا ۳ روز آینده تمام می‌شود؛ پیام یادآوری مناسب است.")
+    if data["inactive30_buyers"]:
+        suggestions.append(f"• {data['inactive30_buyers']} مشتری قدیمی بیش از ۳۰ روز غیرفعال‌اند؛ کمپین بازگشت پیشنهاد می‌شود.")
+    if data["zero_usage7"]:
+        suggestions.append(f"• {data['zero_usage7']} کاربر سرویس گرفته‌اند اما مصرف ثبت نشده؛ احتمال مشکل اتصال را بررسی کنید.")
+    if not suggestions:
+        suggestions.append("• مورد فوری قابل‌توجهی شناسایی نشد.")
+    return (
+        f"🧠 خلاصه هوشمند کاربران — {data['days']} روز اخیر\n\n"
+        f"🆕 عضو جدید: {data['new_users']:,}\n"
+        f"🛒 خریدار از میان اعضای جدید: {data['new_buyers']:,}\n"
+        f"👤 عضو جدید بدون خرید: {data['new_without_buy']:,}\n"
+        f"📈 نرخ تبدیل عضو جدید به خریدار: {data['conversion_rate']}٪\n"
+        f"✨ اولین خرید در بازه: {data['first_buyers']:,}\n"
+        f"🔄 مشتری برگشتی در بازه: {data['returning_buyers']:,}\n"
+        f"💳 مشکل پرداخت/سفارش: {data['payment_problems']:,}\n"
+        f"⏳ نزدیک پایان سرویس: {data['expiring3']:,}\n"
+        f"🌙 مشتری غیرفعال قدیمی: {data['inactive30_buyers']:,}\n"
+        f"💎 مشتری ارزشمند: {data['valuable']:,}\n"
+        f"🎫 دارای تیکت باز: {data['open_ticket']:,}\n"
+        f"💰 موجودی مثبت بدون خرید: {data['positive_balance_no_buy']:,}\n\n"
+        "پیشنهادهای عملی:\n" + "\n".join(suggestions)
+    )
+
+
+def user_insights_kb(days=7):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.row(
+        InlineKeyboardButton("✅ ۷ روز" if days == 7 else "۷ روز", callback_data="adm_users_insights_7"),
+        InlineKeyboardButton("✅ ۳۰ روز" if days == 30 else "۳۰ روز", callback_data="adm_users_insights_30"),
+    )
+    kb.add(InlineKeyboardButton("🛒 مشاهده اعضای بدون خرید", callback_data="adm_useg_no_buy_0"))
+    kb.add(InlineKeyboardButton("💳 مشکلات پرداخت", callback_data="adm_useg_payment_problem30_0"))
+    kb.add(InlineKeyboardButton("⏳ نزدیک پایان سرویس", callback_data="adm_useg_expiring3_0"))
+    kb.add(InlineKeyboardButton("🌙 مشتریان غیرفعال", callback_data="adm_useg_inactive30_buyers_0"))
+    kb.add(InlineKeyboardButton("🧩 سرویس بدون مصرف", callback_data="adm_useg_zero_usage7_0"))
+    kb.add(InlineKeyboardButton("🔄 بروزرسانی خلاصه", callback_data="adm_users_insights"))
+    kb.add(InlineKeyboardButton("⬅️ مرکز کاربران", callback_data="adm_section_users"))
+    return kb
+
+
+def _reports_dashboard_text():
+    sales = commerce.sales_overview()
+    users = db.user_insights(7)
+    services = db.service_report_summary()
+    payments = db.payment_report_summary(7)
+    support = db.support_report_summary(7)
+    yesterday = db.yesterday_sales_total()
+    today = sales.get("today_revenue", 0)
+    if yesterday:
+        change = round((today - yesterday) * 100 / yesterday, 1)
+        change_text = f"{change:+g}٪ نسبت به دیروز"
+    else:
+        change_text = "مقایسه با دیروز در دسترس نیست"
+    problem_orders = sum(payments.get(f"purchase_{s}_count", 0) for s in ("retry", "admin_review", "failed"))
+    return (
+        "📊 داشبورد مدیریتی\n\n"
+        f"💰 فروش امروز: {_fmt_money(today)} ({change_text})\n"
+        f"🛒 سفارش موفق امروز: {sales.get('today_orders', 0):,}\n"
+        f"👤 کاربر جدید ۷ روز: {users['new_users']:,}\n"
+        f"📈 تبدیل عضو جدید به خریدار: {users['conversion_rate']}٪\n"
+        f"📦 کل سرویس‌های تحویل‌شده: {services['delivered']:,}\n"
+        f"⏳ کاربران نزدیک پایان: {services['expiring3_users']:,}\n"
+        f"❌ سفارش مسئله‌دار ۷ روز: {problem_orders:,}\n"
+        f"💳 شارژ در انتظار بررسی: {payments.get('topup_pending_review_count', 0):,}\n"
+        f"🎫 تیکت باز: {support['open']:,}\n\n"
+        "هر گزارش فقط اطلاعات قابل‌اقدام را نشان می‌دهد؛ جزئیات از دکمه‌های پایین در دسترس است."
+    )
+
+
+def reports_back_kb():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("⬅️ داشبورد گزارش‌ها", callback_data="adm_section_reports"))
+    return kb
 
 def _fmt_money(amount):
     return f"{int(amount or 0):,} تومان"
@@ -891,8 +1099,7 @@ async def cb_section_users(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
-    await _replace_callback_message(c, "👥 بخش کاربران\n\nجستجو، بن/آن‌بن، موجودی و جزئیات کاربران از این بخش مدیریت می‌شود.", reply_markup=admin_users_section_kb())
-
+    await _replace_callback_message(c, _fmt_users_dashboard(), reply_markup=admin_users_section_kb())
 
 async def cb_section_services(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
@@ -919,34 +1126,72 @@ async def cb_section_reports(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
     await c.answer()
-    await _replace_callback_message(c, "📊 گزارش‌ها و ارسال همگانی", reply_markup=admin_reports_section_kb())
-
+    await _replace_callback_message(c, _reports_dashboard_text(), reply_markup=admin_reports_section_kb())
 
 async def cb_users(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer()
-
     await c.answer()
-    rows = db.list_users_with_stats(limit=15)
+    total = db.count_user_segment("all")
+    rows = db.list_user_segment("all", offset=0, limit=USER_LIST_PAGE_SIZE)
+    await _replace_callback_message(
+        c,
+        _fmt_user_segment_page("all", 0, rows, total),
+        reply_markup=_user_segment_page_kb("all", 0, rows, total),
+        context="admin_users_list",
+        kind="list",
+    )
 
-    if not rows:
-        return await _replace_callback_message(c, "هیچ کاربری ثبت نشده.", reply_markup=admin_back_kb())
 
-    lines = ["👥 کاربران بر اساس زمان عضویت؛ از قدیمی‌ترین تا جدیدترین:\n"]
-    kb = InlineKeyboardMarkup(row_width=1)
+async def cb_user_insights(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    days = 7
+    if c.data.startswith("adm_users_insights_"):
+        try:
+            days = 30 if int(c.data.rsplit("_", 1)[1]) == 30 else 7
+        except (TypeError, ValueError):
+            days = 7
+    await _replace_callback_message(c, _fmt_user_insights(days), reply_markup=user_insights_kb(days), context="admin_user_insights", kind="list")
 
-    for index, r in enumerate(rows, start=1):
-        flag = "⛔" if r["banned"] else "✅"
-        username = _display_username(r)
-        delivered = int(r["delivered_count"] or 0)
-        test_mark = " | 🧪 تست" if "is_test" in r.keys() and int(r["is_test"] or 0) else ""
-        lines.append(
-            f"{index}. {flag} {r['id']} | {username}{test_mark} | خرید: {r['purchased']} | سرویس: {delivered} | موجودی: {_fmt_money(r['balance'])} | عضویت: {_dual(r['joined_at'])}"
-        )
-        kb.add(InlineKeyboardButton(_user_button_label(r, index), callback_data=f"adm_user_{r['id']}"))
 
-    kb.add(InlineKeyboardButton("⬅️ بازگشت به بخش کاربران", callback_data="adm_section_users"))
-    await _replace_callback_message(c, "\n".join(lines), reply_markup=kb)
+async def cb_user_segments(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    await _replace_callback_message(
+        c,
+        "🗂 دسته‌بندی کاربران\n\nگروه‌ها از داده واقعی خرید، سرویس، پرداخت، فعالیت و تیکت ساخته می‌شوند. هر گروه قابل مشاهده و گروه‌های مجاز قابل استفاده در پیام هدفمند هستند.",
+        reply_markup=user_segments_kb(),
+        context="admin_user_segments",
+        kind="menu",
+    )
+
+
+async def cb_user_segment_page(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    payload = c.data.replace("adm_useg_", "", 1)
+    try:
+        segment, page_text = payload.rsplit("_", 1)
+        page = max(0, int(page_text))
+    except (ValueError, TypeError):
+        return await c.answer("دسته‌بندی نامعتبر است.", show_alert=True)
+    if segment not in USER_SEGMENTS:
+        return await c.answer("دسته‌بندی پیدا نشد.", show_alert=True)
+    total = db.count_user_segment(segment)
+    max_page = max(0, (total - 1) // USER_LIST_PAGE_SIZE)
+    page = min(page, max_page)
+    rows = db.list_user_segment(segment, offset=page * USER_LIST_PAGE_SIZE, limit=USER_LIST_PAGE_SIZE)
+    await _replace_callback_message(
+        c,
+        _fmt_user_segment_page(segment, page, rows, total),
+        reply_markup=_user_segment_page_kb(segment, page, rows, total),
+        context=f"admin_user_segment_{segment}",
+        kind="list",
+    )
 
 
 async def cb_user_detail(c: types.CallbackQuery):
@@ -1946,11 +2191,174 @@ async def cb_stats(c: types.CallbackQuery):
     ]
     for row in db.recent_daily_stats(7):
         lines.append(f"{row['day']}: کاربر جدید {row['new_users']} | فروش {row['sales']} | رفرال {row['referral_rewards']:,}")
-    await _replace_callback_message(c, "\n".join(lines), reply_markup=admin_back_kb())
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=reports_back_kb())
 
 
 # -------------------- مدیریت پلن‌ها --------------------
 
+
+async def cb_report_sales(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    data = commerce.sales_overview()
+    plans = commerce.plan_performance(limit=5)
+    categories = commerce.category_performance(limit=5)
+    avg = int(data.get("month_revenue", 0) / data.get("month_orders", 1)) if data.get("month_orders") else 0
+    lines = [
+        "💰 گزارش فروش و درآمد",
+        "",
+        f"امروز: {_fmt_money(data.get('today_revenue'))} | {data.get('today_orders', 0)} سفارش",
+        f"۷ روز: {_fmt_money(data.get('week_revenue'))} | {data.get('week_orders', 0)} سفارش",
+        f"۳۰ روز: {_fmt_money(data.get('month_revenue'))} | {data.get('month_orders', 0)} سفارش",
+        f"میانگین سفارش ۳۰ روز: {_fmt_money(avg)}",
+        f"بازپرداخت کل: {data.get('refund_orders', 0)} سفارش | {_fmt_money(data.get('refund_amount'))}",
+        "",
+        "🏆 پلن‌های برتر:",
+    ]
+    if plans:
+        for i, row in enumerate(plans, start=1):
+            lines.append(f"{i}. {row['title']} | {int(row['orders'] or 0)} سفارش | {_fmt_money(row['revenue'])} | سود تقریبی {_fmt_money(row['estimated_profit'])}")
+    else:
+        lines.append("هنوز فروش موفقی ثبت نشده.")
+    if categories:
+        lines += ["", "📂 دسته‌های برتر:"]
+        for row in categories[:3]:
+            lines.append(f"• {row['emoji'] or '📦'} {row['title']} | {int(row['orders'] or 0)} سفارش | {_fmt_money(row['revenue'])}")
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=reports_back_kb(), context="report_sales", kind="list")
+
+
+async def cb_report_users(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    data = db.user_insights(30)
+    top = commerce.top_customers(limit=5)
+    lines = [
+        "👥 گزارش کاربران — ۳۰ روز اخیر",
+        "",
+        f"کل واقعی: {db.count_real_users():,}",
+        f"فعال ۷ روز: {db.count_user_segment('active7'):,}",
+        f"عضو جدید: {data['new_users']:,}",
+        f"عضو جدید خریدار: {data['new_buyers']:,}",
+        f"نرخ تبدیل: {data['conversion_rate']}٪",
+        f"اولین خرید: {data['first_buyers']:,}",
+        f"مشتری برگشتی: {data['returning_buyers']:,}",
+        f"غیرفعال قدیمی: {data['inactive30_buyers']:,}",
+        f"نیازمند پیگیری: {db.count_user_segment('attention'):,}",
+        "",
+        "💎 مشتریان برتر:",
+    ]
+    if top:
+        for i, row in enumerate(top, start=1):
+            name = f"@{row['username']}" if row['username'] else (row['display_name'] or row['id'])
+            lines.append(f"{i}. {name} | {int(row['orders'] or 0)} خرید | {_fmt_money(row['spent'])}")
+    else:
+        lines.append("هنوز مشتری خریدار ثبت نشده.")
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🗂 بازکردن دسته‌بندی کاربران", callback_data="adm_users_segments"))
+    kb.add(InlineKeyboardButton("⬅️ داشبورد گزارش‌ها", callback_data="adm_section_reports"))
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=kb, context="report_users", kind="list")
+
+
+async def cb_report_services(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    data = db.service_report_summary()
+    inventory = commerce.inventory_report()
+    usage_pct = round(data['total_used'] * 100 / data['total_limit'], 1) if data['total_limit'] else 0.0
+    lines = [
+        "📦 گزارش سرویس‌ها",
+        "",
+        f"تحویل‌شده: {data['delivered']:,}",
+        f"استخری: {data['pool']:,} | Provider: {data['provider']:,}",
+        f"موجودی استخر: {data['stock']:,}",
+        f"منقضی‌شده Provider: {data['expired']:,}",
+        f"نزدیک پایان: {data['expiring3_users']:,} کاربر",
+        f"حجم رو به پایان: {data['low_volume_users']:,} کاربر",
+        f"بدون مصرف ۷ روزه: {data['zero_usage_users']:,} کاربر",
+        f"مصرف ثبت‌شده Provider: {_fmt_bytes(data['total_used'])} از {_fmt_bytes(data['total_limit'])} ({usage_pct}٪)",
+        "",
+        "🏷 وضعیت پلن‌ها:",
+    ]
+    for row in inventory[:8]:
+        lines.append(f"• {row['title']} | موجودی {int(row['pool_stock'] or 0)} | استخری فروخته {int(row['pool_sold'] or 0)} | Provider {int(row['provider_services'] or 0)}")
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("⏳ کاربران نزدیک پایان", callback_data="adm_useg_expiring3_0"))
+    kb.add(InlineKeyboardButton("📉 حجم رو به پایان", callback_data="adm_useg_low_volume20_0"))
+    kb.add(InlineKeyboardButton("🧩 سرویس بدون مصرف", callback_data="adm_useg_zero_usage7_0"))
+    kb.add(InlineKeyboardButton("⬅️ داشبورد گزارش‌ها", callback_data="adm_section_reports"))
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=kb, context="report_services", kind="list")
+
+
+async def cb_report_payments(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    data = db.payment_report_summary(30)
+    issue_count = sum(data.get(f"purchase_{s}_count", 0) for s in ("retry", "admin_review", "failed", "refunded"))
+    issue_amount = sum(data.get(f"purchase_{s}_amount", 0) for s in ("retry", "admin_review", "failed", "refunded"))
+    text = (
+        "💳 گزارش پرداخت‌ها — ۳۰ روز اخیر\n\n"
+        f"شارژ تأییدشده: {data['topup_approved_count']:,} | {_fmt_money(data['topup_approved_amount'])}\n"
+        f"در انتظار بررسی: {data['topup_pending_review_count']:,} | {_fmt_money(data['topup_pending_review_amount'])}\n"
+        f"رسید ارسال‌نشده: {data['topup_awaiting_receipt_count']:,}\n"
+        f"ردشده: {data['topup_rejected_count']:,} | {_fmt_money(data['topup_rejected_amount'])}\n\n"
+        f"سفارش موفق: {data['purchase_completed_count']:,} | {_fmt_money(data['purchase_completed_amount'])}\n"
+        f"در حال ساخت/Retry: {data['purchase_provisioning_count'] + data['purchase_retry_count']:,}\n"
+        f"نیازمند بررسی ادمین: {data['purchase_admin_review_count']:,}\n"
+        f"ناموفق/Refund: {data['purchase_failed_count'] + data['purchase_refunded_count']:,}\n"
+        f"کل سفارش‌های مسئله‌دار: {issue_count:,} | {_fmt_money(issue_amount)}"
+    )
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("💳 کاربران دارای مشکل پرداخت", callback_data="adm_useg_payment_problem30_0"))
+    kb.add(InlineKeyboardButton("🧾 شارژهای در انتظار", callback_data="adm_topups"))
+    kb.add(InlineKeyboardButton("⬅️ داشبورد گزارش‌ها", callback_data="adm_section_reports"))
+    await _replace_callback_message(c, text, reply_markup=kb, context="report_payments", kind="list")
+
+
+async def cb_report_support(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    data = db.support_report_summary(30)
+    text = (
+        "🎫 گزارش پشتیبانی — ۳۰ روز اخیر\n\n"
+        f"تیکت جدید: {data['new']:,}\n"
+        f"تیکت باز فعلی: {data['open']:,}\n"
+        f"بسته‌شده در بازه: {data['closed']:,}\n"
+        f"کاربران دارای تیکت باز: {data['users_with_open']:,}\n"
+        f"کاربران با چند تیکت در بازه: {data['repeat_users']:,}\n\n"
+        "برای جلوگیری از شلوغی، متن کامل تیکت‌ها در این گزارش نمایش داده نمی‌شود؛ از بخش تیکت‌ها یا فهرست کاربران وارد جزئیات شوید."
+    )
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("👥 کاربران دارای تیکت باز", callback_data="adm_useg_open_ticket_0"))
+    kb.add(InlineKeyboardButton("⬅️ داشبورد گزارش‌ها", callback_data="adm_section_reports"))
+    await _replace_callback_message(c, text, reply_markup=kb, context="report_support", kind="list")
+
+
+async def cb_report_funnel(c: types.CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer()
+    await c.answer()
+    rows = content.funnel_report(30)
+    labels = {
+        "buy_open": "ورود به خرید", "category_view": "مشاهده دسته", "plan_checkout": "ورود به پرداخت",
+        "payment_started": "شروع پرداخت", "payment_success": "پرداخت موفق", "purchase_delivered": "تحویل سرویس",
+    }
+    lines = ["📈 قیف خرید — ۳۰ روز اخیر", ""]
+    previous = None
+    for event, count in rows:
+        rate = round(count * 100 / previous, 1) if previous else 100.0 if count else 0.0
+        suffix = "" if previous is None else f" | عبور از مرحله قبل: {rate}٪"
+        lines.append(f"• {labels.get(event, event)}: {count:,}{suffix}")
+        previous = count
+    if rows and rows[0][1]:
+        total_rate = round(rows[-1][1] * 100 / rows[0][1], 1)
+        lines += ["", f"تبدیل نهایی ورود به خرید تا تحویل: {total_rate}٪"]
+    lines += ["", "افت شدید بین دو مرحله، محل مناسب برای اصلاح متن، دکمه یا فرایند پرداخت است."]
+    await _replace_callback_message(c, "\n".join(lines), reply_markup=reports_back_kb(), context="report_funnel", kind="list")
 
 async def cb_sales_report(c: types.CallbackQuery):
     if not is_admin(c.from_user.id):
@@ -4341,8 +4749,18 @@ BROADCAST_SCOPES = {
     "no_buy": "کاربران عضو ولی بدون خرید",
     "has_sub": "کاربران دارای سرویس تحویل‌شده",
     "no_sub": "کاربران بدون سرویس تحویل‌شده",
+    "new7": "اعضای جدید ۷ روز اخیر",
     "active7": "فعال‌های ۷ روز اخیر",
     "inactive7": "غیرفعال‌های ۷ روز اخیر",
+    "inactive30_buyers": "مشتریان قدیمی غیرفعال",
+    "payment_problem30": "دارای مشکل پرداخت یا سفارش",
+    "expiring3": "سرویس نزدیک پایان تا ۳ روز",
+    "low_volume20": "حجم سرویس رو به پایان",
+    "zero_usage7": "سرویس بدون مصرف ثبت‌شده",
+    "valuable": "مشتریان ارزشمند",
+    "returning": "مشتریان برگشتی",
+    "open_ticket": "کاربران دارای تیکت باز",
+    "positive_balance_no_buy": "موجودی مثبت بدون خرید",
     "positive_balance": "کاربران با موجودی مثبت",
     "low_balance": "موجودی مثبت ولی کمتر از قیمت پلن",
     "referred": "کاربران دعوت‌شده توسط رفرال",
@@ -4358,7 +4776,7 @@ def broadcast_scope_menu_kb():
         except Exception:
             count = "?"
         kb.add(InlineKeyboardButton(f"{label} ({count})", callback_data=f"broadcast_scope_{scope}"))
-    kb.add(InlineKeyboardButton("⬅️ بازگشت", callback_data="adm_back"))
+    kb.add(InlineKeyboardButton("⬅️ بازگشت به گزارش‌ها", callback_data="adm_section_reports"))
     return kb
 
 
@@ -4410,7 +4828,7 @@ async def cb_broadcast_scope(c: types.CallbackQuery, state: FSMContext):
     scope = c.data.split("broadcast_scope_", 1)[1]
 
     if scope not in BROADCAST_SCOPES:
-        return await _replace_callback_message(c, "جامعه هدف نامعتبر است.", reply_markup=admin_back_kb())
+        return await _replace_callback_message(c, "جامعه هدف نامعتبر است.", reply_markup=reports_back_kb())
 
     total = db.count_broadcast_targets(scope)
     await state.update_data(scope=scope)
@@ -4473,7 +4891,7 @@ async def cb_broadcast_cancel(c: types.CallbackQuery, state: FSMContext):
         return await c.answer()
     await c.answer("لغو شد")
     await state.finish()
-    await c.message.answer("❌ ارسال پیام همگانی لغو شد.", reply_markup=admin_back_kb())
+    await c.message.answer("❌ ارسال پیام همگانی لغو شد.", reply_markup=reports_back_kb())
 
 
 async def cb_broadcast_confirm(c: types.CallbackQuery, state: FSMContext):
@@ -4486,13 +4904,13 @@ async def cb_broadcast_confirm(c: types.CallbackQuery, state: FSMContext):
     content_type = data.get("content_type")
     if scope not in BROADCAST_SCOPES or content_type not in {"text", "photo", "document"}:
         await state.finish()
-        return await c.message.answer("اطلاعات ارسال کامل نیست. دوباره شروع کنید.", reply_markup=admin_back_kb())
+        return await c.message.answer("اطلاعات ارسال کامل نیست. دوباره شروع کنید.", reply_markup=reports_back_kb())
 
     targets = db.list_broadcast_targets(scope)
     total = len(targets)
     if total == 0:
         await state.finish()
-        return await c.message.answer("هیچ مخاطبی برای این جامعه هدف وجود ندارد.", reply_markup=admin_back_kb())
+        return await c.message.answer("هیچ مخاطبی برای این جامعه هدف وجود ندارد.", reply_markup=reports_back_kb())
 
     progress = await c.message.answer(f"🚀 ارسال پیام همگانی شروع شد...\nمخاطب‌ها: {total}")
     success = 0
@@ -4527,7 +4945,7 @@ async def cb_broadcast_confirm(c: types.CallbackQuery, state: FSMContext):
         f"کل مخاطب: {total}\n"
         f"موفق: {success}\n"
         f"ناموفق: {failed}",
-        reply_markup=admin_back_kb(),
+        reply_markup=reports_back_kb(),
     )
 
 
@@ -4663,6 +5081,9 @@ def register(dp):
     dp.register_callback_query_handler(cb_fsm_back, lambda c: c.data == "fsm_back", state="*")
 
     dp.register_callback_query_handler(cb_users, lambda c: c.data == "adm_users")
+    dp.register_callback_query_handler(cb_user_insights, lambda c: c.data == "adm_users_insights" or c.data.startswith("adm_users_insights_"))
+    dp.register_callback_query_handler(cb_user_segments, lambda c: c.data == "adm_users_segments")
+    dp.register_callback_query_handler(cb_user_segment_page, lambda c: c.data.startswith("adm_useg_"))
     dp.register_callback_query_handler(cb_user_profile_info, lambda c: c.data.startswith("adm_user_profile_"))
     dp.register_callback_query_handler(cb_user_history, lambda c: c.data.startswith("adm_user_history_"))
     dp.register_callback_query_handler(cb_user_purchase_detail, lambda c: c.data.startswith("adm_user_purchase_"))
@@ -4714,7 +5135,14 @@ def register(dp):
     dp.register_message_handler(process_addsub, content_types=types.ContentTypes.ANY, state=AdminStates.waiting_add_sub)
 
     dp.register_callback_query_handler(cb_topups, lambda c: c.data == "adm_topups")
+    dp.register_callback_query_handler(cb_report_sales, lambda c: c.data == "adm_report_sales")
+    dp.register_callback_query_handler(cb_report_users, lambda c: c.data == "adm_report_users")
+    dp.register_callback_query_handler(cb_report_services, lambda c: c.data == "adm_report_services")
+    dp.register_callback_query_handler(cb_report_payments, lambda c: c.data == "adm_report_payments")
+    dp.register_callback_query_handler(cb_report_support, lambda c: c.data == "adm_report_support")
+    dp.register_callback_query_handler(cb_report_funnel, lambda c: c.data == "adm_report_funnel")
     dp.register_callback_query_handler(cb_stats, lambda c: c.data == "adm_stats")
+    dp.register_callback_query_handler(cb_sales_report, lambda c: c.data == "adm_sales_report")
     dp.register_callback_query_handler(cb_admin_logs, lambda c: c.data == "adm_admin_logs")
 
     dp.register_callback_query_handler(cb_categories, lambda c: c.data == "adm_categories")
