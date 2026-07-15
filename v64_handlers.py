@@ -93,6 +93,7 @@ async def _replace(c: types.CallbackQuery, text: str, reply_markup=None, parse_m
 
 def _home_kb():
     kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🎨 قالب‌های آماده پلن", callback_data="ct_pack_home"))
     for key, label in content.categories():
         kb.add(types.InlineKeyboardButton(label, callback_data=f"ct_cat_{key}"))
     kb.add(types.InlineKeyboardButton("⚙️ تنظیمات نمایش اطلاعات", callback_data="ct_display"))
@@ -212,6 +213,110 @@ async def cb_content_home(c: types.CallbackQuery):
         "منطق خرید، پرداخت و Callbackها از متن جداست؛ بنابراین تغییر نوشته‌ها اکشن تکراری نمی‌سازد.",
         _home_kb(),
     )
+
+
+def _pack_list_kb():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for key, title, _description in content.list_plan_template_packs():
+        kb.add(types.InlineKeyboardButton(title, callback_data=f"ct_pack_show_{key}"))
+    kb.add(types.InlineKeyboardButton("⬅️ مرکز محتوا", callback_data="adm_content"))
+    return kb
+
+
+def _pack_detail_kb(pack_key: str):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("👁 پیش‌نمایش کامل", callback_data=f"ct_pack_preview_{pack_key}"))
+    kb.add(types.InlineKeyboardButton("🌐 اعمال عمومی به‌صورت Draft", callback_data=f"ct_pack_do_{pack_key}_g_0"))
+    kb.add(types.InlineKeyboardButton("🗂 اعمال Draft روی یک دسته", callback_data=f"ct_pack_cats_{pack_key}"))
+    kb.add(types.InlineKeyboardButton("🏷 اعمال Draft روی یک پلن", callback_data=f"ct_pack_plans_{pack_key}"))
+    kb.add(types.InlineKeyboardButton("⬅️ قالب‌های آماده", callback_data="ct_pack_home"))
+    return kb
+
+
+def _pack_scope_rows(pack_key: str, scope_type: str):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if scope_type == content.SCOPE_CATEGORY:
+        for row in db.list_plan_categories(active_only=False, include_empty=True, limit=50):
+            kb.add(types.InlineKeyboardButton(f"{row['emoji'] or '📦'} {row['title']}", callback_data=f"ct_pack_do_{pack_key}_c_{row['id']}"))
+    else:
+        for row in db.list_plans(active_only=False, limit=50):
+            kb.add(types.InlineKeyboardButton(f"🏷 {row['title']}", callback_data=f"ct_pack_do_{pack_key}_p_{row['id']}"))
+    kb.add(types.InlineKeyboardButton("⬅️ بازگشت به قالب", callback_data=f"ct_pack_show_{pack_key}"))
+    return kb
+
+
+def _pack_result_kb(pack_key: str, scope_type: str, scope_id: int, slot_keys: list[str]):
+    ch = _scope_char(scope_type)
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for slot_key in slot_keys:
+        idx = _idx_from_key(slot_key)
+        kb.add(types.InlineKeyboardButton(f"✏️ بررسی و ویرایش: {_item(idx).title}", callback_data=f"ct_d_{idx}_{ch}_{scope_id}"))
+    kb.add(types.InlineKeyboardButton("👁 پیش‌نمایش قالب آماده", callback_data=f"ct_pack_preview_{pack_key}"))
+    kb.add(types.InlineKeyboardButton("⬅️ قالب‌های آماده", callback_data="ct_pack_home"))
+    return kb
+
+
+async def cb_pack_home(c: types.CallbackQuery):
+    await c.answer()
+    await _replace(c, "🎨 قالب‌های آماده پلن\n\nیک سبک آماده را انتخاب کنید تا متن دکمه بسته، صفحه تأیید خرید، پیام خرید موفق و تحویل سرویس با یک لحن هماهنگ ساخته شوند.\n\n🔒 اعمال قالب فقط Draft می‌سازد؛ متن فعلی مشتری تغییر نمی‌کند تا هر بخش را بررسی و منتشر کنید.", _pack_list_kb())
+
+
+async def cb_pack_show(c: types.CallbackQuery):
+    pack_key = c.data.split("ct_pack_show_", 1)[1]
+    try:
+        pack = content.get_plan_template_pack(pack_key)
+    except Exception as exc:
+        return await c.answer(str(exc), show_alert=True)
+    await c.answer()
+    await _replace(c, f"{pack['title']}\n\n{pack['description']}\n\nاین مجموعه چهار بخش واقعی مسیر مشتری را آماده می‌کند:\n• متن دکمه بسته\n• صفحه تأیید خرید\n• پیام خرید موفق\n• پیام تحویل سرویس\n\nپس از اعمال، هر چهار مورد به‌صورت Draft قابل ویرایش، پیش‌نمایش، انتشار و بازگردانی هستند.", _pack_detail_kb(pack_key))
+
+
+async def cb_pack_preview(c: types.CallbackQuery):
+    pack_key = c.data.split("ct_pack_preview_", 1)[1]
+    try:
+        pack = content.get_plan_template_pack(pack_key)
+        rows = content.preview_plan_template_pack(pack_key)
+    except Exception as exc:
+        return await c.answer(str(exc), show_alert=True)
+    await c.answer()
+    lines = [f"👁 پیش‌نمایش {pack['title']}", ""]
+    for index, row in enumerate(rows, start=1):
+        lines.extend([f"{index}️⃣ {row['title']}", row["text"], "────────────"])
+    await c.message.answer("\n".join(lines).rstrip("─\n ")[:4096])
+
+
+async def cb_pack_categories(c: types.CallbackQuery):
+    pack_key = c.data.split("ct_pack_cats_", 1)[1]
+    try:
+        content.get_plan_template_pack(pack_key)
+    except Exception as exc:
+        return await c.answer(str(exc), show_alert=True)
+    await c.answer()
+    await _replace(c, "🗂 دسته‌ای را انتخاب کنید. چهار متن به‌صورت Draft روی همان دسته ذخیره می‌شوند:", _pack_scope_rows(pack_key, content.SCOPE_CATEGORY))
+
+
+async def cb_pack_plans(c: types.CallbackQuery):
+    pack_key = c.data.split("ct_pack_plans_", 1)[1]
+    try:
+        content.get_plan_template_pack(pack_key)
+    except Exception as exc:
+        return await c.answer(str(exc), show_alert=True)
+    await c.answer()
+    await _replace(c, "🏷 پلنی را انتخاب کنید. چهار متن به‌صورت Draft فقط روی همان پلن ذخیره می‌شوند:", _pack_scope_rows(pack_key, content.SCOPE_PLAN))
+
+
+async def cb_pack_apply(c: types.CallbackQuery):
+    try:
+        payload = c.data.split("ct_pack_do_", 1)[1]
+        pack_key, ch, scope_id_text = payload.rsplit("_", 2)
+        scope_type, scope_id = _scope(ch, int(scope_id_text))
+        pack = content.get_plan_template_pack(pack_key)
+        slot_keys = content.apply_plan_template_pack(pack_key, scope_type, scope_id, admin_id=c.from_user.id)
+    except Exception as exc:
+        return await c.answer(str(exc), show_alert=True)
+    db.log_admin_action(c.from_user.id, "content_apply_plan_pack", details=f"pack={pack_key};scope={scope_type}:{scope_id};slots={','.join(slot_keys)}")
+    await c.answer("قالب به‌صورت Draft ذخیره شد")
+    await _replace(c, f"✅ {pack['title']} به‌صورت Draft اعمال شد\n\n📍 دامنه: {_scope_label(scope_type, scope_id)}\nمتن منتشرشده مشتری هنوز تغییر نکرده است. هر بخش را از دکمه‌های زیر بررسی، ویرایش و سپس منتشر کنید.\n\nبرای لغو کامل، وارد هر بخش شوید و «حذف Draft» را بزنید؛ برای بازگشت متن منتشرشده نیز تاریخچه و بازگردانی در دسترس است.", _pack_result_kb(pack_key, scope_type, scope_id, slot_keys))
 
 
 async def cb_content_category(c: types.CallbackQuery):
@@ -572,6 +677,12 @@ def register(dp):
     # Legacy content entry callbacks are intentionally redirected to one center,
     # so no parallel message/template menus remain.
     dp.register_callback_query_handler(cb_content_home, lambda c: _allowed(c, c.data in {"adm_content", "adm_messages", "adm_plan_templates"}), state="*")
+    dp.register_callback_query_handler(cb_pack_home, lambda c: _allowed(c, c.data == "ct_pack_home"), state="*")
+    dp.register_callback_query_handler(cb_pack_show, lambda c: _allowed(c, c.data.startswith("ct_pack_show_")), state="*")
+    dp.register_callback_query_handler(cb_pack_preview, lambda c: _allowed(c, c.data.startswith("ct_pack_preview_")), state="*")
+    dp.register_callback_query_handler(cb_pack_categories, lambda c: _allowed(c, c.data.startswith("ct_pack_cats_")), state="*")
+    dp.register_callback_query_handler(cb_pack_plans, lambda c: _allowed(c, c.data.startswith("ct_pack_plans_")), state="*")
+    dp.register_callback_query_handler(cb_pack_apply, lambda c: _allowed(c, c.data.startswith("ct_pack_do_")), state="*")
     dp.register_callback_query_handler(cb_content_category, lambda c: _allowed(c, c.data.startswith("ct_cat_")), state="*")
     dp.register_callback_query_handler(cb_content_detail, lambda c: _allowed(c, c.data.startswith("ct_d_")), state="*")
     dp.register_callback_query_handler(cb_scope_select, lambda c: _allowed(c, c.data.startswith("ct_sc_")), state="*")

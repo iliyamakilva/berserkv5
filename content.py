@@ -190,6 +190,126 @@ CATEGORIES = {
     "guide": "📚 آموزش اتصال",
 }
 
+
+# Ready-made packs target the real v6.4 customer slots. Applying a pack only
+# creates Drafts; published customer text remains untouched until review.
+PLAN_TEMPLATE_PACK_SLOTS = ("package_button", "checkout", "purchase_success", "service_delivery")
+PLAN_TEMPLATE_PACKS = {
+    "professional": {
+        "title": "✨ حرفه‌ای",
+        "description": "متعادل، کامل و مناسب استفاده عمومی فروشگاه.",
+        "slots": {
+            "package_button": "✨ {title} | {volume} | {price}",
+            "checkout": "✨ انتخاب حرفه‌ای شما\n\n📦 بسته: {package_title}\n📊 حجم: {volume}\n⏳ مدت: {duration}\n{devices_line}\n\n💰 مبلغ نهایی: {price}\n{wallet_balance_line}\n{discount_line}\n{plan_description}\n{pre_purchase_text}\n\n{checkout_hint}",
+            "purchase_success": "✅ خرید شما با موفقیت نهایی شد\n\n🧾 سفارش: #{order_id}\n💎 پلن: {plan_title}\n🔢 تعداد: {quantity}\n💰 مبلغ پرداخت‌شده: {total}\n👛 موجودی جدید: {balance_after}\n{test_notice}\n{post_purchase_text}\n\nاطلاعات اتصال تا چند لحظه دیگر ارسال می‌شود 🚀",
+            "service_delivery": "🎉 سرویس شما آماده است\n\n🧾 سفارش: #{order_id}\n💎 پلن: {plan_title}\n👤 شناسه: {username}\n📦 حجم: {volume}\n⏳ مدت: {duration}\n📱 دستگاه: {devices}\n📅 انقضا: {expire_date}\n\n🔗 لینک اختصاصی:\n{subscription_url}\n\n⚠️ این لینک شخصی است؛ آن را با دیگران به اشتراک نگذارید.",
+        },
+    },
+    "minimal": {
+        "title": "🤍 مینیمال",
+        "description": "کوتاه، خلوت و سریع برای مشتریانی که متن ساده می‌پسندند.",
+        "slots": {
+            "package_button": "{volume} | {duration} | {price}",
+            "checkout": "🛒 {package_title}\n\n📦 {volume}\n⏳ {duration}\n💰 {price}\n{discount_line}\n\n{checkout_hint}",
+            "purchase_success": "✅ خرید انجام شد\n\nسفارش #{order_id}\nپلن: {plan_title}\nمبلغ: {total}\n\nاطلاعات سرویس در پیام بعدی ارسال می‌شود.",
+            "service_delivery": "✅ سرویس آماده است\n\n{plan_title}\nشناسه: {username}\nانقضا: {expire_date}\n\n{subscription_url}",
+        },
+    },
+    "vip": {
+        "title": "💎 VIP",
+        "description": "لحن پریمیوم و ویژه برای سرویس‌های VIP و حرفه‌ای.",
+        "slots": {
+            "package_button": "💎 {volume} | {duration} | {price}",
+            "checkout": "💎 انتخاب ویژه VIP\n\n🚀 بسته: {package_title}\n📦 حجم: {volume}\n⏳ اعتبار: {duration}\n{devices_line}\n\n💰 مبلغ: {price}\n{wallet_balance_line}\n{discount_line}\n{plan_description}\n\n✨ پس از پرداخت، سرویس اختصاصی شما آماده می‌شود.\n{checkout_hint}",
+            "purchase_success": "💎 خرید VIP شما ثبت شد\n\n🧾 سفارش: #{order_id}\n🚀 پلن: {plan_title}\n💰 پرداخت موفق: {total}\n👛 موجودی جدید: {balance_after}\n{post_purchase_text}\n\nسرویس اختصاصی شما در حال تحویل است ✨",
+            "service_delivery": "💎 سرویس VIP شما آماده است\n\n🧾 سفارش: #{order_id}\n🚀 پلن: {plan_title}\n👤 شناسه اختصاصی: {username}\n📦 حجم: {volume}\n⏳ مدت: {duration}\n📅 انقضا: {expire_date}\n\n🔗 لینک اتصال اختصاصی:\n{subscription_url}\n\n🔐 برای حفظ کیفیت سرویس، لینک را فقط روی دستگاه‌های خودتان استفاده کنید.",
+        },
+    },
+    "economy": {
+        "title": "🌱 اقتصادی",
+        "description": "صمیمی و مقرون‌به‌صرفه برای بسته‌های اقتصادی.",
+        "slots": {
+            "package_button": "🌱 {volume} | {duration} | {price}",
+            "checkout": "🌱 خرید اقتصادی و به‌صرفه\n\n📦 بسته: {package_title}\n📊 حجم: {volume}\n⏳ مدت: {duration}\n\n💰 مبلغ: {price}\n{wallet_balance_line}\n{discount_line}\n{plan_description}\n\n✅ انتخاب مناسب برای استفاده روزمره\n{checkout_hint}",
+            "purchase_success": "✅ خرید اقتصادی شما انجام شد\n\n🧾 سفارش: #{order_id}\n🌱 پلن: {plan_title}\n💰 مبلغ پرداخت‌شده: {total}\n👛 موجودی جدید: {balance_after}\n\nسرویس تا چند لحظه دیگر ارسال می‌شود.",
+            "service_delivery": "🌱 سرویس شما آماده است\n\n🧾 سفارش: #{order_id}\n📦 پلن: {plan_title}\n👤 شناسه: {username}\n📊 حجم: {volume}\n⏳ مدت: {duration}\n📅 انقضا: {expire_date}\n\n🔗 لینک اتصال:\n{subscription_url}\n\n✅ برای اتصال بهتر، ساب‌لینک را در برنامه بروزرسانی کنید.",
+        },
+    },
+    "technical": {
+        "title": "🧩 فنی",
+        "description": "منظم و اطلاعات‌محور برای مشتریان حرفه‌ای‌تر.",
+        "slots": {
+            "package_button": "🧩 {title} | {volume} | {duration} | {price}",
+            "checkout": "🧩 مشخصات فنی سفارش\n\nPlan: {package_title}\nTraffic: {volume}\nDuration: {duration}\n{devices_line}\nPrice: {price}\n{discount_line}\n{plan_description}\n{pre_purchase_text}\n\n{checkout_hint}",
+            "purchase_success": "✅ تراکنش موفق\n\nOrder ID: #{order_id}\nPlan: {plan_title}\nQuantity: {quantity}\nPaid: {total}\nBalance: {balance_after}\n\nProvisioning completed; connection data follows.",
+            "service_delivery": "🧩 مشخصات سرویس\n\nOrder: #{order_id}\nPlan: {plan_title}\nUsername: {username}\nTraffic: {volume}\nDuration: {duration}\nDevices: {devices}\nExpires: {expire_date}\n\nSubscription URL:\n{subscription_url}",
+        },
+    },
+    "sales": {
+        "title": "🔥 فروش‌محور",
+        "description": "انرژی بیشتر و دعوت واضح به خرید، بدون شلوغی اضافی.",
+        "slots": {
+            "package_button": "🔥 {title} | فقط {price}",
+            "checkout": "🔥 این بسته را از دست ندهید\n\n✅ {package_title}\n📦 {volume} حجم\n⏳ {duration} اعتبار\n{devices_line}\n\n💰 فقط {price}\n{discount_line}\n{plan_description}\n\n🚀 تحویل سریع پس از پرداخت\n{checkout_hint}",
+            "purchase_success": "🎉 انتخاب عالی بود؛ خرید شما انجام شد\n\n🧾 سفارش: #{order_id}\n🔥 پلن: {plan_title}\n💰 پرداخت‌شده: {total}\n{post_purchase_text}\n\nاطلاعات اتصال همین حالا برایتان ارسال می‌شود 🚀",
+            "service_delivery": "🚀 سرویس شما آماده استفاده است\n\n🔥 پلن: {plan_title}\n📦 حجم: {volume}\n⏳ مدت: {duration}\n📅 انقضا: {expire_date}\n\n🔗 لینک اختصاصی شما:\n{subscription_url}\n\n✅ لینک را به برنامه اضافه کنید و از اتصال سریع لذت ببرید.",
+        },
+    },
+    "trial": {
+        "title": "🧪 تست رایگان",
+        "description": "متن مناسب بسته‌های تست و سرویس‌های آزمایشی.",
+        "slots": {
+            "package_button": "🧪 تست {volume} | {duration} | {price}",
+            "checkout": "🧪 دریافت سرویس آزمایشی\n\n📦 بسته: {package_title}\n📊 حجم تست: {volume}\n⏳ اعتبار: {duration}\n\n💰 هزینه: {price}\n{plan_description}\n\nاین سرویس برای بررسی کیفیت اتصال ارائه می‌شود.\n{checkout_hint}",
+            "purchase_success": "🧪 درخواست تست شما ثبت شد\n\n🧾 سفارش: #{order_id}\n📦 سرویس: {plan_title}\n💰 مبلغ: {total}\n\nاطلاعات تست در پیام بعدی ارسال می‌شود.",
+            "service_delivery": "🧪 اکانت تست شما آماده است\n\n👤 شناسه: {username}\n📦 حجم: {volume}\n⏳ اعتبار: {duration}\n📅 انقضا: {expire_date}\n\n🔗 لینک تست:\n{subscription_url}\n\n⚠️ هر کاربر فقط طبق قوانین فروشگاه امکان دریافت تست دارد.",
+        },
+    },
+}
+
+
+def list_plan_template_packs() -> list[tuple[str, str, str]]:
+    return [(key, value["title"], value["description"]) for key, value in PLAN_TEMPLATE_PACKS.items()]
+
+
+def get_plan_template_pack(pack_key: str) -> dict[str, Any]:
+    pack = PLAN_TEMPLATE_PACKS.get(str(pack_key or "").strip().lower())
+    if not pack:
+        raise ValueError("قالب آماده پلن پیدا نشد.")
+    return pack
+
+
+def preview_plan_template_pack(pack_key: str, *, category_id=None, plan_id=None) -> list[dict[str, str]]:
+    pack = get_plan_template_pack(pack_key)
+    values = sample_context(category_id=category_id, plan_id=plan_id)
+    previews: list[dict[str, str]] = []
+    for slot_key in PLAN_TEMPLATE_PACK_SLOTS:
+        item = definition(slot_key)
+        template_text = pack["slots"][slot_key]
+        validate_text(slot_key, template_text, "plain")
+        safe_values = {field: _escape_value(values.get(field, ""), "plain") for field in item.fields}
+        rendered = _clean_rendered(template_text.format_map(_SafeDict(safe_values)))
+        if item.kind == "button" and len(rendered) > BUTTON_LIMIT:
+            rendered = rendered[: BUTTON_LIMIT - 1].rstrip() + "…"
+        previews.append({"slot_key": slot_key, "title": item.title, "text": rendered})
+    return previews
+
+
+def apply_plan_template_pack(pack_key: str, scope_type: str, scope_id: int = 0, *, admin_id=None) -> list[str]:
+    """Save a coherent ready-made pack as Drafts without auto-publishing."""
+    pack = get_plan_template_pack(pack_key)
+    scope_type, scope_id = _normalize_scope(scope_type, scope_id)
+    prepared: list[tuple[str, str]] = []
+    for slot_key in PLAN_TEMPLATE_PACK_SLOTS:
+        item = definition(slot_key)
+        if scope_type not in item.scopes:
+            raise ValueError(f"«{item.title}» در این دامنه قابل اعمال نیست.")
+        template_text = pack["slots"][slot_key]
+        prepared.append((slot_key, validate_text(slot_key, template_text, "plain")))
+    for slot_key, template_text in prepared:
+        save_draft(slot_key, template_text, scope_type, scope_id, parse_mode="plain", admin_id=admin_id)
+    return [slot_key for slot_key, _ in prepared]
+
 LEGACY_MESSAGE_MAP = {
     "welcome": "welcome",
     "main_menu": "main_menu",
