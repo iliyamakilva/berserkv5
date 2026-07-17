@@ -739,6 +739,187 @@ def list_users_with_stats(offset=0, limit=10):
     return cur.fetchall()
 
 
+# گروه‌بندی یکپارچه کاربران برای پنل مدیریت و پیام‌های هدفمند.
+# همه شرط‌ها ثابت و داخلی هستند تا هیچ SQL دلخواهی از Callback وارد نشود.
+_USER_SEGMENT_WHERE = {
+    "all": "1=1",
+    "buyers": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0)",
+    "no_buy": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND NOT EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0)",
+    "has_sub": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1 AND COALESCE(s.is_trial,0)=0)",
+    "no_sub": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND NOT EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1 AND COALESCE(s.is_trial,0)=0)",
+    "new7": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND u.joined_at>=datetime('now','-7 days')",
+    "new30": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND u.joined_at>=datetime('now','-30 days')",
+    "active7": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND u.last_active>=datetime('now','-7 days')",
+    "inactive30_buyers": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND (u.last_active<datetime('now','-30 days') OR u.last_active IS NULL) AND EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0)",
+    "payment_problem30": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND (EXISTS (SELECT 1 FROM topups t WHERE t.user_id=u.id AND t.status='rejected' AND COALESCE(t.reviewed_at,t.created_at)>=datetime('now','-30 days')) OR EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status IN ('failed','retry','admin_review','refunded') AND p.created_at>=datetime('now','-30 days') AND COALESCE(p.is_test,0)=0))",
+    "expiring3": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1 AND COALESCE(s.is_trial,0)=0 AND s.panel_expires_at IS NOT NULL AND CAST(s.panel_expires_at AS INTEGER)>CAST(strftime('%s','now') AS INTEGER) AND CAST(s.panel_expires_at AS INTEGER)<=CAST(strftime('%s','now','+3 days') AS INTEGER))",
+    "low_volume20": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1 AND COALESCE(s.is_trial,0)=0 AND COALESCE(s.panel_data_limit,0)>0 AND COALESCE(s.panel_used_traffic,0)>=CAST(COALESCE(s.panel_data_limit,0)*0.8 AS INTEGER) AND COALESCE(s.panel_used_traffic,0)<COALESCE(s.panel_data_limit,0))",
+    "zero_usage7": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1 AND COALESCE(s.is_trial,0)=0 AND COALESCE(s.source_type,'pool')!='pool' AND COALESCE(s.panel_used_traffic,0)=0 AND s.assigned_at<=datetime('now','-7 days'))",
+    "valuable": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND COALESCE((SELECT SUM(p.amount) FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0),0)>=1000000",
+    "returning": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND (SELECT COUNT(*) FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0)>=2",
+    "open_ticket": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND EXISTS (SELECT 1 FROM tickets tk WHERE tk.user_id=u.id AND tk.status='open')",
+    "positive_balance_no_buy": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND COALESCE(u.balance,0)>0 AND NOT EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0)",
+    "attention": "u.banned=0 AND COALESCE(u.is_test,0)=0 AND (EXISTS (SELECT 1 FROM tickets tk WHERE tk.user_id=u.id AND tk.status='open') OR EXISTS (SELECT 1 FROM topups t WHERE t.user_id=u.id AND t.status='rejected' AND COALESCE(t.reviewed_at,t.created_at)>=datetime('now','-30 days')) OR EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status IN ('failed','retry','admin_review') AND p.created_at>=datetime('now','-30 days') AND COALESCE(p.is_test,0)=0) OR EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1 AND COALESCE(s.is_trial,0)=0 AND s.panel_expires_at IS NOT NULL AND CAST(s.panel_expires_at AS INTEGER)>CAST(strftime('%s','now') AS INTEGER) AND CAST(s.panel_expires_at AS INTEGER)<=CAST(strftime('%s','now','+3 days') AS INTEGER)))",
+    "banned": "u.banned=1",
+    "test": "COALESCE(u.is_test,0)=1",
+}
+
+
+def _user_segment_where(segment):
+    segment = str(segment or "all")
+    if segment not in _USER_SEGMENT_WHERE:
+        raise ValueError(f"unknown user segment: {segment}")
+    return _USER_SEGMENT_WHERE[segment]
+
+
+def count_user_segment(segment):
+    where = _user_segment_where(segment)
+    cur.execute(f"SELECT COUNT(*) AS c FROM users u WHERE {where}")
+    return int(cur.fetchone()["c"] or 0)
+
+
+def list_user_segment(segment, offset=0, limit=6):
+    where = _user_segment_where(segment)
+    cur.execute(
+        f"""
+        SELECT u.*,
+               (SELECT COUNT(*) FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0) AS purchase_count,
+               COALESCE((SELECT SUM(p.amount) FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0),0) AS spent_total,
+               (SELECT COUNT(*) FROM subs s WHERE s.owner=u.id AND s.used=1 AND COALESCE(s.is_trial,0)=0) AS delivered_count,
+               (SELECT COUNT(*) FROM tickets tk WHERE tk.user_id=u.id AND tk.status='open') AS open_ticket_count,
+               (SELECT COUNT(*) FROM users child WHERE child.ref=u.id AND COALESCE(child.is_test,0)=0) AS referral_count,
+               (SELECT COUNT(*) FROM users child WHERE child.ref=u.id AND COALESCE(child.is_test,0)=1) AS referral_test_count,
+               (SELECT COUNT(*) FROM users child WHERE child.ref=u.id AND child.rewarded=1 AND COALESCE(child.is_test,0)=0) AS rewarded_referral_count
+        FROM users u
+        WHERE {where}
+        ORDER BY u.joined_at DESC, u.id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (max(1, min(20, int(limit))), max(0, int(offset))),
+    )
+    return cur.fetchall()
+
+
+def user_segment_counts(segments=None):
+    names = list(segments or _USER_SEGMENT_WHERE.keys())
+    return {name: count_user_segment(name) for name in names if name in _USER_SEGMENT_WHERE}
+
+
+def user_insights(days=7):
+    days = max(1, min(365, int(days)))
+    period = f"-{days} days"
+    result = {"days": days}
+    cur.execute("SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND COALESCE(u.is_test,0)=0 AND u.joined_at>=datetime('now',?)", (period,))
+    result["new_users"] = int(cur.fetchone()["c"] or 0)
+    cur.execute(
+        """
+        SELECT COUNT(*) AS c FROM users u
+        WHERE u.banned=0 AND COALESCE(u.is_test,0)=0 AND u.joined_at>=datetime('now',?)
+          AND EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status='completed' AND COALESCE(p.is_test,0)=0)
+        """,
+        (period,),
+    )
+    result["new_buyers"] = int(cur.fetchone()["c"] or 0)
+    result["new_without_buy"] = max(0, result["new_users"] - result["new_buyers"])
+    result["conversion_rate"] = round(result["new_buyers"] * 100 / result["new_users"], 1) if result["new_users"] else 0.0
+    cur.execute(
+        """
+        SELECT COUNT(*) AS c FROM (
+            SELECT user_id, MIN(created_at) AS first_purchase
+            FROM purchases
+            WHERE status='completed' AND COALESCE(is_test,0)=0
+            GROUP BY user_id
+            HAVING first_purchase>=datetime('now',?)
+        ) q
+        """,
+        (period,),
+    )
+    result["first_buyers"] = int(cur.fetchone()["c"] or 0)
+    cur.execute(
+        """
+        SELECT COUNT(DISTINCT p.user_id) AS c
+        FROM purchases p
+        WHERE p.status='completed' AND COALESCE(p.is_test,0)=0 AND p.created_at>=datetime('now',?)
+          AND EXISTS (SELECT 1 FROM purchases old WHERE old.user_id=p.user_id AND old.status='completed' AND COALESCE(old.is_test,0)=0 AND old.created_at<datetime('now',?))
+        """,
+        (period, period),
+    )
+    result["returning_buyers"] = int(cur.fetchone()["c"] or 0)
+    cur.execute(
+        """
+        SELECT COUNT(DISTINCT u.id) AS c FROM users u
+        WHERE u.banned=0 AND COALESCE(u.is_test,0)=0 AND (
+          EXISTS (SELECT 1 FROM topups t WHERE t.user_id=u.id AND t.status='rejected' AND COALESCE(t.reviewed_at,t.created_at)>=datetime('now',?))
+          OR EXISTS (SELECT 1 FROM purchases p WHERE p.user_id=u.id AND p.status IN ('failed','retry','admin_review','refunded') AND p.created_at>=datetime('now',?) AND COALESCE(p.is_test,0)=0)
+        )
+        """,
+        (period, period),
+    )
+    result["payment_problems"] = int(cur.fetchone()["c"] or 0)
+    result["expiring3"] = count_user_segment("expiring3")
+    result["inactive30_buyers"] = count_user_segment("inactive30_buyers")
+    result["valuable"] = count_user_segment("valuable")
+    result["open_ticket"] = count_user_segment("open_ticket")
+    result["positive_balance_no_buy"] = count_user_segment("positive_balance_no_buy")
+    result["zero_usage7"] = count_user_segment("zero_usage7")
+    return result
+
+
+def service_report_summary():
+    result = {}
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1 AND COALESCE(is_trial,0)=0")
+    result["delivered"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1 AND COALESCE(is_trial,0)=0 AND COALESCE(source_type,'pool')='pool'")
+    result["pool"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1 AND COALESCE(is_trial,0)=0 AND COALESCE(source_type,'pool')!='pool'")
+    result["provider"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=0 AND COALESCE(source_type,'pool')='pool' AND COALESCE(status,'available') IN ('available','returned_to_pool')")
+    result["stock"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(*) AS c FROM subs WHERE used=1 AND COALESCE(is_trial,0)=0 AND panel_expires_at IS NOT NULL AND CAST(panel_expires_at AS INTEGER)<=CAST(strftime('%s','now') AS INTEGER)")
+    result["expired"] = int(cur.fetchone()["c"] or 0)
+    result["expiring3_users"] = count_user_segment("expiring3")
+    result["low_volume_users"] = count_user_segment("low_volume20")
+    result["zero_usage_users"] = count_user_segment("zero_usage7")
+    cur.execute("SELECT COALESCE(SUM(panel_data_limit),0) AS total_limit,COALESCE(SUM(panel_used_traffic),0) AS total_used FROM subs WHERE used=1 AND COALESCE(is_trial,0)=0 AND COALESCE(source_type,'pool')!='pool'")
+    row = cur.fetchone()
+    result["total_limit"] = int(row["total_limit"] or 0)
+    result["total_used"] = int(row["total_used"] or 0)
+    return result
+
+
+def payment_report_summary(days=30):
+    days = max(1, min(365, int(days)))
+    period = f"-{days} days"
+    result = {"days": days}
+    for status in ("approved", "pending_review", "rejected", "awaiting_receipt"):
+        cur.execute("SELECT COUNT(*) AS c,COALESCE(SUM(amount),0) AS amount FROM topups WHERE status=? AND created_at>=datetime('now',?) AND COALESCE(is_test,0)=0", (status, period))
+        row = cur.fetchone()
+        result[f"topup_{status}_count"] = int(row["c"] or 0)
+        result[f"topup_{status}_amount"] = int(row["amount"] or 0)
+    for status in ("completed", "paid", "provisioning", "retry", "admin_review", "failed", "refunded"):
+        cur.execute("SELECT COUNT(*) AS c,COALESCE(SUM(amount),0) AS amount FROM purchases WHERE status=? AND created_at>=datetime('now',?) AND COALESCE(is_test,0)=0", (status, period))
+        row = cur.fetchone()
+        result[f"purchase_{status}_count"] = int(row["c"] or 0)
+        result[f"purchase_{status}_amount"] = int(row["amount"] or 0)
+    return result
+
+
+def support_report_summary(days=30):
+    days = max(1, min(365, int(days)))
+    period = f"-{days} days"
+    result = {"days": days}
+    cur.execute("SELECT COUNT(*) AS c FROM tickets WHERE created_at>=datetime('now',?)", (period,))
+    result["new"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(*) AS c FROM tickets WHERE status='open'")
+    result["open"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(*) AS c FROM tickets WHERE status='closed' AND COALESCE(closed_at,created_at)>=datetime('now',?)", (period,))
+    result["closed"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(DISTINCT user_id) AS c FROM tickets WHERE status='open'")
+    result["users_with_open"] = int(cur.fetchone()["c"] or 0)
+    cur.execute("SELECT COUNT(*) AS c FROM (SELECT user_id FROM tickets WHERE created_at>=datetime('now',?) GROUP BY user_id HAVING COUNT(*)>=2)", (period,))
+    result["repeat_users"] = int(cur.fetchone()["c"] or 0)
+    return result
+
 def count_users():
     cur.execute("SELECT COUNT(*) AS c FROM users")
     return int(cur.fetchone()["c"] or 0)
@@ -772,12 +953,22 @@ def sum_all_balances(include_test=False):
 
 _BROADCAST_COUNT_SQL = {
     "all": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0",
-    "buyers": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.purchased > 0",
-    "no_buy": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.purchased = 0",
-    "has_sub": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1)",
-    "no_sub": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND NOT EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1)",
-    "active7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.last_active >= datetime('now', '-7 days')",
-    "inactive7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND (u.last_active < datetime('now', '-7 days') OR u.last_active IS NULL)",
+    "buyers": "SELECT COUNT(*) AS c FROM users u WHERE " + _USER_SEGMENT_WHERE["buyers"],
+    "no_buy": "SELECT COUNT(*) AS c FROM users u WHERE " + _USER_SEGMENT_WHERE["no_buy"],
+    "has_sub": "SELECT COUNT(*) AS c FROM users u WHERE " + _USER_SEGMENT_WHERE["has_sub"],
+    "no_sub": "SELECT COUNT(*) AS c FROM users u WHERE " + _USER_SEGMENT_WHERE["no_sub"],
+    "active7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND COALESCE(u.is_test,0)=0 AND u.last_active >= datetime('now', '-7 days')",
+    "inactive7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND COALESCE(u.is_test,0)=0 AND (u.last_active < datetime('now', '-7 days') OR u.last_active IS NULL)",
+    "inactive30_buyers": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["inactive30_buyers"],
+    "new7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["new7"],
+    "payment_problem30": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["payment_problem30"],
+    "expiring3": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["expiring3"],
+    "low_volume20": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["low_volume20"],
+    "zero_usage7": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["zero_usage7"],
+    "valuable": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["valuable"],
+    "returning": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["returning"],
+    "open_ticket": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["open_ticket"],
+    "positive_balance_no_buy": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND " + _USER_SEGMENT_WHERE["positive_balance_no_buy"],
     "positive_balance": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.balance > 0",
     "low_balance": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.balance > 0 AND u.balance < COALESCE((SELECT MIN(price) FROM plans WHERE is_active=1), 100000)",
     "referred": "SELECT COUNT(*) AS c FROM users u WHERE u.banned=0 AND u.ref IS NOT NULL AND TRIM(u.ref) <> ''",
@@ -785,18 +976,10 @@ _BROADCAST_COUNT_SQL = {
 }
 
 _BROADCAST_LIST_SQL = {
-    "all": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 ORDER BY u.joined_at DESC",
-    "buyers": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.purchased > 0 ORDER BY u.joined_at DESC",
-    "no_buy": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.purchased = 0 ORDER BY u.joined_at DESC",
-    "has_sub": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1) ORDER BY u.joined_at DESC",
-    "no_sub": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND NOT EXISTS (SELECT 1 FROM subs s WHERE s.owner=u.id AND s.used=1) ORDER BY u.joined_at DESC",
-    "active7": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.last_active >= datetime('now', '-7 days') ORDER BY u.joined_at DESC",
-    "inactive7": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND (u.last_active < datetime('now', '-7 days') OR u.last_active IS NULL) ORDER BY u.joined_at DESC",
-    "positive_balance": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.balance > 0 ORDER BY u.joined_at DESC",
-    "low_balance": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.balance > 0 AND u.balance < COALESCE((SELECT MIN(price) FROM plans WHERE is_active=1), 100000) ORDER BY u.joined_at DESC",
-    "referred": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND u.ref IS NOT NULL AND TRIM(u.ref) <> '' ORDER BY u.joined_at DESC",
-    "referrers": "SELECT u.id, u.username, u.purchased, u.balance, u.last_active FROM users u WHERE u.banned=0 AND EXISTS (SELECT 1 FROM users child WHERE child.ref=u.id) ORDER BY u.joined_at DESC",
+    scope: sql.replace("SELECT COUNT(*) AS c", "SELECT u.id, u.username, u.purchased, u.balance, u.last_active") + " ORDER BY u.joined_at DESC"
+    for scope, sql in _BROADCAST_COUNT_SQL.items()
 }
+
 
 
 def _broadcast_scope(scope):
